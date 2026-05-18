@@ -1,0 +1,2 @@
+nat_type_tester_cli_tests 1 0.00313116
+---

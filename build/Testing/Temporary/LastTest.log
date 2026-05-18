@@ -1,0 +1,19 @@
+Start testing: May 18 13:34 UTC
+----------------------------------------------------------
+1/1 Testing: nat_type_tester_cli_tests
+1/1 Test: nat_type_tester_cli_tests
+Command: "/home/runner/work/NatTypeTester_CLI/NatTypeTester_CLI/build/nat_type_tester_cli_tests"
+Directory: /home/runner/work/NatTypeTester_CLI/NatTypeTester_CLI/build
+"nat_type_tester_cli_tests" start time: May 18 13:34 UTC
+Output:
+----------------------------------------------------------
+All nat_type_tester_cli_tests passed
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"nat_type_tester_cli_tests" end time: May 18 13:34 UTC
+"nat_type_tester_cli_tests" time elapsed: 00:00:00
+----------------------------------------------------------
+
+End testing: May 18 13:34 UTC
