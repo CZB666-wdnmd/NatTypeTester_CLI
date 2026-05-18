@@ -3,8 +3,7 @@ name: C/C++ CLI
 on:
   push:
     branches:
-      - master
-      - renovate/**
+      - main
     tags:
       - "*"
   pull_request:
