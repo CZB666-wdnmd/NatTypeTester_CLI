@@ -59,6 +59,7 @@ enum class StunTestType {
     Binding,
     Mapping,
     Filtering,
+    TcpFiltering,
     ProtocolCorrelation,
 };
 

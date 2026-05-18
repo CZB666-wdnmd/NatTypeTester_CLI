@@ -64,3 +64,16 @@
 ![](docs/img/RFC5780_4.5.png)
 
 </details>
+
+## RFC5382 / RFC7857 (TCP Filtering & Protocol Correlation)
+
+标准 STUN 服务端通常不支持 TCP 过滤行为探测，因此仓库新增了一个简易双 IP 服务端（`src_ser`）。
+
+- 构建服务端：
+  - `cmake -S src_ser -B src_ser/build`
+  - `cmake --build src_ser/build`
+- 启动服务端：
+  - `./src_ser/build/nat_type_tester_rfc5382_server --primary 1.2.3.4:3478 --secondary 5.6.7.8:3478`
+- 运行客户端测试：
+  - `./build/nat_type_tester_cli rfc5780 --server 1.2.3.4:3478 --server2 5.6.7.8:3478 --test-type tcp-filtering --transport tcp`
+  - `./build/nat_type_tester_cli rfc5780 --server 1.2.3.4:3478 --server2 5.6.7.8:3478 --test-type protocol-correlation --transport tcp`
