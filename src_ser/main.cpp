@@ -268,23 +268,27 @@ void handle_tcp_client(int client_fd, const IpEndpoint& primary_server, const Ip
             throw system_error("getpeername failed");
         }
         IpEndpoint peer_endpoint = from_sockaddr(reinterpret_cast<sockaddr*>(&peer), peer_length);
-        std::string command = recv_line(client_fd);
-
-        if (command == "M") {
-            send_all(client_fd, endpoint_line(peer_endpoint));
-            return;
+        while (true) {
+            std::string command = recv_line(client_fd);
+            if (command.empty()) {
+                return;
+            }
+            if (command == "M") {
+                send_all(client_fd, endpoint_line(peer_endpoint));
+                continue;
+            }
+            if (command == "F") {
+                IpEndpoint primary_source = primary_server;
+                primary_source.port = 0;
+                IpEndpoint secondary_source = secondary_server;
+                secondary_source.port = 0;
+                bool primary_ok = try_connect_from_source(primary_source, peer_endpoint, probe_timeout_ms);
+                bool secondary_ok = try_connect_from_source(secondary_source, peer_endpoint, probe_timeout_ms);
+                send_all(client_fd, std::string("P=") + (primary_ok ? "1" : "0") + " S=" + (secondary_ok ? "1" : "0") + "\n");
+                continue;
+            }
+            send_all(client_fd, "ERR\n");
         }
-        if (command == "F") {
-            IpEndpoint primary_source = primary_server;
-            primary_source.port = 0;
-            IpEndpoint secondary_source = secondary_server;
-            secondary_source.port = 0;
-            bool primary_ok = try_connect_from_source(primary_source, peer_endpoint, probe_timeout_ms);
-            bool secondary_ok = try_connect_from_source(secondary_source, peer_endpoint, probe_timeout_ms);
-            send_all(client_fd, std::string("P=") + (primary_ok ? "1" : "0") + " S=" + (secondary_ok ? "1" : "0") + "\n");
-            return;
-        }
-        send_all(client_fd, "ERR\n");
     } catch (...) {
     }
 }

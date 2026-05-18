@@ -193,6 +193,28 @@ std::pair<bool, bool> parse_filter_line(const std::string& line) {
     return {parse_flag(p_field, 'P'), parse_flag(s_field, 'S')};
 }
 
+std::string request_tcp_command(const IpEndpoint& local,
+                                const IpEndpoint& server,
+                                std::string_view command,
+                                std::chrono::milliseconds timeout) {
+    int control = socket(server.family, SOCK_STREAM, IPPROTO_TCP);
+    if (control < 0) {
+        throw system_error("socket failed");
+    }
+    try {
+        set_reuse_options(control);
+        bind_socket(control, local);
+        connect_with_timeout(control, server, timeout);
+        send_all(control, command);
+        std::string line = recv_line(control, timeout);
+        close(control);
+        return line;
+    } catch (...) {
+        close(control);
+        throw;
+    }
+}
+
 std::optional<IpEndpoint> request_udp_mapping(const IpEndpoint& local, const IpEndpoint& server, std::chrono::milliseconds timeout) {
     int socket_fd = socket(server.family, SOCK_DGRAM, IPPROTO_UDP);
     if (socket_fd < 0) {
@@ -242,7 +264,6 @@ Rfc5382TcpResult run_rfc5382_tcp_tests(const RequestOptions& options,
     }
 
     Rfc5382TcpResult result;
-    int control = -1;
     try {
         set_reuse_options(listener);
         bind_socket(listener, local_bind.value_or(wildcard_endpoint(primary_server.family)));
@@ -250,24 +271,15 @@ Rfc5382TcpResult run_rfc5382_tcp_tests(const RequestOptions& options,
             throw system_error("listen failed");
         }
         result.local_endpoint = socket_local_endpoint(listener);
-
-        control = socket(primary_server.family, SOCK_STREAM, IPPROTO_TCP);
-        if (control < 0) {
-            throw system_error("socket failed");
-        }
-        set_reuse_options(control);
-        bind_socket(control, *result.local_endpoint);
-        connect_with_timeout(control, primary_server, options.timeout);
-
-        send_all(control, "M\n");
-        result.tcp_public_endpoint = parse_endpoint_line(recv_line(control, options.timeout), primary_server.family);
+        result.tcp_public_endpoint = parse_endpoint_line(
+            request_tcp_command(*result.local_endpoint, primary_server, "M\n", options.timeout), primary_server.family);
 
         if (result.local_endpoint.has_value()) {
             result.udp_public_endpoint = request_udp_mapping(*result.local_endpoint, primary_server, options.timeout);
         }
 
-        send_all(control, "F\n");
-        auto [primary_ok, secondary_ok] = parse_filter_line(recv_line(control, options.timeout));
+        auto [primary_ok, secondary_ok] = parse_filter_line(
+            request_tcp_command(*result.local_endpoint, primary_server, "F\n", options.timeout));
         result.primary_probe_success = primary_ok;
         result.secondary_probe_success = secondary_ok;
         if (secondary_ok) {
@@ -290,13 +302,9 @@ Rfc5382TcpResult run_rfc5382_tcp_tests(const RequestOptions& options,
             }
         }
 
-        close(control);
         close(listener);
         return result;
     } catch (...) {
-        if (control >= 0) {
-            close(control);
-        }
         close(listener);
         throw;
     }
