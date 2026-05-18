@@ -356,7 +356,11 @@ StunResult5389 run_rfc5780_test(const RequestOptions& options,
         break;
     case StunTestType::Combining:
     default:
-        action = discovery.create_query();
+        if (options.transport != TransportType::Udp) {
+            action = discovery.create_mapping_behavior_test();
+        } else {
+            action = discovery.create_query();
+        }
         break;
     }
 
