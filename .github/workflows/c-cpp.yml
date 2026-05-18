@@ -29,9 +29,19 @@ jobs:
         run: cmake --build src/build --config Release
       - name: Test
         run: ctest --test-dir src/build --output-on-failure
+      - name: Configure server
+        run: >
+          cmake -S src_ser -B src_ser/build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DOPENSSL_USE_STATIC_LIBS=TRUE
+          -DCMAKE_EXE_LINKER_FLAGS="-static"
+      - name: Build server
+        run: cmake --build src_ser/build --config Release
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: nat_type_tester_cli_build
-          path: src/build
+          name: nat_type_tester_binaries
+          path: |
+            src/build/nat_type_tester_cli
+            src_ser/build/nat_type_tester_rfc5382_server
           if-no-files-found: error
