@@ -59,7 +59,6 @@ enum class StunTestType {
     Binding,
     Mapping,
     Filtering,
-    ProtocolCorrelation,
 };
 
 struct IpEndpoint {

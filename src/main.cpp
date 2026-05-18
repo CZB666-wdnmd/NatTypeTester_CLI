@@ -8,8 +8,17 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <poll.h>
+#include <unistd.h>
 
 namespace {
+
+#ifndef SO_REUSEPORT
+#define SO_REUSEPORT 15
+#endif
 
 using natcli::IpEndpoint;
 using natcli::RequestOptions;
@@ -62,7 +71,7 @@ void print_help() {
         << "Usage:\n"
         << "  nat_type_tester_cli rfc3489 --server host[:port] [--local host[:port]] [--timeout-ms 3000]\n"
         << "  nat_type_tester_cli rfc5780 --server host[:port] [--local host[:port]] [--transport udp|tcp|tls]\n"
-        << "                               [--test-type combining|binding|mapping|filtering|protocol-correlation] [--skip-cert] [--timeout-ms 3000]\n";
+        << "                               [--test-type combining|binding|mapping|filtering] [--skip-cert] [--timeout-ms 3000]\n";
 }
 
 std::string require_option(const ParsedArguments& args, const std::string& name) {
@@ -109,9 +118,6 @@ StunTestType parse_test_type(const ParsedArguments& args) {
     if (value == "filtering") {
         return StunTestType::Filtering;
     }
-    if (value == "protocol-correlation") { 
-        return StunTestType::ProtocolCorrelation;
-    }
     fail("Unsupported test type: " + value);
 }
 
@@ -132,6 +138,109 @@ std::string endpoint_or_dash(const std::optional<IpEndpoint>& endpoint) {
     return endpoint.has_value() ? natcli::to_string(*endpoint) : "-";
 }
 
+void run_rfc5382_tcp_test(const std::string& server_ip, std::uint16_t server_port, const std::optional<IpEndpoint>& local_bind) {
+    int opt = 1;
+
+    // --- 步骤 1：创建 Listen Socket ---
+    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+
+    sockaddr_storage local_sa{};
+    socklen_t local_len = sizeof(sockaddr_in);
+    if (local_bind.has_value()) {
+        auto addr_st = natcli::to_sockaddr(*local_bind);
+        local_sa = addr_st.storage;
+        local_len = addr_st.length;
+    } else {
+        auto* sa = reinterpret_cast<sockaddr_in*>(&local_sa);
+        sa->sin_family = AF_INET;
+        sa->sin_addr.s_addr = INADDR_ANY;
+        sa->sin_port = 0;
+    }
+
+    if (bind(listen_fd, reinterpret_cast<sockaddr*>(&local_sa), local_len) < 0) {
+        fail("Failed to bind Listen Socket: " + std::string(strerror(errno)));
+    }
+    listen(listen_fd, 5);
+
+    // 获取系统分配的真实本地端口
+    IpEndpoint real_local = natcli::socket_local_endpoint(listen_fd);
+
+    // --- 步骤 2：创建 Outbound Socket (复用相同的本地端口) ---
+    int out_fd = socket(AF_INET, SOCK_STREAM, 0);
+    setsockopt(out_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    setsockopt(out_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+
+    auto bind_addr = natcli::to_sockaddr(real_local);
+    if (bind(out_fd, reinterpret_cast<sockaddr*>(&bind_addr.storage), bind_addr.length) < 0) {
+        fail("Failed to bind Outbound Socket to reused port: " + std::string(strerror(errno)));
+    }
+
+    // --- 步骤 3：连接到服务端 IP1 ---
+    IpEndpoint server_ep = natcli::resolve_endpoint(server_ip, server_port, SOCK_STREAM, AF_INET);
+    auto server_sa = natcli::to_sockaddr(server_ep);
+
+    if (connect(out_fd, reinterpret_cast<sockaddr*>(&server_sa.storage), server_sa.length) < 0) {
+        fail("Failed to connect to custom TCP server: " + std::string(strerror(errno)));
+    }
+
+    // --- 步骤 4：请求 NAT 映射信息 ---
+    std::string req = "BIND\n";
+    send(out_fd, req.data(), req.size(), 0);
+
+    char buf[1024];
+    int n = recv(out_fd, buf, sizeof(buf) - 1, 0);
+    if (n <= 0) fail("Failed to receive BIND response");
+    buf[n] = 0;
+
+    char pip[64], palt[64];
+    int pport = 0;
+    std::string pub_ip = "-";
+    std::string pub_port = "-";
+    std::string alt_ip = "-";
+
+    if (sscanf(buf, "MAPPED %63s %d ALT %63s", pip, &pport, palt) == 3) {
+        pub_ip = pip;
+        pub_port = std::to_string(pport);
+        alt_ip = palt;
+    } else {
+        fail("Invalid response from server: " + std::string(buf));
+    }
+
+    // --- 步骤 5：请求服务器用备用 IP 测试入站连接 ---
+    req = "TEST_FILTER\n";
+    send(out_fd, req.data(), req.size(), 0);
+
+    // --- 步骤 6：等待入站连接 ---
+    pollfd pfd{listen_fd, POLLIN, 0};
+    int pr = poll(&pfd, 1, 4000); // 4秒超时
+
+    std::string filtering_result = "AddressDependent (or PortDependent)";
+    if (pr > 0 && (pfd.revents & POLLIN)) {
+        int incoming = accept(listen_fd, nullptr, nullptr);
+        if (incoming >= 0) {
+            int in_n = recv(incoming, buf, sizeof(buf) - 1, 0);
+            if (in_n > 0) {
+                buf[in_n] = 0;
+                if (std::string(buf).find("EIF_OK") != std::string::npos) {
+                    filtering_result = "EndpointIndependent (Full Cone TCP)";
+                }
+            }
+            close(incoming);
+        }
+    }
+
+    close(out_fd);
+    close(listen_fd);
+
+    // --- 打印结果 ---
+    print_row("TcpFilteringBehavior", filtering_result);
+    print_row("PublicEnd", pub_ip + ":" + pub_port);
+    print_row("LocalEnd", natcli::to_string(real_local));
+    print_row("ServerAltIp", alt_ip);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -140,6 +249,10 @@ int main(int argc, char** argv) {
         if (args.command == "help" || args.options.contains("--help") || args.options.contains("-h")) {
             print_help();
             return 0;
+        }
+
+        if (args.command != "rfc3489" && args.command != "rfc5780" && args.command != "rfc5382") {
+            fail("Unknown subcommand: " + args.command);
         }
 
         if (args.command != "rfc3489" && args.command != "rfc5780") {
@@ -169,42 +282,12 @@ int main(int argc, char** argv) {
             return 0;
         }
 
-        StunTestType test_type = parse_test_type(args);
-        if (test_type == StunTestType::ProtocolCorrelation) {
-            // 第一步：使用 UDP 进行绑定测试
-            RequestOptions udp_options = options;
-            udp_options.transport = TransportType::Udp;
-            natcli::StunResult5389 udp_result = natcli::run_rfc5780_test(udp_options, StunTestType::Binding, server, local_bind);
-
-            if (!udp_result.local_endpoint.has_value() || !udp_result.public_endpoint.has_value()) {
-                fail("UDP Binding failed, cannot proceed with protocol correlation test.");
-            }
-
-            // 第二步：使用完全相同的 Local IP 和 Port，发起 TCP 绑定测试
-            natcli::IpEndpoint shared_local = *udp_result.local_endpoint;
-            RequestOptions tcp_options = options;
-            tcp_options.transport = TransportType::Tcp;
-            natcli::StunResult5389 tcp_result = natcli::run_rfc5780_test(tcp_options, StunTestType::Binding, server, shared_local);
-
-            print_row("UDP LocalEnd", endpoint_or_dash(udp_result.local_endpoint));
-            print_row("UDP PublicEnd", endpoint_or_dash(udp_result.public_endpoint));
-            print_row("TCP LocalEnd", endpoint_or_dash(tcp_result.local_endpoint));
-            print_row("TCP PublicEnd", endpoint_or_dash(tcp_result.public_endpoint));
-
-            if (tcp_result.public_endpoint.has_value()) {
-                if (*udp_result.public_endpoint == *tcp_result.public_endpoint) {
-                    print_row("ProtocolCorrelation", "Independent (RFC 5382 Req 2 Supported)");
-                } else if (udp_result.public_endpoint->address == tcp_result.public_endpoint->address) {
-                    print_row("ProtocolCorrelation", "Address-Independent, Port-Dependent");
-                } else {
-                    print_row("ProtocolCorrelation", "Dependent (RFC 5382 Req 2 Unsupported)");
-                }
-            } else {
-                print_row("ProtocolCorrelation", "Unknown (TCP Binding Failed)");
-            }
+        if (args.command == "rfc5382") {
+            run_rfc5382_tcp_test(server_host, server_port, local_bind);
             return 0;
         }
 
+        StunTestType test_type = parse_test_type(args);
         natcli::StunResult5389 result = natcli::run_rfc5780_test(options, test_type, server, local_bind);
 
         if (test_type == StunTestType::Combining || test_type == StunTestType::Binding) {

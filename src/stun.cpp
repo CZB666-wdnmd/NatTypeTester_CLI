@@ -299,7 +299,6 @@ std::string to_string(StunTestType value) {
     case StunTestType::Binding: return "binding";
     case StunTestType::Mapping: return "mapping";
     case StunTestType::Filtering: return "filtering";
-    case StunTestType::ProtocolCorrelation: return "protocol-correlation";
     }
     return "combining";
 }
@@ -503,69 +502,40 @@ UdpSession::~UdpSession() {
 std::optional<StunResponse> UdpSession::request(const StunDiscoveryAction& action) {
     std::vector<std::uint8_t> payload = serialize(action.message);
     SocketAddress remote = to_sockaddr(action.send_to);
-
-    const auto deadline = std::chrono::steady_clock::now() + timeout_;
-    
-    // RFC 5389 推荐的初始重传超时时间 (RTO) 为 500ms
-    std::chrono::milliseconds rto(500); 
-    std::vector<std::uint8_t> buffer(65536);
-
-    while (std::chrono::steady_clock::now() < deadline) {
-        // 1. 发送 (或重传) STUN 请求包
-        ssize_t sent = sendto(socket_, payload.data(), payload.size(), 0, reinterpret_cast<sockaddr*>(&remote.storage), remote.length);
-        if (sent < 0) {
-            throw system_error("sendto failed");
-        }
-
-        auto next_resend_time = std::chrono::steady_clock::now() + rto;
-
-        // 2. 在当前 RTO 窗口内，循环等待并接收响应
-        while (std::chrono::steady_clock::now() < std::min(next_resend_time, deadline)) {
-            auto now = std::chrono::steady_clock::now();
-            auto wait_time = std::chrono::duration_cast<std::chrono::milliseconds>(std::min(next_resend_time, deadline) - now);
-            
-            if (wait_time.count() <= 0) {
-                break;
-            }
-
-            // 等待 Socket 可读
-            if (!wait_for_readable(socket_, wait_time)) {
-                break; // 当前 RTO 超时，跳出内层循环去重传
-            }
-
-            // Socket 可读，接收数据
-            sockaddr_storage response_remote{};
-            socklen_t response_length = sizeof(response_remote);
-            ssize_t received = recvfrom(socket_, buffer.data(), buffer.size(), 0, reinterpret_cast<sockaddr*>(&response_remote), &response_length);
-            if (received < 0) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    continue;
-                }
-                throw system_error("recvfrom failed");
-            }
-
-            // 解析 STUN 消息
-            StunMessage response_message;
-            if (!parse_message(buffer.data(), static_cast<std::size_t>(received), response_message)) {
-                continue; // 可能是杂音数据，忽略并继续等待
-            }
-            
-            // 校验 Magic Cookie 和 Transaction ID 是否匹配
-            if (response_message.magic_cookie != action.message.magic_cookie || 
-                response_message.transaction_id != action.message.transaction_id) {
-                continue; // 不是当前请求的响应，忽略并继续等待
-            }
-
-            // 成功匹配，返回结果
-            return StunResponse{response_message, from_sockaddr(reinterpret_cast<sockaddr*>(&response_remote), response_length),
-                                socket_local_endpoint(socket_)};
-        }
-
-        // 3. 指数退避：如果没收到响应，把等待时间翻倍
-        rto *= 2; 
+    ssize_t sent = sendto(socket_, payload.data(), payload.size(), 0, reinterpret_cast<sockaddr*>(&remote.storage), remote.length);
+    if (sent < 0) {
+        throw system_error("sendto failed");
     }
 
-    // 达到总超时时间，彻底失败
+    std::vector<std::uint8_t> buffer(65536);
+    const auto deadline = std::chrono::steady_clock::now() + timeout_;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
+        if (!wait_for_readable(socket_, remaining)) {
+            break;
+        }
+
+        sockaddr_storage response_remote{};
+        socklen_t response_length = sizeof(response_remote);
+        ssize_t received = recvfrom(socket_, buffer.data(), buffer.size(), 0, reinterpret_cast<sockaddr*>(&response_remote), &response_length);
+        if (received < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                break;
+            }
+            throw system_error("recvfrom failed");
+        }
+
+        StunMessage response_message;
+        if (!parse_message(buffer.data(), static_cast<std::size_t>(received), response_message)) {
+            continue;
+        }
+        if (response_message.magic_cookie != action.message.magic_cookie || response_message.transaction_id != action.message.transaction_id) {
+            continue;
+        }
+        return StunResponse{response_message, from_sockaddr(reinterpret_cast<sockaddr*>(&response_remote), response_length),
+                            socket_local_endpoint(socket_)};
+    }
+
     return std::nullopt;
 }
 
@@ -593,10 +563,6 @@ std::optional<StunResponse> TcpSession::request(const StunDiscoveryAction& actio
 
         std::vector<std::uint8_t> payload = serialize(action.message);
         IpEndpoint local = socket_local_endpoint(socket_fd);
-
-        if (!local_bind_.has_value() || local_bind_->port == 0) {
-            local_bind_ = local;
-        }
 
         if (!use_tls_) {
             std::size_t offset = 0;
