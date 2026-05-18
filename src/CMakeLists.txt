@@ -11,6 +11,7 @@ include(CTest)
 add_library(nat_type_tester_cli_lib
   stun.cpp
   discovery.cpp
+  rfc5382.cpp
 )
 
 target_include_directories(nat_type_tester_cli_lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

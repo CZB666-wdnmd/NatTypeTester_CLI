@@ -299,6 +299,7 @@ std::string to_string(StunTestType value) {
     case StunTestType::Binding: return "binding";
     case StunTestType::Mapping: return "mapping";
     case StunTestType::Filtering: return "filtering";
+    case StunTestType::TcpFiltering: return "tcp-filtering";
     case StunTestType::ProtocolCorrelation: return "protocol-correlation";
     }
     return "combining";

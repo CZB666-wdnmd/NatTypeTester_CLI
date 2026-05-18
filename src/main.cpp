@@ -1,4 +1,5 @@
 #include "discovery.hpp"
+#include "rfc5382.hpp"
 
 #include <sys/socket.h>
 
@@ -62,7 +63,8 @@ void print_help() {
         << "Usage:\n"
         << "  nat_type_tester_cli rfc3489 --server host[:port] [--local host[:port]] [--timeout-ms 3000]\n"
         << "  nat_type_tester_cli rfc5780 --server host[:port] [--local host[:port]] [--transport udp|tcp|tls]\n"
-        << "                               [--test-type combining|binding|mapping|filtering|protocol-correlation] [--skip-cert] [--timeout-ms 3000]\n";
+        << "                               [--server2 host[:port]]\n"
+        << "                               [--test-type combining|binding|mapping|filtering|tcp-filtering|protocol-correlation] [--skip-cert] [--timeout-ms 3000]\n";
 }
 
 std::string require_option(const ParsedArguments& args, const std::string& name) {
@@ -109,6 +111,9 @@ StunTestType parse_test_type(const ParsedArguments& args) {
     if (value == "filtering") {
         return StunTestType::Filtering;
     }
+    if (value == "tcp-filtering") {
+        return StunTestType::TcpFiltering;
+    }
     if (value == "protocol-correlation") { 
         return StunTestType::ProtocolCorrelation;
     }
@@ -130,6 +135,20 @@ void print_row(const std::string& key, const std::string& value) {
 
 std::string endpoint_or_dash(const std::optional<IpEndpoint>& endpoint) {
     return endpoint.has_value() ? natcli::to_string(*endpoint) : "-";
+}
+
+std::string classify_protocol_correlation(const std::optional<IpEndpoint>& udp,
+                                          const std::optional<IpEndpoint>& tcp) {
+    if (!udp.has_value() || !tcp.has_value()) {
+        return "Unknown";
+    }
+    if (*udp == *tcp) {
+        return "Independent (RFC 5382 Req 2 Supported)";
+    }
+    if (udp->address == tcp->address) {
+        return "Address-Independent, Port-Dependent";
+    }
+    return "Dependent (RFC 5382 Req 2 Unsupported)";
 }
 
 } // namespace
@@ -170,38 +189,15 @@ int main(int argc, char** argv) {
         }
 
         StunTestType test_type = parse_test_type(args);
-        if (test_type == StunTestType::ProtocolCorrelation) {
-            // 第一步：使用 UDP 进行绑定测试
-            RequestOptions udp_options = options;
-            udp_options.transport = TransportType::Udp;
-            natcli::StunResult5389 udp_result = natcli::run_rfc5780_test(udp_options, StunTestType::Binding, server, local_bind);
-
-            if (!udp_result.local_endpoint.has_value() || !udp_result.public_endpoint.has_value()) {
-                fail("UDP Binding failed, cannot proceed with protocol correlation test.");
-            }
-
-            // 第二步：使用完全相同的 Local IP 和 Port，发起 TCP 绑定测试
-            natcli::IpEndpoint shared_local = *udp_result.local_endpoint;
-            RequestOptions tcp_options = options;
-            tcp_options.transport = TransportType::Tcp;
-            natcli::StunResult5389 tcp_result = natcli::run_rfc5780_test(tcp_options, StunTestType::Binding, server, shared_local);
-
-            print_row("UDP LocalEnd", endpoint_or_dash(udp_result.local_endpoint));
-            print_row("UDP PublicEnd", endpoint_or_dash(udp_result.public_endpoint));
-            print_row("TCP LocalEnd", endpoint_or_dash(tcp_result.local_endpoint));
-            print_row("TCP PublicEnd", endpoint_or_dash(tcp_result.public_endpoint));
-
-            if (tcp_result.public_endpoint.has_value()) {
-                if (*udp_result.public_endpoint == *tcp_result.public_endpoint) {
-                    print_row("ProtocolCorrelation", "Independent (RFC 5382 Req 2 Supported)");
-                } else if (udp_result.public_endpoint->address == tcp_result.public_endpoint->address) {
-                    print_row("ProtocolCorrelation", "Address-Independent, Port-Dependent");
-                } else {
-                    print_row("ProtocolCorrelation", "Dependent (RFC 5382 Req 2 Unsupported)");
-                }
-            } else {
-                print_row("ProtocolCorrelation", "Unknown (TCP Binding Failed)");
-            }
+        if (test_type == StunTestType::TcpFiltering || test_type == StunTestType::ProtocolCorrelation) {
+            auto [server2_host, server2_port] = natcli::split_host_port(require_option(args, "--server2"), default_port);
+            IpEndpoint server2 = natcli::resolve_endpoint(server2_host, server2_port, SOCK_STREAM, server.family);
+            natcli::Rfc5382TcpResult result = natcli::run_rfc5382_tcp_tests(options, server, server2, local_bind);
+            print_row("LocalEnd", endpoint_or_dash(result.local_endpoint));
+            print_row("TCP PublicEnd", endpoint_or_dash(result.tcp_public_endpoint));
+            print_row("UDP PublicEnd", endpoint_or_dash(result.udp_public_endpoint));
+            print_row("TcpFilteringBehavior", natcli::to_string(result.filtering_behavior));
+            print_row("ProtocolCorrelation", classify_protocol_correlation(result.udp_public_endpoint, result.tcp_public_endpoint));
             return 0;
         }
 

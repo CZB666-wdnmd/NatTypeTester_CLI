@@ -1,2 +1,0 @@
-/usr/bin/ar qc libnat_type_tester_cli_lib.a CMakeFiles/nat_type_tester_cli_lib.dir/stun.cpp.o CMakeFiles/nat_type_tester_cli_lib.dir/discovery.cpp.o
-/usr/bin/ranlib libnat_type_tester_cli_lib.a

@@ -1,1 +1,0 @@
-/usr/bin/c++ -Wl,--dependency-file=CMakeFiles/nat_type_tester_cli_tests.dir/link.d CMakeFiles/nat_type_tester_cli_tests.dir/tests.cpp.o -o nat_type_tester_cli_tests  libnat_type_tester_cli_lib.a /usr/lib/x86_64-linux-gnu/libssl.so /usr/lib/x86_64-linux-gnu/libcrypto.so

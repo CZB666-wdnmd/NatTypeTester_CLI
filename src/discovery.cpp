@@ -354,6 +354,9 @@ StunResult5389 run_rfc5780_test(const RequestOptions& options,
         }
         action = discovery.create_filtering_behavior_test();
         break;
+    case StunTestType::TcpFiltering:
+    case StunTestType::ProtocolCorrelation:
+        throw std::runtime_error("Selected test type requires the custom RFC 5382/7857 server mode.");
     case StunTestType::Combining:
     default:
         if (options.transport != TransportType::Udp) {
