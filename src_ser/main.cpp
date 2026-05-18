@@ -189,7 +189,7 @@ std::string endpoint_line(const IpEndpoint& endpoint) {
 void send_all(int socket_fd, std::string_view payload) {
     std::size_t offset = 0;
     while (offset < payload.size()) {
-        ssize_t written = send(socket_fd, payload.data() + static_cast<long>(offset), payload.size() - offset, 0);
+        ssize_t written = send(socket_fd, payload.data() + offset, payload.size() - offset, 0);
         if (written <= 0) {
             throw system_error("send failed");
         }
@@ -260,7 +260,10 @@ bool try_connect_from_source(const IpEndpoint& source_address_only, const IpEndp
     return success;
 }
 
-void handle_tcp_client(int client_fd, const IpEndpoint& primary_server, const IpEndpoint& secondary_server, int probe_timeout_ms) {
+void handle_tcp_client(int client_fd,
+                       const IpEndpoint& primary_server,
+                       const IpEndpoint& secondary_server,
+                       int connection_probe_timeout_ms) {
     try {
         sockaddr_storage peer{};
         socklen_t peer_length = sizeof(peer);
@@ -282,8 +285,8 @@ void handle_tcp_client(int client_fd, const IpEndpoint& primary_server, const Ip
                 primary_source.port = 0;
                 IpEndpoint secondary_source = secondary_server;
                 secondary_source.port = 0;
-                bool primary_ok = try_connect_from_source(primary_source, peer_endpoint, probe_timeout_ms);
-                bool secondary_ok = try_connect_from_source(secondary_source, peer_endpoint, probe_timeout_ms);
+                bool primary_ok = try_connect_from_source(primary_source, peer_endpoint, connection_probe_timeout_ms);
+                bool secondary_ok = try_connect_from_source(secondary_source, peer_endpoint, connection_probe_timeout_ms);
                 send_all(client_fd, std::string("P=") + (primary_ok ? "1" : "0") + " S=" + (secondary_ok ? "1" : "0") + "\n");
                 continue;
             }
@@ -311,12 +314,12 @@ void handle_udp_map(int udp_fd) {
 int main(int argc, char** argv) {
     try {
         if (argc < 3) {
-            fail("Usage: nat_type_tester_rfc5382_server --primary host[:port] --secondary host[:port] [--probe-timeout-ms 1200]");
+            fail("Insufficient arguments. Use --help for usage information.");
         }
 
         std::optional<std::string> primary_arg;
         std::optional<std::string> secondary_arg;
-        int probe_timeout_ms = 1200;
+        int connection_probe_timeout_ms = 1200;
         for (int index = 1; index < argc; ++index) {
             std::string token = argv[index];
             if (token == "--primary" && index + 1 < argc) {
@@ -324,7 +327,7 @@ int main(int argc, char** argv) {
             } else if (token == "--secondary" && index + 1 < argc) {
                 secondary_arg = argv[++index];
             } else if (token == "--probe-timeout-ms" && index + 1 < argc) {
-                probe_timeout_ms = std::stoi(argv[++index]);
+                connection_probe_timeout_ms = std::stoi(argv[++index]);
             } else if (token == "--help" || token == "-h") {
                 std::cout << "Usage: nat_type_tester_rfc5382_server --primary host[:port] --secondary host[:port] [--probe-timeout-ms 1200]\n";
                 return 0;
@@ -372,7 +375,7 @@ int main(int argc, char** argv) {
                 socklen_t length = sizeof(client);
                 int client_fd = accept(primary_tcp_fd, reinterpret_cast<sockaddr*>(&client), &length);
                 if (client_fd >= 0) {
-                    handle_tcp_client(client_fd, primary_server, secondary_server, probe_timeout_ms);
+                    handle_tcp_client(client_fd, primary_server, secondary_server, connection_probe_timeout_ms);
                     close(client_fd);
                 }
             }
@@ -381,7 +384,7 @@ int main(int argc, char** argv) {
                 socklen_t length = sizeof(client);
                 int client_fd = accept(secondary_tcp_fd, reinterpret_cast<sockaddr*>(&client), &length);
                 if (client_fd >= 0) {
-                    handle_tcp_client(client_fd, primary_server, secondary_server, probe_timeout_ms);
+                    handle_tcp_client(client_fd, primary_server, secondary_server, connection_probe_timeout_ms);
                     close(client_fd);
                 }
             }

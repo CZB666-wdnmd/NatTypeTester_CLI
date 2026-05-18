@@ -140,7 +140,7 @@ bool wait_for_readable(int socket_fd, std::chrono::milliseconds timeout) {
 void send_all(int socket_fd, std::string_view payload) {
     std::size_t offset = 0;
     while (offset < payload.size()) {
-        ssize_t written = send(socket_fd, payload.data() + static_cast<long>(offset), payload.size() - offset, 0);
+        ssize_t written = send(socket_fd, payload.data() + offset, payload.size() - offset, 0);
         if (written <= 0) {
             throw system_error("send failed");
         }
@@ -185,7 +185,8 @@ std::pair<bool, bool> parse_filter_line(const std::string& line) {
         throw std::runtime_error("Invalid filtering response");
     }
     auto parse_flag = [](const std::string& field, const char key) -> bool {
-        if (field.size() != 3 || field[0] != key || field[1] != '=') {
+        constexpr std::size_t FLAG_FIELD_SIZE = 3; // "P=1" / "S=0"
+        if (field.size() != FLAG_FIELD_SIZE || field[0] != key || field[1] != '=') {
             throw std::runtime_error("Invalid filtering response field");
         }
         return field[2] == '1';
@@ -290,7 +291,8 @@ Rfc5382TcpResult run_rfc5382_tcp_tests(const RequestOptions& options,
             result.filtering_behavior = FilteringBehavior::AddressAndPortDependent;
         }
 
-        for (int index = 0; index < 4; ++index) {
+        constexpr int max_drain_accepts = 4; // server sends up to primary+secondary probe connections plus retries
+        for (int index = 0; index < max_drain_accepts; ++index) {
             if (!wait_for_readable(listener, std::chrono::milliseconds(100))) {
                 break;
             }
