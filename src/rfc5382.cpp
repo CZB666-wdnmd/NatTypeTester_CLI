@@ -295,6 +295,13 @@ std::string request_tcp_command(const IpEndpoint& local,
     }
     try {
         set_reuse_options(control);
+        
+        // 关键修正: 配置 SO_LINGER，在关闭 socket 时直接发送 RST。
+        // 这将跳过 TCP 的 TIME_WAIT 状态，释放掉五元组，
+        // 使得后续的 connect 能够成功，从而解决 EADDRNOTAVAIL 报错。
+        linger sl{1, 0};
+        setsockopt(control, SOL_SOCKET, SO_LINGER, &sl, sizeof(sl));
+
         bind_socket(control, local);
         connect_with_timeout(control, server, timeout);
         send_all(control, command);
@@ -365,6 +372,7 @@ Rfc5382TcpResult run_rfc5382_tests(const RequestOptions& options,
         result.local_endpoint = socket_local_endpoint(listener);
         IpEndpoint control_local = select_control_local_endpoint(*result.local_endpoint, primary_server);
         result.local_endpoint = control_local;
+        
         result.tcp_public_endpoint =
             parse_endpoint_line(request_tcp_command(control_local, primary_server, "M\n", options.timeout), primary_server.family);
 
