@@ -218,11 +218,6 @@ bool wait_for_readable(int socket_fd, std::chrono::milliseconds timeout) {
     return rc > 0 && (descriptor.revents & POLLIN) != 0;
 }
 
-IpEndpoint bind_and_get_local_endpoint(int socket_fd, const IpEndpoint& endpoint) {
-    bind_socket(socket_fd, endpoint);
-    return socket_local_endpoint(socket_fd);
-}
-
 void send_all(int socket_fd, std::string_view payload) {
     std::size_t offset = 0;
     while (offset < payload.size()) {
@@ -424,11 +419,11 @@ ProbeStatus run_udp_hairpin_probe(const IpEndpoint& stun_server,
         set_reuse_options(receiver);
         set_reuse_options(sender);
         const IpEndpoint receiver_bind = local_bind.value_or(wildcard_endpoint(stun_server.family));
-        bind_and_get_local_endpoint(receiver, receiver_bind);
+        bind_socket(receiver, receiver_bind);
 
         IpEndpoint sender_bind = receiver_bind;
         sender_bind.port = 0;
-        bind_and_get_local_endpoint(sender, sender_bind);
+        bind_socket(sender, sender_bind);
 
         *public_endpoint = request_stun_udp_mapping(receiver, stun_server, timeout);
         if (!public_endpoint->has_value()) {
@@ -552,7 +547,7 @@ ProbeStatus run_icmp_hairpin_probe(const IpEndpoint& stun_server,
 
         IpEndpoint probe_target = *udp_public_endpoint;
         probe_target.port = probe_target.port == std::numeric_limits<std::uint16_t>::max()
-                                ? static_cast<std::uint16_t>(probe_target.port - 1)
+                                ? static_cast<std::uint16_t>(std::numeric_limits<std::uint16_t>::max() - 1)
                                 : static_cast<std::uint16_t>(probe_target.port + 1);
         SocketAddress target = to_sockaddr(probe_target);
         if (connect(socket_fd, reinterpret_cast<sockaddr*>(&target.storage), target.length) != 0) {
