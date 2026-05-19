@@ -25,6 +25,8 @@ struct SocketAddress {
     socklen_t length{};
 };
 
+void bind_socket(int socket_fd, const IpEndpoint& endpoint);
+
 std::runtime_error system_error(const std::string& message) {
     return std::runtime_error(message + ": " + std::strerror(errno));
 }
@@ -119,6 +121,37 @@ IpEndpoint infer_local_source_for_remote(const IpEndpoint& remote) {
         close(socket_fd);
         throw;
     }
+}
+
+bool can_connect_udp_from_local_address(const IpEndpoint& local, const IpEndpoint& remote) {
+    int socket_fd = socket(remote.family, SOCK_DGRAM, IPPROTO_UDP);
+    if (socket_fd < 0) {
+        return false;
+    }
+    bool ok = false;
+    try {
+        IpEndpoint local_address_only = local;
+        local_address_only.port = 0;
+        bind_socket(socket_fd, local_address_only);
+        SocketAddress remote_address = to_sockaddr(remote);
+        ok = connect(socket_fd, reinterpret_cast<sockaddr*>(&remote_address.storage), remote_address.length) == 0;
+    } catch (...) {
+        ok = false;
+    }
+    close(socket_fd);
+    return ok;
+}
+
+IpEndpoint select_control_local_endpoint(const IpEndpoint& local, const IpEndpoint& remote) {
+    IpEndpoint selected = local;
+    if (!is_wildcard_endpoint_address(local) && can_connect_udp_from_local_address(local, remote)) {
+        return selected;
+    }
+    IpEndpoint routed_local = infer_local_source_for_remote(remote);
+    selected.address = routed_local.address;
+    selected.address_length = routed_local.address_length;
+    selected.family = routed_local.family;
+    return selected;
 }
 
 void set_reuse_options(int socket_fd) {
@@ -330,13 +363,7 @@ Rfc5382TcpResult run_rfc5382_tests(const RequestOptions& options,
             throw system_error("listen failed");
         }
         result.local_endpoint = socket_local_endpoint(listener);
-        IpEndpoint control_local = *result.local_endpoint;
-        if (is_wildcard_endpoint_address(control_local)) {
-            IpEndpoint routed_local = infer_local_source_for_remote(primary_server);
-            control_local.address = routed_local.address;
-            control_local.address_length = routed_local.address_length;
-            control_local.family = routed_local.family;
-        }
+        IpEndpoint control_local = select_control_local_endpoint(*result.local_endpoint, primary_server);
         result.local_endpoint = control_local;
         result.tcp_public_endpoint =
             parse_endpoint_line(request_tcp_command(control_local, primary_server, "M\n", options.timeout), primary_server.family);
