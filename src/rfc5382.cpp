@@ -11,7 +11,6 @@
 #include <array>
 #include <cerrno>
 #include <cstring>
-#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -216,6 +215,36 @@ bool wait_for_readable(int socket_fd, std::chrono::milliseconds timeout) {
     pollfd descriptor{socket_fd, POLLIN, 0};
     int rc = poll(&descriptor, 1, static_cast<int>(timeout.count()));
     return rc > 0 && (descriptor.revents & POLLIN) != 0;
+}
+
+bool wait_for_error(int socket_fd, std::chrono::milliseconds timeout) {
+    pollfd descriptor{socket_fd, POLLERR, 0};
+    int rc = poll(&descriptor, 1, static_cast<int>(timeout.count()));
+    if (rc <= 0 || (descriptor.revents & POLLERR) == 0) {
+        return false;
+    }
+    int error = 0;
+    socklen_t error_length = sizeof(error);
+    return getsockopt(socket_fd, SOL_SOCKET, SO_ERROR, &error, &error_length) == 0 && error != 0;
+}
+
+bool disconnect_udp_socket(int socket_fd) {
+    sockaddr_storage storage{};
+    storage.ss_family = AF_UNSPEC;
+    return connect(socket_fd, reinterpret_cast<sockaddr*>(&storage), sizeof(sa_family_t)) == 0;
+}
+
+ProbeStatus merge_probe_status(ProbeStatus left, ProbeStatus right) {
+    if (left == ProbeStatus::Fail || right == ProbeStatus::Fail) {
+        return ProbeStatus::Fail;
+    }
+    if (left == ProbeStatus::Pass && right == ProbeStatus::Pass) {
+        return ProbeStatus::Pass;
+    }
+    if (left == ProbeStatus::Unknown || right == ProbeStatus::Unknown) {
+        return ProbeStatus::Unknown;
+    }
+    return ProbeStatus::Inconclusive;
 }
 
 void send_all(int socket_fd, std::string_view payload) {
@@ -526,60 +555,97 @@ ProbeStatus run_tcp_hairpin_probe(const IpEndpoint& stun_server,
     }
 }
 
-ProbeStatus run_icmp_hairpin_probe(const IpEndpoint& stun_server,
-                                   const std::optional<IpEndpoint>& local_bind,
-                                   std::chrono::milliseconds timeout,
-                                   const std::optional<IpEndpoint>& udp_public_endpoint) {
-    if (!udp_public_endpoint.has_value()) {
-        return ProbeStatus::Inconclusive;
-    }
-
+ProbeStatus run_udp_icmp_mapping_validation(const IpEndpoint& stun_server,
+                                            const std::optional<IpEndpoint>& local_bind,
+                                            std::chrono::milliseconds timeout) {
     int socket_fd = socket(stun_server.family, SOCK_DGRAM, IPPROTO_UDP);
     if (socket_fd < 0) {
         return ProbeStatus::Inconclusive;
     }
-
     try {
         set_reuse_options(socket_fd);
         IpEndpoint local = local_bind.value_or(wildcard_endpoint(stun_server.family));
         local.port = 0;
         bind_socket(socket_fd, local);
-
-        IpEndpoint probe_target = *udp_public_endpoint;
-        probe_target.port = probe_target.port == std::numeric_limits<std::uint16_t>::max()
-                                ? std::numeric_limits<std::uint16_t>::max() - 1
-                                : probe_target.port + 1;
-        SocketAddress target = to_sockaddr(probe_target);
-        if (connect(socket_fd, reinterpret_cast<sockaddr*>(&target.storage), target.length) != 0) {
+        std::optional<IpEndpoint> mapped_before = request_stun_udp_mapping(socket_fd, stun_server, timeout);
+        if (!mapped_before.has_value()) {
             close(socket_fd);
             return ProbeStatus::Inconclusive;
         }
 
-        ssize_t sent = send(socket_fd, kHairpinIcmpPayload.data(), kHairpinIcmpPayload.size(), 0);
-        if (sent != static_cast<ssize_t>(kHairpinIcmpPayload.size())) {
-            close(socket_fd);
-            return ProbeStatus::Fail;
-        }
-
-        pollfd descriptor{socket_fd, POLLIN | POLLERR, 0};
-        const int rc = poll(&descriptor, 1, static_cast<int>(timeout.count()));
-        if (rc > 0 && (descriptor.revents & POLLERR) != 0) {
-            int error = 0;
-            socklen_t error_length = sizeof(error);
-            if (getsockopt(socket_fd, SOL_SOCKET, SO_ERROR, &error, &error_length) == 0 && error != 0) {
-                close(socket_fd);
-                return ProbeStatus::Pass;
+        auto run_single_error_probe = [&](std::uint16_t offset) -> bool {
+            IpEndpoint target = *mapped_before;
+            target.port = static_cast<std::uint16_t>(target.port + offset);
+            if (target.port == mapped_before->port) {
+                target.port = static_cast<std::uint16_t>(target.port + 1);
             }
-        }
-        if (rc > 0 && (descriptor.revents & POLLIN) != 0) {
-            close(socket_fd);
+            SocketAddress destination = to_sockaddr(target);
+            if (connect(socket_fd, reinterpret_cast<sockaddr*>(&destination.storage), destination.length) != 0) {
+                return false;
+            }
+            const ssize_t sent = send(socket_fd, kHairpinIcmpPayload.data(), kHairpinIcmpPayload.size(), 0);
+            if (sent != static_cast<ssize_t>(kHairpinIcmpPayload.size())) {
+                return false;
+            }
+            return wait_for_error(socket_fd, timeout) && disconnect_udp_socket(socket_fd);
+        };
+
+        const bool unreachable_error = run_single_error_probe(1);
+        const bool secondary_error = run_single_error_probe(2);
+        std::optional<IpEndpoint> mapped_after = request_stun_udp_mapping(socket_fd, stun_server, timeout);
+        close(socket_fd);
+
+        if (!unreachable_error || !secondary_error) {
             return ProbeStatus::Fail;
         }
-
-        close(socket_fd);
-        return ProbeStatus::Inconclusive;
+        if (!mapped_after.has_value() || *mapped_after != *mapped_before) {
+            return ProbeStatus::Fail;
+        }
+        return ProbeStatus::Pass;
     } catch (...) {
         close(socket_fd);
+        return ProbeStatus::Inconclusive;
+    }
+}
+
+ProbeStatus run_tcp_icmp_mapping_validation(const IpEndpoint& stun_server,
+                                            const IpEndpoint& primary_server,
+                                            const std::optional<IpEndpoint>& local_bind,
+                                            std::chrono::milliseconds timeout) {
+    int control = socket(primary_server.family, SOCK_STREAM, IPPROTO_TCP);
+    if (control < 0) {
+        return ProbeStatus::Inconclusive;
+    }
+
+    try {
+        set_reuse_options(control);
+        bind_socket(control, local_bind.value_or(wildcard_endpoint(primary_server.family)));
+        connect_with_timeout(control, primary_server, timeout);
+        send_all(control, "M\n");
+        std::optional<IpEndpoint> mapped_before = parse_endpoint_line(recv_line(control, timeout), primary_server.family);
+        if (!mapped_before.has_value()) {
+            close(control);
+            return ProbeStatus::Inconclusive;
+        }
+
+        IpEndpoint local_tcp = socket_local_endpoint(control);
+        IpEndpoint local_ip_only = local_tcp;
+        local_ip_only.port = 0;
+        ProbeStatus icmp_status = run_udp_icmp_mapping_validation(stun_server, local_ip_only, timeout);
+        if (icmp_status != ProbeStatus::Pass) {
+            close(control);
+            return icmp_status == ProbeStatus::Fail ? ProbeStatus::Fail : ProbeStatus::Inconclusive;
+        }
+
+        send_all(control, "M\n");
+        std::optional<IpEndpoint> mapped_after = parse_endpoint_line(recv_line(control, timeout), primary_server.family);
+        close(control);
+        if (!mapped_after.has_value() || *mapped_after != *mapped_before) {
+            return ProbeStatus::Fail;
+        }
+        return ProbeStatus::Pass;
+    } catch (...) {
+        close(control);
         return ProbeStatus::Inconclusive;
     }
 }
@@ -731,15 +797,39 @@ std::optional<bool> probe_udp_mapping_allows_tcp(const IpEndpoint& local,
 
 } // namespace
 
-HairpinningResult run_hairpinning_tests(const RequestOptions& options,
-                                        const IpEndpoint& stun_server,
-                                        const std::optional<IpEndpoint>& local_bind) {
-    HairpinningResult result;
+ProbeStatus run_udp_hairpinning_test(const RequestOptions& options,
+                                     const IpEndpoint& stun_server,
+                                     const std::optional<IpEndpoint>& local_bind) {
     std::optional<IpEndpoint> udp_public_endpoint;
-    result.udp = run_udp_hairpin_probe(stun_server, local_bind, options.timeout, &udp_public_endpoint);
-    result.tcp = run_tcp_hairpin_probe(stun_server, local_bind, options.timeout);
-    result.icmp = run_icmp_hairpin_probe(stun_server, local_bind, options.timeout, udp_public_endpoint);
-    return result;
+    return run_udp_hairpin_probe(stun_server, local_bind, options.timeout, &udp_public_endpoint);
+}
+
+ProbeStatus run_tcp_hairpinning_test(const RequestOptions& options,
+                                     const IpEndpoint& stun_server,
+                                     const std::optional<IpEndpoint>& local_bind) {
+    return run_tcp_hairpin_probe(stun_server, local_bind, options.timeout);
+}
+
+ProbeStatus run_udp_icmp_error_handling_test(const RequestOptions& options,
+                                             const IpEndpoint& stun_server,
+                                             const std::optional<IpEndpoint>& local_bind) {
+    return run_udp_icmp_mapping_validation(stun_server, local_bind, options.timeout);
+}
+
+ProbeStatus run_tcp_icmp_error_handling_test(const RequestOptions& options,
+                                             const IpEndpoint& stun_server,
+                                             const IpEndpoint& primary_server,
+                                             const std::optional<IpEndpoint>& local_bind) {
+    return run_tcp_icmp_mapping_validation(stun_server, primary_server, local_bind, options.timeout);
+}
+
+ProbeStatus run_rfc7857_icmp_hairpinning_test(const RequestOptions& options,
+                                              const IpEndpoint& stun_server,
+                                              const IpEndpoint& primary_server,
+                                              const std::optional<IpEndpoint>& local_bind) {
+    ProbeStatus udp_status = run_udp_icmp_error_handling_test(options, stun_server, local_bind);
+    ProbeStatus tcp_status = run_tcp_icmp_error_handling_test(options, stun_server, primary_server, local_bind);
+    return merge_probe_status(udp_status, tcp_status);
 }
 
 Rfc5382TcpResult run_rfc5382_tests(const RequestOptions& options,
@@ -789,11 +879,8 @@ Rfc5382TcpResult run_rfc5382_tests(const RequestOptions& options,
             parse_syn_line(request_tcp_command(control_local, primary_server, "S\n", options.timeout));
         result.simultaneous_open = immediate_ok ? ProbeStatus::Pass : ProbeStatus::Fail;
         result.unexpected_syn = delayed_ok ? ProbeStatus::Pass : ProbeStatus::Fail;
-        result.icmp_error_handling = ProbeStatus::Inconclusive;
-        HairpinningResult hairpin = run_hairpinning_tests(options, stun_server, local_bind);
-        result.udp_hairpinning = hairpin.udp;
-        result.tcp_hairpinning = hairpin.tcp;
-        result.icmp_hairpinning = hairpin.icmp;
+        result.icmp_error_handling = run_tcp_icmp_error_handling_test(options, stun_server, primary_server, local_bind);
+        result.tcp_hairpinning = run_tcp_hairpinning_test(options, stun_server, local_bind);
         if (result.local_endpoint.has_value()) {
             result.tcp_mapping_allows_udp =
                 probe_tcp_mapping_allows_udp(*result.local_endpoint, primary_server, options.timeout);

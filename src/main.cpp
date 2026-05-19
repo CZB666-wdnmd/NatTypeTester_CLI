@@ -297,9 +297,10 @@ int main(int argc, char** argv) {
         std::optional<IpEndpoint> local_bind = parse_local_bind(args, stun_server.family, SOCK_STREAM);
 
         if (args.command == "rfc4787") {
+            std::optional<IpEndpoint> udp_local_bind = parse_local_bind(args, stun_server.family, SOCK_DGRAM);
             Rfc4787TestType test_type = parse_rfc4787_test_type(args);
             natcli::Rfc4787Result result =
-                natcli::run_rfc4787_tests(options, test_type, stun_server, primary_server, secondary_server, local_bind);
+                natcli::run_rfc4787_tests(options, test_type, stun_server, primary_server, secondary_server, udp_local_bind);
             print_binding_if_available(result.binding_test_result);
             print_mapping_if_available(result.mapping_behavior);
             if (result.filtering_behavior != natcli::FilteringBehavior::Unknown) {
@@ -309,8 +310,6 @@ int main(int argc, char** argv) {
             print_probe_if_available("PortParityPreservation", result.port_parity_preservation);
             print_probe_if_available("IcmpErrorHandling", result.icmp_error_handling);
             print_probe_if_available("UdpHairpinning", result.udp_hairpinning);
-            print_probe_if_available("TcpHairpinning", result.tcp_hairpinning);
-            print_probe_if_available("IcmpHairpinning", result.icmp_hairpinning);
             print_probe_if_available("OutboundFragmentation", result.outbound_fragmentation);
             print_probe_if_available("InboundFragmentation", result.inbound_fragmentation);
             print_row("PublicEnd", endpoint_or_dash(result.public_endpoint));
@@ -341,9 +340,7 @@ int main(int argc, char** argv) {
             }
             if (test_type == Rfc5382TestType::All || test_type == Rfc5382TestType::Icmp) {
                 print_row("IcmpErrorHandling", natcli::to_string(server_result.icmp_error_handling));
-                print_row("UdpHairpinning", natcli::to_string(server_result.udp_hairpinning));
                 print_row("TcpHairpinning", natcli::to_string(server_result.tcp_hairpinning));
-                print_row("IcmpHairpinning", natcli::to_string(server_result.icmp_hairpinning));
             }
             print_row("LocalEnd", endpoint_or_dash(server_result.local_endpoint));
             return 0;

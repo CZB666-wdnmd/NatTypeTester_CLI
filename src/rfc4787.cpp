@@ -147,11 +147,8 @@ Rfc4787Result run_rfc4787_tests(const RequestOptions& options,
     }
 
     if (run_all || test_type == Rfc4787TestType::Icmp) {
-        result.icmp_error_handling = ProbeStatus::Inconclusive;
-        HairpinningResult hairpin = run_hairpinning_tests(options, stun_server, local_bind);
-        result.udp_hairpinning = hairpin.udp;
-        result.tcp_hairpinning = hairpin.tcp;
-        result.icmp_hairpinning = hairpin.icmp;
+        result.icmp_error_handling = run_udp_icmp_error_handling_test(options, stun_server, local_bind);
+        result.udp_hairpinning = run_udp_hairpinning_test(options, stun_server, local_bind);
     }
 
     if (run_all || test_type == Rfc4787TestType::Fragmentation) {

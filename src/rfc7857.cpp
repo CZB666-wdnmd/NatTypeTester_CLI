@@ -67,9 +67,9 @@ Rfc7857Result run_rfc7857_tests(const RequestOptions& options,
         tcp_result.tcp_mapping_allows_udp, tcp_result.udp_mapping_allows_tcp);
     result.port_parity_preservation =
         classify_port_parity(result.local_endpoint, result.udp_public_endpoint, result.tcp_public_endpoint);
-    result.udp_hairpinning = tcp_result.udp_hairpinning;
+    result.udp_hairpinning = run_udp_hairpinning_test(options, stun_server, local_bind);
     result.tcp_hairpinning = tcp_result.tcp_hairpinning;
-    result.icmp_hairpinning = tcp_result.icmp_hairpinning;
+    result.icmp_hairpinning = run_rfc7857_icmp_hairpinning_test(options, stun_server, primary_server, local_bind);
 
     return result;
 }
