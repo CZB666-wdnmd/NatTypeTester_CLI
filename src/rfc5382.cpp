@@ -587,7 +587,9 @@ ProbeStatus run_udp_icmp_mapping_validation(const IpEndpoint& stun_server,
             if (sent != static_cast<ssize_t>(kHairpinIcmpPayload.size())) {
                 return false;
             }
-            return wait_for_error(socket_fd, timeout) && disconnect_udp_socket(socket_fd);
+            const bool observed_error = wait_for_error(socket_fd, timeout);
+            const bool disconnected = disconnect_udp_socket(socket_fd);
+            return observed_error && disconnected;
         };
 
         const bool unreachable_error = run_single_error_probe(1);
