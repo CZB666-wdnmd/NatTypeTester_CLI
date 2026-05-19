@@ -934,8 +934,8 @@ ProbeStatus run_rfc7857_icmp_hairpinning_test(const RequestOptions& options,
                                               const IpEndpoint& stun_server,
                                               const IpEndpoint& primary_server,
                                               const std::optional<IpEndpoint>& local_bind) {
-    ProbeStatus udp_status = run_udp_icmp_error_handling_test(options, stun_server, local_bind);
-    ProbeStatus tcp_status = run_tcp_icmp_error_handling_test(options, stun_server, primary_server, local_bind);
+    ProbeStatus udp_status = run_udp_icmp_error_handling_test(options, primary_server, local_bind);
+    ProbeStatus tcp_status = run_tcp_icmp_error_handling_test(options, primary_server, local_bind);
     return merge_probe_status(udp_status, tcp_status);
 }
 
