@@ -223,9 +223,9 @@ bool wait_for_error(int socket_fd, std::chrono::milliseconds timeout) {
     if (rc <= 0 || (descriptor.revents & POLLERR) == 0) {
         return false;
     }
-    int error = 0;
-    socklen_t error_length = sizeof(error);
-    return getsockopt(socket_fd, SOL_SOCKET, SO_ERROR, &error, &error_length) == 0 && error != 0;
+    int socket_error = 0;
+    socklen_t error_length = sizeof(socket_error);
+    return getsockopt(socket_fd, SOL_SOCKET, SO_ERROR, &socket_error, &error_length) == 0 && socket_error != 0;
 }
 
 bool disconnect_udp_socket(int socket_fd) {
