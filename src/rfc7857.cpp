@@ -5,29 +5,13 @@
 namespace natcli {
 namespace {
 
-ProbeStatus classify_eim_independence(const std::optional<IpEndpoint>& udp_public,
-                                      const std::optional<IpEndpoint>& tcp_public) {
-    if (!udp_public.has_value() || !tcp_public.has_value()) {
-        return ProbeStatus::Inconclusive;
-    }
-    return *udp_public == *tcp_public ? ProbeStatus::Pass : ProbeStatus::Fail;
-}
-
-ProbeStatus classify_eif_independence(FilteringBehavior udp_filtering, FilteringBehavior tcp_filtering) {
-    if (udp_filtering == FilteringBehavior::Unknown || tcp_filtering == FilteringBehavior::Unknown) {
-        return ProbeStatus::Inconclusive;
-    }
-    if (udp_filtering == FilteringBehavior::EndpointIndependent &&
-        tcp_filtering == FilteringBehavior::EndpointIndependent) {
-        return ProbeStatus::Pass;
-    }
-    return ProbeStatus::Fail;
-}
-
 ProbeStatus classify_port_parity(const std::optional<IpEndpoint>& local,
                                  const std::optional<IpEndpoint>& udp_public,
                                  const std::optional<IpEndpoint>& tcp_public) {
-    if (!local.has_value() || !udp_public.has_value() || !tcp_public.has_value()) {
+    if (!udp_public.has_value() || !tcp_public.has_value()) {
+        return ProbeStatus::Inconclusive;
+    }
+    if (!local.has_value()) {
         return ProbeStatus::Inconclusive;
     }
     const bool local_parity = (local->port % 2) == 0;
@@ -37,6 +21,26 @@ ProbeStatus classify_port_parity(const std::optional<IpEndpoint>& local,
 }
 
 } // namespace
+
+ProbeStatus classify_rfc7857_eim_protocol_independence(const std::optional<IpEndpoint>& udp_public,
+                                                       const std::optional<IpEndpoint>& tcp_public) {
+    if (!udp_public.has_value() || !tcp_public.has_value()) {
+        return ProbeStatus::Inconclusive;
+    }
+    return *udp_public == *tcp_public ? ProbeStatus::Fail : ProbeStatus::Pass;
+}
+
+ProbeStatus classify_rfc7857_eif_protocol_independence(FilteringBehavior udp_filtering,
+                                                       FilteringBehavior tcp_filtering) {
+    if (udp_filtering == FilteringBehavior::Unknown || tcp_filtering == FilteringBehavior::Unknown) {
+        return ProbeStatus::Inconclusive;
+    }
+    if (udp_filtering == FilteringBehavior::EndpointIndependent &&
+        tcp_filtering == FilteringBehavior::EndpointIndependent) {
+        return ProbeStatus::Fail;
+    }
+    return ProbeStatus::Pass;
+}
 
 Rfc7857Result run_rfc7857_tests(const RequestOptions& options,
                                 const IpEndpoint& stun_server,
@@ -57,8 +61,10 @@ Rfc7857Result run_rfc7857_tests(const RequestOptions& options,
     result.local_endpoint = tcp_result.local_endpoint.has_value() ? tcp_result.local_endpoint : udp_mapping.local_endpoint;
     result.udp_public_endpoint = udp_mapping.public_endpoint;
     result.tcp_public_endpoint = tcp_result.tcp_public_endpoint;
-    result.eim_protocol_independence = classify_eim_independence(result.udp_public_endpoint, result.tcp_public_endpoint);
-    result.eif_protocol_independence = classify_eif_independence(result.udp_filtering_behavior, result.tcp_filtering_behavior);
+    result.eim_protocol_independence =
+        classify_rfc7857_eim_protocol_independence(result.udp_public_endpoint, result.tcp_public_endpoint);
+    result.eif_protocol_independence =
+        classify_rfc7857_eif_protocol_independence(result.udp_filtering_behavior, result.tcp_filtering_behavior);
     result.port_parity_preservation =
         classify_port_parity(result.local_endpoint, result.udp_public_endpoint, result.tcp_public_endpoint);
 

@@ -1,4 +1,5 @@
 #include "discovery.hpp"
+#include "rfc7857.hpp"
 
 #include <sys/socket.h>
 
@@ -148,6 +149,26 @@ void test_rfc5389_filtering_address_dependent() {
     expect(session.result.filtering_behavior == FilteringBehavior::AddressDependent);
 }
 
+void test_rfc7857_eim_protocol_independence() {
+    const IpEndpoint udp_public = endpoint(1, 1, 1, 1, 40000);
+    const IpEndpoint same_tcp_public = endpoint(1, 1, 1, 1, 40000);
+    const IpEndpoint different_tcp_public = endpoint(1, 1, 1, 1, 40001);
+
+    expect(classify_rfc7857_eim_protocol_independence(udp_public, same_tcp_public) == ProbeStatus::Fail);
+    expect(classify_rfc7857_eim_protocol_independence(udp_public, different_tcp_public) == ProbeStatus::Pass);
+    expect(classify_rfc7857_eim_protocol_independence(udp_public, std::nullopt) == ProbeStatus::Inconclusive);
+}
+
+void test_rfc7857_eif_protocol_independence() {
+    expect(classify_rfc7857_eif_protocol_independence(FilteringBehavior::EndpointIndependent,
+                                                      FilteringBehavior::EndpointIndependent) == ProbeStatus::Fail);
+    expect(classify_rfc7857_eif_protocol_independence(FilteringBehavior::AddressDependent,
+                                                      FilteringBehavior::EndpointIndependent) == ProbeStatus::Pass);
+    expect(classify_rfc7857_eif_protocol_independence(FilteringBehavior::Unknown,
+                                                      FilteringBehavior::EndpointIndependent) ==
+           ProbeStatus::Inconclusive);
+}
+
 } // namespace
 
 int main() {
@@ -157,6 +178,8 @@ int main() {
         test_rfc3489_symmetric();
         test_rfc5389_mapping_endpoint_independent();
         test_rfc5389_filtering_address_dependent();
+        test_rfc7857_eim_protocol_independence();
+        test_rfc7857_eif_protocol_independence();
         std::cout << "All nat_type_tester_cli_tests passed\n";
         return 0;
     } catch (const std::exception& exception) {

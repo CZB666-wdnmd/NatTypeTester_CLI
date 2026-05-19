@@ -241,11 +241,11 @@ nat_type_tester_cli rfc7857 --stun_server host[:port] --primary_server host[:por
 并计算三项一致性：
 
 - `EimProtocolIndependence`
-  - 若 `UdpPublicEnd == TcpPublicEnd` → `Pass`
-  - 否则 `Fail`
+  - 若 `UdpPublicEnd != TcpPublicEnd` → `Pass`
+  - 若 `UdpPublicEnd == TcpPublicEnd` → `Fail`
 - `EifProtocolIndependence`
-  - UDP/TCP Filtering 都是 `EndpointIndependent` → `Pass`
-  - 否则 `Fail`
+  - 只要 UDP/TCP 过滤不是“同时都为 `EndpointIndependent`” → `Pass`
+  - UDP/TCP Filtering 都是 `EndpointIndependent` → `Fail`
 - `PortParityPreservation`
   - 本地端口与 UDP/TCP 外网端口奇偶都一致 → `Pass`
   - 否则 `Fail`
