@@ -547,8 +547,8 @@ ProbeStatus run_icmp_hairpin_probe(const IpEndpoint& stun_server,
 
         IpEndpoint probe_target = *udp_public_endpoint;
         probe_target.port = probe_target.port == std::numeric_limits<std::uint16_t>::max()
-                                ? static_cast<std::uint16_t>(std::numeric_limits<std::uint16_t>::max() - 1)
-                                : static_cast<std::uint16_t>(probe_target.port + 1);
+                                ? std::numeric_limits<std::uint16_t>::max() - 1
+                                : probe_target.port + 1;
         SocketAddress target = to_sockaddr(probe_target);
         if (connect(socket_fd, reinterpret_cast<sockaddr*>(&target.storage), target.length) != 0) {
             close(socket_fd);
