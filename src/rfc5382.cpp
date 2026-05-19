@@ -20,6 +20,10 @@
 namespace natcli {
 namespace {
 
+constexpr std::string_view kUdpMappingRequest = "M\n";
+constexpr std::string_view kRfc7857UdpProbePayload = "RFC7857-UDP-PROBE\n";
+constexpr char kProbeResultFlagKey = 'R';
+
 struct SocketAddress {
     sockaddr_storage storage{};
     socklen_t length{};
@@ -285,6 +289,19 @@ std::pair<bool, bool> parse_syn_line(const std::string& line) {
     return {parse_flag(immediate_field, 'I'), parse_flag(delayed_field, 'D')};
 }
 
+bool parse_flag_response(const std::string& line, char key) {
+    if (line.size() != 3 || line[0] != key || line[1] != '=') {
+        throw std::runtime_error("Invalid single-flag response");
+    }
+    if (line[2] == '0') {
+        return false;
+    }
+    if (line[2] == '1') {
+        return true;
+    }
+    throw std::runtime_error("Invalid single-flag value");
+}
+
 std::string request_tcp_command(const IpEndpoint& local,
                                 const IpEndpoint& server,
                                 std::string_view command,
@@ -324,7 +341,8 @@ std::optional<IpEndpoint> request_udp_mapping(const IpEndpoint& local, const IpE
         set_reuse_options(socket_fd);
         bind_socket(socket_fd, local);
         SocketAddress remote = to_sockaddr(server);
-        ssize_t sent = sendto(socket_fd, "M\n", 2, 0, reinterpret_cast<sockaddr*>(&remote.storage), remote.length);
+        ssize_t sent = sendto(socket_fd, kUdpMappingRequest.data(), kUdpMappingRequest.size(), 0,
+                              reinterpret_cast<sockaddr*>(&remote.storage), remote.length);
         if (sent <= 0) {
             throw system_error("sendto failed");
         }
@@ -343,6 +361,88 @@ std::optional<IpEndpoint> request_udp_mapping(const IpEndpoint& local, const IpE
         return parse_endpoint_line(std::string(buffer.data()), server.family);
     } catch (...) {
         close(socket_fd);
+        throw;
+    }
+}
+
+std::optional<bool> probe_tcp_mapping_allows_udp(const IpEndpoint& local,
+                                                 const IpEndpoint& server,
+                                                 std::chrono::milliseconds timeout) {
+    int socket_fd = socket(server.family, SOCK_DGRAM, IPPROTO_UDP);
+    if (socket_fd < 0) {
+        throw system_error("socket failed");
+    }
+
+    try {
+        set_reuse_options(socket_fd);
+        bind_socket(socket_fd, local);
+        const bool server_probe_sent =
+            parse_flag_response(request_tcp_command(local, server, "U\n", timeout), kProbeResultFlagKey);
+        if (!server_probe_sent) {
+            close(socket_fd);
+            return std::nullopt;
+        }
+
+        if (!wait_for_readable(socket_fd, timeout)) {
+            close(socket_fd);
+            return false;
+        }
+        std::array<char, 256> buffer{};
+        ssize_t received = recv(socket_fd, buffer.data(), buffer.size(), 0);
+        close(socket_fd);
+        if (received <= 0) {
+            return false;
+        }
+        const std::string_view received_payload(buffer.data(), static_cast<std::size_t>(received));
+        return received_payload == kRfc7857UdpProbePayload;
+    } catch (...) {
+        close(socket_fd);
+        throw;
+    }
+}
+
+std::optional<bool> probe_udp_mapping_allows_tcp(const IpEndpoint& local,
+                                                 const IpEndpoint& server,
+                                                 std::chrono::milliseconds timeout) {
+    int udp_socket = socket(server.family, SOCK_DGRAM, IPPROTO_UDP);
+    if (udp_socket < 0) {
+        throw system_error("socket failed");
+    }
+
+    try {
+        set_reuse_options(udp_socket);
+        bind_socket(udp_socket, local);
+
+        SocketAddress remote = to_sockaddr(server);
+        ssize_t sent = sendto(udp_socket, kUdpMappingRequest.data(), kUdpMappingRequest.size(), 0,
+                              reinterpret_cast<sockaddr*>(&remote.storage), remote.length);
+        if (sent <= 0) {
+            throw system_error("sendto failed");
+        }
+        if (!wait_for_readable(udp_socket, timeout)) {
+            close(udp_socket);
+            return std::nullopt;
+        }
+        std::array<char, 256> buffer{};
+        ssize_t received = recv(udp_socket, buffer.data(), buffer.size() - 1, 0);
+        if (received <= 0) {
+            close(udp_socket);
+            return std::nullopt;
+        }
+        buffer[static_cast<std::size_t>(received)] = '\0';
+        std::optional<IpEndpoint> udp_public = parse_endpoint_line(std::string(buffer.data()), server.family);
+        if (!udp_public.has_value()) {
+            close(udp_socket);
+            return std::nullopt;
+        }
+
+        const std::string command = "C " + to_string(*udp_public) + "\n";
+        const bool tcp_probe_connected =
+            parse_flag_response(request_tcp_command(local, server, command, timeout), kProbeResultFlagKey);
+        close(udp_socket);
+        return tcp_probe_connected;
+    } catch (...) {
+        close(udp_socket);
         throw;
     }
 }
@@ -396,6 +496,12 @@ Rfc5382TcpResult run_rfc5382_tests(const RequestOptions& options,
         result.simultaneous_open = immediate_ok ? ProbeStatus::Pass : ProbeStatus::Fail;
         result.unexpected_syn = delayed_ok ? ProbeStatus::Pass : ProbeStatus::Fail;
         result.icmp_error_handling = ProbeStatus::Inconclusive;
+        if (result.local_endpoint.has_value()) {
+            result.tcp_mapping_allows_udp =
+                probe_tcp_mapping_allows_udp(*result.local_endpoint, primary_server, options.timeout);
+            result.udp_mapping_allows_tcp =
+                probe_udp_mapping_allows_tcp(*result.local_endpoint, primary_server, options.timeout);
+        }
 
         constexpr int max_drain_accepts = 4; // server sends up to primary+secondary probe connections plus retries
         for (int index = 0; index < max_drain_accepts; ++index) {
