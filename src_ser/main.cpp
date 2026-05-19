@@ -311,9 +311,10 @@ void handle_tcp_client(int client_fd,
 }
 
 void handle_udp_packet(int udp_fd) {
+    constexpr std::size_t UDP_BUFFER_SIZE = 4096;
     sockaddr_storage peer{};
     socklen_t peer_length = sizeof(peer);
-    std::vector<char> buffer(4096);
+    std::vector<char> buffer(UDP_BUFFER_SIZE);
     ssize_t received = recvfrom(udp_fd, buffer.data(), buffer.size(), 0, reinterpret_cast<sockaddr*>(&peer), &peer_length);
     if (received <= 0) {
         return;

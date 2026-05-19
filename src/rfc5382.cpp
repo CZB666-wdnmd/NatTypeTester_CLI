@@ -202,8 +202,8 @@ std::pair<bool, bool> parse_syn_line(const std::string& line) {
         throw std::runtime_error("Invalid SYN probe response");
     }
     auto parse_flag = [](const std::string& field, const char key) -> bool {
-        constexpr std::size_t FLAG_FIELD_SIZE = 3; // "I=1" / "D=0"
-        if (field.size() != FLAG_FIELD_SIZE || field[0] != key || field[1] != '=') {
+        constexpr std::size_t SYN_FLAG_FIELD_SIZE = 3; // "I=1" / "D=0"
+        if (field.size() != SYN_FLAG_FIELD_SIZE || field[0] != key || field[1] != '=') {
             throw std::runtime_error("Invalid SYN probe response field");
         }
         return field[2] == '1';
