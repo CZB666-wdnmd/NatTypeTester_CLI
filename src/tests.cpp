@@ -151,12 +151,13 @@ void test_rfc5389_filtering_address_dependent() {
 
 void test_rfc7857_eim_protocol_independence() {
     const IpEndpoint udp_public = endpoint(1, 1, 1, 1, 40000);
-    const IpEndpoint same_tcp_public = endpoint(1, 1, 1, 1, 40000);
+    const IpEndpoint tcp_public_same_port = endpoint(1, 1, 1, 1, 40000);
     const IpEndpoint different_tcp_public = endpoint(1, 1, 1, 1, 40001);
 
-    expect(classify_rfc7857_eim_protocol_independence(udp_public, same_tcp_public) == ProbeStatus::Fail);
+    expect(classify_rfc7857_eim_protocol_independence(udp_public, tcp_public_same_port) == ProbeStatus::Fail);
     expect(classify_rfc7857_eim_protocol_independence(udp_public, different_tcp_public) == ProbeStatus::Pass);
     expect(classify_rfc7857_eim_protocol_independence(udp_public, std::nullopt) == ProbeStatus::Inconclusive);
+    expect(classify_rfc7857_eim_protocol_independence(std::nullopt, std::nullopt) == ProbeStatus::Inconclusive);
 }
 
 void test_rfc7857_eif_protocol_independence() {
