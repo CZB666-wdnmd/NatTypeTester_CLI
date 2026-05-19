@@ -74,7 +74,9 @@ ParsedArguments parse_arguments(int argc, char** argv) {
 
 void print_help() {
     std::cout
-        << "NatTypeTester standalone C++ CLI\n\n"
+        << "NatTypeTester standalone C++ CLI\n"
+        << "================================\n"
+        << "一个多协议 NAT 行为与穿透特性测试工具，支持 RFC 3489 / 5780 / 4787 / 5382 / 7857。\n\n"
         << "Usage:\n"
         << "  nat_type_tester_cli rfc3489 --stun_server host[:port] [--local host[:port]] [--timeout-ms 3000]\n"
         << "  nat_type_tester_cli rfc5780 --stun_server host[:port] [--local host[:port]] [--transport udp|tcp|tls]\n"
@@ -84,7 +86,7 @@ void print_help() {
         << "  nat_type_tester_cli rfc5382 --stun_server host[:port] --primary_server host[:port] --secondary_server host[:port]\n"
         << "                               [--local host[:port]] [--test-type all|mapping|filtering|simultaneous-open|unexpected-syn|icmp] [--timeout-ms 3000]\n"
         << "  nat_type_tester_cli rfc7857 --stun_server host[:port] --primary_server host[:port] --secondary_server host[:port]\n"
-        << "                               [--local host[:port]] [--timeout-ms 3000]\n";
+        << "                               [--local host[:port]] [--timeout-ms 3000]\n\n";
 }
 
 std::string require_option(const ParsedArguments& args, const std::string& name) {

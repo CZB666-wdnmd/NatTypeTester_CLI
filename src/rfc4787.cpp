@@ -147,7 +147,7 @@ Rfc4787Result run_rfc4787_tests(const RequestOptions& options,
     }
 
     if (run_all || test_type == Rfc4787TestType::Icmp) {
-        result.icmp_error_handling = run_udp_icmp_error_handling_test(options, stun_server, local_bind);
+        result.icmp_error_handling = run_udp_icmp_error_handling_test(options, primary_server, local_bind);
         result.udp_hairpinning = run_udp_hairpinning_test(options, stun_server, local_bind);
     }
 

@@ -30,10 +30,9 @@ ProbeStatus run_tcp_hairpinning_test(const RequestOptions& options,
                                      const IpEndpoint& stun_server,
                                      const std::optional<IpEndpoint>& local_bind);
 ProbeStatus run_udp_icmp_error_handling_test(const RequestOptions& options,
-                                             const IpEndpoint& stun_server,
+                                             const IpEndpoint& primary_server,
                                              const std::optional<IpEndpoint>& local_bind);
 ProbeStatus run_tcp_icmp_error_handling_test(const RequestOptions& options,
-                                             const IpEndpoint& stun_server,
                                              const IpEndpoint& primary_server,
                                              const std::optional<IpEndpoint>& local_bind);
 ProbeStatus run_rfc7857_icmp_hairpinning_test(const RequestOptions& options,

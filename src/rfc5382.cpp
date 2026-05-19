@@ -16,6 +16,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <thread>
 
 namespace natcli {
 namespace {
@@ -652,6 +653,111 @@ ProbeStatus run_tcp_icmp_mapping_validation(const IpEndpoint& stun_server,
     }
 }
 
+ProbeStatus run_server_assisted_udp_icmp_test(const IpEndpoint& primary_server,
+                                              const std::optional<IpEndpoint>& local_bind,
+                                              std::chrono::milliseconds timeout) {
+    int socket_fd = socket(primary_server.family, SOCK_DGRAM, IPPROTO_UDP);
+    if (socket_fd < 0) {
+        return ProbeStatus::Inconclusive;
+    }
+    try {
+        set_reuse_options(socket_fd);
+        IpEndpoint local = local_bind.value_or(wildcard_endpoint(primary_server.family));
+        local.port = 0;
+        bind_socket(socket_fd, local);
+
+        SocketAddress remote = to_sockaddr(primary_server);
+
+        auto exchange = [&](std::string_view req) -> std::string {
+            sendto(socket_fd, req.data(), req.size(), 0, reinterpret_cast<sockaddr*>(&remote.storage), remote.length);
+            if (!wait_for_readable(socket_fd, timeout)) return "";
+            std::array<char, 256> buf{};
+            ssize_t rx = recv(socket_fd, buf.data(), buf.size() - 1, 0);
+            if (rx <= 0) return "";
+            buf[static_cast<std::size_t>(rx)] = '\0';
+            return std::string(buf.data());
+        };
+
+        // 1. 获取基准映射
+        std::string baseline = exchange("M\n");
+        std::optional<IpEndpoint> mapped_before = parse_endpoint_line(baseline, primary_server.family);
+        if (!mapped_before.has_value()) { close(socket_fd); return ProbeStatus::Inconclusive; }
+
+        // 2. 发送 I 指令，让服务器注入 ICMP 错误包
+        std::string icmp_resp = exchange("I\n");
+        if (icmp_resp != "I=1\n") { close(socket_fd); return ProbeStatus::Inconclusive; }
+
+        // 3. 延时等待 NAT 处理
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+        // 4. 再次验证映射，测试 REQ-12
+        std::string after = exchange("M\n");
+        if (after.empty()) {
+            close(socket_fd);
+            return ProbeStatus::Fail; // 超时说明 NAT 擅自把映射删了
+        }
+
+        std::optional<IpEndpoint> mapped_after = parse_endpoint_line(after, primary_server.family);
+        close(socket_fd);
+
+        if (!mapped_after.has_value() || *mapped_after != *mapped_before) {
+            return ProbeStatus::Fail;
+        }
+        return ProbeStatus::Pass;
+    } catch (...) {
+        close(socket_fd);
+        return ProbeStatus::Inconclusive;
+    }
+}
+
+ProbeStatus run_server_assisted_tcp_icmp_test(const IpEndpoint& primary_server,
+                                              const std::optional<IpEndpoint>& local_bind,
+                                              std::chrono::milliseconds timeout) {
+    int control = socket(primary_server.family, SOCK_STREAM, IPPROTO_TCP);
+    if (control < 0) {
+        return ProbeStatus::Inconclusive;
+    }
+
+    try {
+        set_reuse_options(control);
+        bind_socket(control, local_bind.value_or(wildcard_endpoint(primary_server.family)));
+        connect_with_timeout(control, primary_server, timeout);
+
+        // 1. 获取基准映射
+        send_all(control, "M\n");
+        std::optional<IpEndpoint> mapped_before = parse_endpoint_line(recv_line(control, timeout), primary_server.family);
+        if (!mapped_before.has_value()) { close(control); return ProbeStatus::Inconclusive; }
+
+        // 2. 触发服务器发回带有 TCP 5元组的 ICMP 错误包
+        send_all(control, "I\n");
+        std::string i_resp = recv_line(control, timeout);
+        if (i_resp != "I=1") { close(control); return ProbeStatus::Inconclusive; }
+
+        // 3. 延时等待 NAT 处理
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+        // 4. 验证 TCP 连接是否依然存活，测试 REQ-10
+        std::optional<IpEndpoint> mapped_after;
+        try {
+            send_all(control, "M\n");
+            mapped_after = parse_endpoint_line(recv_line(control, timeout), primary_server.family);
+        } catch (...) {
+            // 如果发 M 时抛出异常 (Connection reset by peer)，说明 NAT 干掉了连接
+            close(control);
+            return ProbeStatus::Fail; 
+        }
+
+        close(control);
+        if (!mapped_after.has_value() || *mapped_after != *mapped_before) {
+            return ProbeStatus::Fail;
+        }
+        return ProbeStatus::Pass;
+    } catch (...) {
+        close(control);
+        return ProbeStatus::Fail;
+    }
+}
+
 std::string request_tcp_command(const IpEndpoint& local,
                                 const IpEndpoint& server,
                                 std::string_view command,
@@ -813,24 +919,23 @@ ProbeStatus run_tcp_hairpinning_test(const RequestOptions& options,
 }
 
 ProbeStatus run_udp_icmp_error_handling_test(const RequestOptions& options,
-                                             const IpEndpoint& stun_server,
+                                             const IpEndpoint& primary_server,
                                              const std::optional<IpEndpoint>& local_bind) {
-    return run_udp_icmp_mapping_validation(stun_server, local_bind, options.timeout);
+    return run_server_assisted_udp_icmp_test(primary_server, local_bind, options.timeout);
 }
 
 ProbeStatus run_tcp_icmp_error_handling_test(const RequestOptions& options,
-                                             const IpEndpoint& stun_server,
                                              const IpEndpoint& primary_server,
                                              const std::optional<IpEndpoint>& local_bind) {
-    return run_tcp_icmp_mapping_validation(stun_server, primary_server, local_bind, options.timeout);
+    return run_server_assisted_tcp_icmp_test(primary_server, local_bind, options.timeout);
 }
 
 ProbeStatus run_rfc7857_icmp_hairpinning_test(const RequestOptions& options,
                                               const IpEndpoint& stun_server,
                                               const IpEndpoint& primary_server,
                                               const std::optional<IpEndpoint>& local_bind) {
-    ProbeStatus udp_status = run_udp_icmp_error_handling_test(options, stun_server, local_bind);
-    ProbeStatus tcp_status = run_tcp_icmp_error_handling_test(options, stun_server, primary_server, local_bind);
+    ProbeStatus udp_status = run_udp_icmp_error_handling_test(options, primary_server, local_bind);
+    ProbeStatus tcp_status = run_tcp_icmp_error_handling_test(options, primary_server, local_bind);
     return merge_probe_status(udp_status, tcp_status);
 }
 
@@ -881,7 +986,7 @@ Rfc5382TcpResult run_rfc5382_tests(const RequestOptions& options,
             parse_syn_line(request_tcp_command(control_local, primary_server, "S\n", options.timeout));
         result.simultaneous_open = immediate_ok ? ProbeStatus::Pass : ProbeStatus::Fail;
         result.unexpected_syn = delayed_ok ? ProbeStatus::Pass : ProbeStatus::Fail;
-        result.icmp_error_handling = run_tcp_icmp_error_handling_test(options, stun_server, primary_server, local_bind);
+        result.icmp_error_handling = run_tcp_icmp_error_handling_test(options, primary_server, local_bind);
         result.tcp_hairpinning = run_tcp_hairpinning_test(options, stun_server, local_bind);
         if (result.local_endpoint.has_value()) {
             result.tcp_mapping_allows_udp =

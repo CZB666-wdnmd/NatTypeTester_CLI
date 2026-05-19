@@ -1,6 +1,6 @@
 # NatTypeTester_CLI
 
-一个基于 C++ 的 NAT 行为测试命令行工具，覆盖：
+一个基于 C++ 的 NAT 行为测试命令行工具，提供对现代和经典 NAT/防火墙行为的深度探测，覆盖：
 
 - RFC 3489（经典 NAT Type）
 - RFC 5780 / RFC 5389 / RFC 8489 体系下的 Binding / Mapping / Filtering 行为探测
@@ -31,29 +31,9 @@
 
 ---
 
-## 2. 构建与测试
+## 2. 运行
 
-### 2.1 构建客户端（`src`）
-
-```bash
-cmake -S src -B src/build
-cmake --build src/build
-```
-
-### 2.2 运行客户端单元测试
-
-```bash
-ctest --test-dir src/build --output-on-failure
-```
-
-### 2.3 构建 RFC5382 扩展服务端（`src_ser`）
-
-```bash
-cmake -S src_ser -B src_ser/build
-cmake --build src_ser/build
-```
-
----
+目前仅支持 x64 Linux 环境，直接编译或下载二进制文件即可运行。客户端无需特殊权限，但**服务端由于包含原生 ICMP 注入测试，需要 `root` 权限**。
 
 ## 3. CLI 用法
 
@@ -78,7 +58,7 @@ nat_type_tester_cli rfc7857 --stun_server host[:port] --primary_server host[:por
 - `--stun_server` 默认端口 `3478`
 - `--local` 可选；用于指定本地绑定地址/端口
 - `--timeout-ms` 默认 `3000`
-- `rfc5780 --transport tls` 时，可用 `--skip-cert 1` 跳过证书校验（测试环境用）
+- `rfc5780 --transport tls` 时，可用 `--skip-cert 1` 跳过证书校验
 
 ---
 
@@ -97,17 +77,19 @@ nat_type_tester_cli rfc7857 --stun_server host[:port] --primary_server host[:por
 - `rfc5382`
 - `rfc7857`
 
-原因：这三类测试包含“非标准 STUN 回路”与“主动回连探测”，普通公网 STUN 服务器不提供该能力。
+**原因**：这三类测试包含“非标准 STUN 回路”、“主动 TCP 回连探测”以及“真实的外部 ICMP 错误注入”，普通公网 STUN 服务器无法提供这种定制化的网络控制能力。
 
-启动方式示例：
+**启动方式示例（服务端）：**
+
+ **重要**：为了测试 NAT 对外部 ICMP 错误的处理能力，服务端使用了 Raw Socket 伪造数据包，因此**必须使用 `sudo` 运行**。
 
 ```bash
-./src_ser/build/nat_type_tester_rfc5382_server \
+sudo ./src_ser/build/nat_type_tester_rfc5382_server \
   --primary 1.2.3.4:3478 \
   --secondary 5.6.7.8:3478
 ```
 
-再执行客户端：
+**执行客户端：**
 
 ```bash
 ./src/build/nat_type_tester_cli rfc5382 \
@@ -116,10 +98,10 @@ nat_type_tester_cli rfc7857 --stun_server host[:port] --primary_server host[:por
   --secondary_server 5.6.7.8:3478
 ```
 
-要求：
+**服务端要求：**
 
 - `primary` 与 `secondary` 必须是同地址族（同为 IPv4 或同为 IPv6）
-- 服务端两个地址都要可达
+- 服务端两个地址必须均可从公网访问
 
 ---
 
@@ -191,13 +173,13 @@ nat_type_tester_cli rfc7857 --stun_server host[:port] --primary_server host[:por
   - `PortParityPreservation`：内外端口奇偶性是否保持
 - `fragmentation`：向 `primary/secondary` 发送 2000 字节 UDP 负载并等待回显
   - `OutboundFragmentation` / `InboundFragmentation` 用 Pass/Fail 表示
-- `icmp`：建立 UDP 映射后触发 ICMP 错误探测，输出 `IcmpErrorHandling`；该子命令只包含 UDP 回环（`UdpHairpinning`）
+- `icmp`：
+  - `IcmpErrorHandling` (外部错误容忍)：由自定义服务端注入携带原始 UDP 五元组的真实 ICMP 错误，验证 NAT 收到外部 ICMP 后是否会违规销毁 UDP 映射 (REQ-12)。
+  - `UdpHairpinning` (内部回环)：向同一公网 IP 的相邻未映射端口发包，触发并验证 NAT 能否正确回传内部产生的 ICMP Port Unreachable。
 
 尚未实现的检测:
-- [ ] REQ-2：如果 NAT 有多个公网 IP，推荐（RECOMMENDED）使用“成对（Paired）”的 IP 地址池行为。
 - [ ] REQ-5：NAT 的 UDP 映射超时时间绝不能（MUST NOT）小于 2 分钟，推荐默认超时时间为 5 分钟或以上。
 - [ ] REQ-6：NAT 必须（MUST）在有“出站（Outbound）”流量时刷新超时定时器。
-- [ ] REQ-12：接收到 ICMP 错误消息绝不能（MUST NOT）导致 NAT 销毁映射。
 
 ## 5.4 `rfc5382`：TCP NAT 行为要求
 
@@ -223,14 +205,12 @@ nat_type_tester_cli rfc7857 --stun_server host[:port] --primary_server host[:por
 - `UnexpectedSynHandling`
   - `D=1` → `Pass`，否则 `Fail`
 - `IcmpErrorHandling`
-  - 在已建立 TCP 连接后触发 ICMP 错误探测，并检查连接/映射是否保持
+  - 已建立 TCP 控制连接后，由服务端向客户端 NAT 注入携带 TCP 原始报头的 ICMP 错误，验证 NAT 是否违规掐断 TCP 连接 或能否正确翻译错误。
 - Hairpinning
   - RFC5382 仅输出 `TcpHairpinning`
 
 尚未实现的检测:
 - [ ] REQ-5：对于已建立（Established）的 TCP 连接，NAT 的空闲超时时间不得少于 2 小时 4 分钟。对于过渡状态，超时时间不得少于 4 分钟。
-- [ ] REQ-9：NAT 应该翻译 ICMP 目标不可达消息。
-- [ ] REQ-10：收到任何类型的 ICMP 消息，NAT 都“绝对不能”终结 TCP 连接或删掉映射。
 
 ## 5.5 `rfc7857`：跨协议一致性（UDP + TCP）
 
@@ -240,7 +220,7 @@ nat_type_tester_cli rfc7857 --stun_server host[:port] --primary_server host[:por
 - UDP Filtering：来自 RFC5780 Filtering
 - TCP Filtering：来自 RFC5382
 - Hairpinning（UDP/TCP）：分别使用 RFC4787 的 UDP 回环和 RFC5382 的 TCP 回环
-- ICMP Hairpinning：在已建立 UDP/TCP 连接下联合验证 ICMP 错误可达性与映射保持
+- ICMP Hairpinning：验证基于已建立 UDP/TCP 连接下，NAT 对局域网内部 ICMP 的回路转发能力。
 
 并计算三项一致性：
 
