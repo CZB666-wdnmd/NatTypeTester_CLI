@@ -308,6 +308,9 @@ int main(int argc, char** argv) {
             print_probe_if_available("PortRangePreservation", result.port_range_preservation);
             print_probe_if_available("PortParityPreservation", result.port_parity_preservation);
             print_probe_if_available("IcmpErrorHandling", result.icmp_error_handling);
+            print_probe_if_available("UdpHairpinning", result.udp_hairpinning);
+            print_probe_if_available("TcpHairpinning", result.tcp_hairpinning);
+            print_probe_if_available("IcmpHairpinning", result.icmp_hairpinning);
             print_probe_if_available("OutboundFragmentation", result.outbound_fragmentation);
             print_probe_if_available("InboundFragmentation", result.inbound_fragmentation);
             print_row("PublicEnd", endpoint_or_dash(result.public_endpoint));
@@ -320,7 +323,7 @@ int main(int argc, char** argv) {
             natcli::StunResult5389 mapping_result =
                 natcli::run_rfc5780_test(options, StunTestType::Mapping, stun_server, local_bind);
             natcli::Rfc5382TcpResult server_result =
-                natcli::run_rfc5382_tests(options, primary_server, secondary_server, local_bind);
+                natcli::run_rfc5382_tests(options, stun_server, primary_server, secondary_server, local_bind);
 
             if (test_type == Rfc5382TestType::All || test_type == Rfc5382TestType::Mapping) {
                 print_row("MappingBehavior", natcli::to_string(mapping_result.mapping_behavior));
@@ -338,6 +341,9 @@ int main(int argc, char** argv) {
             }
             if (test_type == Rfc5382TestType::All || test_type == Rfc5382TestType::Icmp) {
                 print_row("IcmpErrorHandling", natcli::to_string(server_result.icmp_error_handling));
+                print_row("UdpHairpinning", natcli::to_string(server_result.udp_hairpinning));
+                print_row("TcpHairpinning", natcli::to_string(server_result.tcp_hairpinning));
+                print_row("IcmpHairpinning", natcli::to_string(server_result.icmp_hairpinning));
             }
             print_row("LocalEnd", endpoint_or_dash(server_result.local_endpoint));
             return 0;
@@ -351,6 +357,9 @@ int main(int argc, char** argv) {
         print_row("EimProtocolIndependence", natcli::to_string(result.eim_protocol_independence));
         print_row("EifProtocolIndependence", natcli::to_string(result.eif_protocol_independence));
         print_row("PortParityPreservation", natcli::to_string(result.port_parity_preservation));
+        print_row("UdpHairpinning", natcli::to_string(result.udp_hairpinning));
+        print_row("TcpHairpinning", natcli::to_string(result.tcp_hairpinning));
+        print_row("IcmpHairpinning", natcli::to_string(result.icmp_hairpinning));
         print_row("UdpPublicEnd", endpoint_or_dash(result.udp_public_endpoint));
         print_row("TcpPublicEnd", endpoint_or_dash(result.tcp_public_endpoint));
         print_row("LocalEnd", endpoint_or_dash(result.local_endpoint));

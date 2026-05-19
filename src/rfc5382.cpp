@@ -11,6 +11,7 @@
 #include <array>
 #include <cerrno>
 #include <cstring>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -23,6 +24,8 @@ namespace {
 constexpr std::string_view kUdpMappingRequest = "M\n";
 constexpr std::string_view kRfc7857UdpProbePayload = "RFC7857-UDP-PROBE\n";
 constexpr char kProbeResultFlagKey = 'R';
+constexpr std::string_view kHairpinUdpPayload = "RFC-HAIRPIN-UDP\n";
+constexpr std::string_view kHairpinIcmpPayload = "RFC-HAIRPIN-ICMP\n";
 
 struct SocketAddress {
     sockaddr_storage storage{};
@@ -215,6 +218,11 @@ bool wait_for_readable(int socket_fd, std::chrono::milliseconds timeout) {
     return rc > 0 && (descriptor.revents & POLLIN) != 0;
 }
 
+IpEndpoint bind_and_get_local_endpoint(int socket_fd, const IpEndpoint& endpoint) {
+    bind_socket(socket_fd, endpoint);
+    return socket_local_endpoint(socket_fd);
+}
+
 void send_all(int socket_fd, std::string_view payload) {
     std::size_t offset = 0;
     while (offset < payload.size()) {
@@ -300,6 +308,285 @@ bool parse_flag_response(const std::string& line, char key) {
         return true;
     }
     throw std::runtime_error("Invalid single-flag value");
+}
+
+std::optional<IpEndpoint> request_stun_udp_mapping(int socket_fd,
+                                                   const IpEndpoint& stun_server,
+                                                   std::chrono::milliseconds timeout) {
+    StunMessage request = create_binding_request(0x2112A442u);
+    std::vector<std::uint8_t> payload = serialize(request);
+    SocketAddress remote = to_sockaddr(stun_server);
+    ssize_t sent = sendto(socket_fd,
+                          payload.data(),
+                          payload.size(),
+                          0,
+                          reinterpret_cast<sockaddr*>(&remote.storage),
+                          remote.length);
+    if (sent != static_cast<ssize_t>(payload.size())) {
+        return std::nullopt;
+    }
+    if (!wait_for_readable(socket_fd, timeout)) {
+        return std::nullopt;
+    }
+
+    std::array<std::uint8_t, 2048> buffer{};
+    ssize_t received = recv(socket_fd, buffer.data(), buffer.size(), 0);
+    if (received <= 0) {
+        return std::nullopt;
+    }
+
+    StunMessage response;
+    if (!parse_message(buffer.data(), static_cast<std::size_t>(received), response) ||
+        response.magic_cookie != request.magic_cookie || response.transaction_id != request.transaction_id) {
+        return std::nullopt;
+    }
+
+    if (std::optional<IpEndpoint> xor_mapped = get_xor_mapped_address_attribute(response); xor_mapped.has_value()) {
+        return xor_mapped;
+    }
+    return get_mapped_address_attribute(response);
+}
+
+std::optional<IpEndpoint> request_stun_tcp_mapping(const IpEndpoint& local_bind,
+                                                   const IpEndpoint& stun_server,
+                                                   std::chrono::milliseconds timeout,
+                                                   std::optional<IpEndpoint>* local_endpoint) {
+    int socket_fd = socket(stun_server.family, SOCK_STREAM, IPPROTO_TCP);
+    if (socket_fd < 0) {
+        return std::nullopt;
+    }
+
+    try {
+        set_reuse_options(socket_fd);
+        bind_socket(socket_fd, local_bind);
+        connect_with_timeout(socket_fd, stun_server, timeout);
+        *local_endpoint = socket_local_endpoint(socket_fd);
+
+        StunMessage request = create_binding_request(0x2112A442u);
+        std::vector<std::uint8_t> payload = serialize(request);
+        std::size_t offset = 0;
+        while (offset < payload.size()) {
+            ssize_t written = send(socket_fd, payload.data() + offset, payload.size() - offset, 0);
+            if (written <= 0) {
+                close(socket_fd);
+                return std::nullopt;
+            }
+            offset += static_cast<std::size_t>(written);
+        }
+
+        std::vector<std::uint8_t> buffer(65536);
+        std::size_t received_total = 0;
+        while (wait_for_readable(socket_fd, timeout)) {
+            ssize_t received = recv(socket_fd, buffer.data() + received_total, buffer.size() - received_total, 0);
+            if (received <= 0) {
+                break;
+            }
+            received_total += static_cast<std::size_t>(received);
+            StunMessage response;
+            if (parse_message(buffer.data(), received_total, response) &&
+                response.magic_cookie == request.magic_cookie &&
+                response.transaction_id == request.transaction_id) {
+                close(socket_fd);
+                if (std::optional<IpEndpoint> xor_mapped = get_xor_mapped_address_attribute(response); xor_mapped.has_value()) {
+                    return xor_mapped;
+                }
+                return get_mapped_address_attribute(response);
+            }
+            if (received_total == buffer.size()) {
+                break;
+            }
+        }
+        close(socket_fd);
+        return std::nullopt;
+    } catch (...) {
+        close(socket_fd);
+        return std::nullopt;
+    }
+}
+
+ProbeStatus run_udp_hairpin_probe(const IpEndpoint& stun_server,
+                                  const std::optional<IpEndpoint>& local_bind,
+                                  std::chrono::milliseconds timeout,
+                                  std::optional<IpEndpoint>* public_endpoint) {
+    int receiver = socket(stun_server.family, SOCK_DGRAM, IPPROTO_UDP);
+    int sender = socket(stun_server.family, SOCK_DGRAM, IPPROTO_UDP);
+    if (receiver < 0 || sender < 0) {
+        if (receiver >= 0) {
+            close(receiver);
+        }
+        if (sender >= 0) {
+            close(sender);
+        }
+        return ProbeStatus::Inconclusive;
+    }
+
+    try {
+        set_reuse_options(receiver);
+        set_reuse_options(sender);
+        const IpEndpoint receiver_bind = local_bind.value_or(wildcard_endpoint(stun_server.family));
+        bind_and_get_local_endpoint(receiver, receiver_bind);
+
+        IpEndpoint sender_bind = receiver_bind;
+        sender_bind.port = 0;
+        bind_and_get_local_endpoint(sender, sender_bind);
+
+        *public_endpoint = request_stun_udp_mapping(receiver, stun_server, timeout);
+        if (!public_endpoint->has_value()) {
+            close(receiver);
+            close(sender);
+            return ProbeStatus::Inconclusive;
+        }
+
+        SocketAddress public_receiver = to_sockaddr(**public_endpoint);
+        ssize_t sent = sendto(sender,
+                              kHairpinUdpPayload.data(),
+                              kHairpinUdpPayload.size(),
+                              0,
+                              reinterpret_cast<sockaddr*>(&public_receiver.storage),
+                              public_receiver.length);
+        if (sent != static_cast<ssize_t>(kHairpinUdpPayload.size())) {
+            close(receiver);
+            close(sender);
+            return ProbeStatus::Fail;
+        }
+        if (!wait_for_readable(receiver, timeout)) {
+            close(receiver);
+            close(sender);
+            return ProbeStatus::Fail;
+        }
+
+        std::array<char, 256> buffer{};
+        ssize_t received = recv(receiver, buffer.data(), buffer.size(), 0);
+        close(receiver);
+        close(sender);
+        if (received != static_cast<ssize_t>(kHairpinUdpPayload.size())) {
+            return ProbeStatus::Fail;
+        }
+        const std::string_view received_payload(buffer.data(), static_cast<std::size_t>(received));
+        return received_payload == kHairpinUdpPayload ? ProbeStatus::Pass : ProbeStatus::Fail;
+    } catch (...) {
+        close(receiver);
+        close(sender);
+        return ProbeStatus::Inconclusive;
+    }
+}
+
+ProbeStatus run_tcp_hairpin_probe(const IpEndpoint& stun_server,
+                                  const std::optional<IpEndpoint>& local_bind,
+                                  std::chrono::milliseconds timeout) {
+    std::optional<IpEndpoint> mapped_public;
+    std::optional<IpEndpoint> mapped_local;
+    IpEndpoint mapping_bind = local_bind.value_or(wildcard_endpoint(stun_server.family));
+    mapping_bind.port = 0;
+    mapped_public = request_stun_tcp_mapping(mapping_bind, stun_server, timeout, &mapped_local);
+    if (!mapped_public.has_value() || !mapped_local.has_value()) {
+        return ProbeStatus::Inconclusive;
+    }
+
+    int listener = socket(stun_server.family, SOCK_STREAM, IPPROTO_TCP);
+    if (listener < 0) {
+        return ProbeStatus::Inconclusive;
+    }
+
+    try {
+        set_reuse_options(listener);
+        bind_socket(listener, *mapped_local);
+        if (listen(listener, 1) != 0) {
+            close(listener);
+            return ProbeStatus::Inconclusive;
+        }
+
+        int connector = socket(stun_server.family, SOCK_STREAM, IPPROTO_TCP);
+        if (connector < 0) {
+            close(listener);
+            return ProbeStatus::Inconclusive;
+        }
+        set_reuse_options(connector);
+        IpEndpoint connector_bind = local_bind.value_or(wildcard_endpoint(stun_server.family));
+        connector_bind.port = 0;
+        bind_socket(connector, connector_bind);
+
+        ProbeStatus status = ProbeStatus::Fail;
+        try {
+            connect_with_timeout(connector, *mapped_public, timeout);
+            if (wait_for_readable(listener, timeout)) {
+                sockaddr_storage incoming{};
+                socklen_t length = sizeof(incoming);
+                int accepted = accept(listener, reinterpret_cast<sockaddr*>(&incoming), &length);
+                if (accepted >= 0) {
+                    status = ProbeStatus::Pass;
+                    close(accepted);
+                }
+            }
+        } catch (...) {
+            status = ProbeStatus::Fail;
+        }
+
+        close(connector);
+        close(listener);
+        return status;
+    } catch (...) {
+        close(listener);
+        return ProbeStatus::Inconclusive;
+    }
+}
+
+ProbeStatus run_icmp_hairpin_probe(const IpEndpoint& stun_server,
+                                   const std::optional<IpEndpoint>& local_bind,
+                                   std::chrono::milliseconds timeout,
+                                   const std::optional<IpEndpoint>& udp_public_endpoint) {
+    if (!udp_public_endpoint.has_value()) {
+        return ProbeStatus::Inconclusive;
+    }
+
+    int socket_fd = socket(stun_server.family, SOCK_DGRAM, IPPROTO_UDP);
+    if (socket_fd < 0) {
+        return ProbeStatus::Inconclusive;
+    }
+
+    try {
+        set_reuse_options(socket_fd);
+        IpEndpoint local = local_bind.value_or(wildcard_endpoint(stun_server.family));
+        local.port = 0;
+        bind_socket(socket_fd, local);
+
+        IpEndpoint probe_target = *udp_public_endpoint;
+        probe_target.port = probe_target.port == std::numeric_limits<std::uint16_t>::max()
+                                ? static_cast<std::uint16_t>(probe_target.port - 1)
+                                : static_cast<std::uint16_t>(probe_target.port + 1);
+        SocketAddress target = to_sockaddr(probe_target);
+        if (connect(socket_fd, reinterpret_cast<sockaddr*>(&target.storage), target.length) != 0) {
+            close(socket_fd);
+            return ProbeStatus::Inconclusive;
+        }
+
+        ssize_t sent = send(socket_fd, kHairpinIcmpPayload.data(), kHairpinIcmpPayload.size(), 0);
+        if (sent != static_cast<ssize_t>(kHairpinIcmpPayload.size())) {
+            close(socket_fd);
+            return ProbeStatus::Fail;
+        }
+
+        pollfd descriptor{socket_fd, POLLIN | POLLERR, 0};
+        const int rc = poll(&descriptor, 1, static_cast<int>(timeout.count()));
+        if (rc > 0 && (descriptor.revents & POLLERR) != 0) {
+            int error = 0;
+            socklen_t error_length = sizeof(error);
+            if (getsockopt(socket_fd, SOL_SOCKET, SO_ERROR, &error, &error_length) == 0 && error != 0) {
+                close(socket_fd);
+                return ProbeStatus::Pass;
+            }
+        }
+        if (rc > 0 && (descriptor.revents & POLLIN) != 0) {
+            close(socket_fd);
+            return ProbeStatus::Fail;
+        }
+
+        close(socket_fd);
+        return ProbeStatus::Inconclusive;
+    } catch (...) {
+        close(socket_fd);
+        return ProbeStatus::Inconclusive;
+    }
 }
 
 std::string request_tcp_command(const IpEndpoint& local,
@@ -449,7 +736,19 @@ std::optional<bool> probe_udp_mapping_allows_tcp(const IpEndpoint& local,
 
 } // namespace
 
+HairpinningResult run_hairpinning_tests(const RequestOptions& options,
+                                        const IpEndpoint& stun_server,
+                                        const std::optional<IpEndpoint>& local_bind) {
+    HairpinningResult result;
+    std::optional<IpEndpoint> udp_public_endpoint;
+    result.udp = run_udp_hairpin_probe(stun_server, local_bind, options.timeout, &udp_public_endpoint);
+    result.tcp = run_tcp_hairpin_probe(stun_server, local_bind, options.timeout);
+    result.icmp = run_icmp_hairpin_probe(stun_server, local_bind, options.timeout, udp_public_endpoint);
+    return result;
+}
+
 Rfc5382TcpResult run_rfc5382_tests(const RequestOptions& options,
+                                   const IpEndpoint& stun_server,
                                    const IpEndpoint& primary_server,
                                    const IpEndpoint& secondary_server,
                                    const std::optional<IpEndpoint>& local_bind) {
@@ -496,6 +795,10 @@ Rfc5382TcpResult run_rfc5382_tests(const RequestOptions& options,
         result.simultaneous_open = immediate_ok ? ProbeStatus::Pass : ProbeStatus::Fail;
         result.unexpected_syn = delayed_ok ? ProbeStatus::Pass : ProbeStatus::Fail;
         result.icmp_error_handling = ProbeStatus::Inconclusive;
+        HairpinningResult hairpin = run_hairpinning_tests(options, stun_server, local_bind);
+        result.udp_hairpinning = hairpin.udp;
+        result.tcp_hairpinning = hairpin.tcp;
+        result.icmp_hairpinning = hairpin.icmp;
         if (result.local_endpoint.has_value()) {
             result.tcp_mapping_allows_udp =
                 probe_tcp_mapping_allows_udp(*result.local_endpoint, primary_server, options.timeout);

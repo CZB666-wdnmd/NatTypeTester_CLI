@@ -52,7 +52,7 @@ Rfc7857Result run_rfc7857_tests(const RequestOptions& options,
 
     StunResult5389 udp_mapping = run_rfc5780_test(udp_options, StunTestType::Mapping, stun_server, local_bind);
     StunResult5389 udp_filtering = run_rfc5780_test(udp_options, StunTestType::Filtering, stun_server, local_bind);
-    Rfc5382TcpResult tcp_result = run_rfc5382_tests(options, primary_server, secondary_server, local_bind);
+    Rfc5382TcpResult tcp_result = run_rfc5382_tests(options, stun_server, primary_server, secondary_server, local_bind);
 
     Rfc7857Result result;
     result.udp_mapping_behavior = udp_mapping.mapping_behavior;
@@ -67,6 +67,9 @@ Rfc7857Result run_rfc7857_tests(const RequestOptions& options,
         tcp_result.tcp_mapping_allows_udp, tcp_result.udp_mapping_allows_tcp);
     result.port_parity_preservation =
         classify_port_parity(result.local_endpoint, result.udp_public_endpoint, result.tcp_public_endpoint);
+    result.udp_hairpinning = tcp_result.udp_hairpinning;
+    result.tcp_hairpinning = tcp_result.tcp_hairpinning;
+    result.icmp_hairpinning = tcp_result.icmp_hairpinning;
 
     return result;
 }

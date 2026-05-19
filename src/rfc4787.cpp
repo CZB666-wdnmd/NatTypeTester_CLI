@@ -1,6 +1,7 @@
 #include "rfc4787.hpp"
 
 #include "discovery.hpp"
+#include "rfc5382.hpp"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -147,6 +148,10 @@ Rfc4787Result run_rfc4787_tests(const RequestOptions& options,
 
     if (run_all || test_type == Rfc4787TestType::Icmp) {
         result.icmp_error_handling = ProbeStatus::Inconclusive;
+        HairpinningResult hairpin = run_hairpinning_tests(options, stun_server, local_bind);
+        result.udp_hairpinning = hairpin.udp;
+        result.tcp_hairpinning = hairpin.tcp;
+        result.icmp_hairpinning = hairpin.icmp;
     }
 
     if (run_all || test_type == Rfc4787TestType::Fragmentation) {
