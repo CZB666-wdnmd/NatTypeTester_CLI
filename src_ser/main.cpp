@@ -5,6 +5,9 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <netinet/in.h>
+#include <netinet/ip.h>
+#include <netinet/ip_icmp.h>
 
 #include <array>
 #include <cerrno>
@@ -227,6 +230,87 @@ std::string recv_line(int socket_fd) {
     return line.substr(0, line.find('\n'));
 }
 
+// ---------------------------------------------------------
+// 新增: 构造并发送原生的 ICMP 错误包功能
+// ---------------------------------------------------------
+std::uint16_t calculate_checksum(const void* data, std::size_t len) {
+    const auto* ptr = static_cast<const std::uint16_t*>(data);
+    std::uint32_t sum = 0;
+    while (len > 1) {
+        sum += *ptr++;
+        len -= 2;
+    }
+    if (len == 1) {
+        sum += *reinterpret_cast<const std::uint8_t*>(ptr);
+    }
+    sum = (sum >> 16) + (sum & 0xFFFF);
+    sum += (sum >> 16);
+    return static_cast<std::uint16_t>(~sum);
+}
+
+bool send_ipv4_icmp_error(const IpEndpoint& peer, const IpEndpoint& local, int protocol) {
+    if (peer.family != AF_INET) {
+        // 出于复杂性考虑，目前仅实现了 IPv4 的 ICMP 注入
+        std::cerr << "Warning: ICMP injection only implemented for IPv4.\n";
+        return false;
+    }
+
+    // 创建原始套接字，这需要 ROOT 权限
+    int raw_fd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    if (raw_fd < 0) {
+        std::cerr << "Warning: Failed to create raw socket (Requires root). Error: " << std::strerror(errno) << '\n';
+        return false;
+    }
+
+    // Payload = ICMP 报头(8) + 内层 IP 报头(20) + 内层 L4 报头(8)
+    std::vector<std::uint8_t> packet(sizeof(icmphdr) + sizeof(iphdr) + 8, 0);
+
+    // 1. 构造 ICMP 报头
+    auto* icmp = reinterpret_cast<icmphdr*>(packet.data());
+    icmp->type = ICMP_DEST_UNREACH;
+    icmp->code = ICMP_PORT_UNREACH; // Code 3: 端口不可达
+    icmp->checksum = 0;
+
+    // 2. 构造内层的 IP 报头 (这代表的是 NAT发往服务器的那张包)
+    auto* inner_ip = reinterpret_cast<iphdr*>(packet.data() + sizeof(icmphdr));
+    inner_ip->ihl = 5;
+    inner_ip->version = 4;
+    inner_ip->tos = 0;
+    inner_ip->tot_len = htons(sizeof(iphdr) + 8);
+    inner_ip->id = htons(0x1234);
+    inner_ip->frag_off = 0;
+    inner_ip->ttl = 64;
+    inner_ip->protocol = protocol; // IPPROTO_TCP 或 IPPROTO_UDP
+    
+    // 内层包：源 IP 是 NAT，目的 IP 是服务器
+    std::memcpy(&inner_ip->saddr, peer.address.data(), 4);
+    std::memcpy(&inner_ip->daddr, local.address.data(), 4);
+    inner_ip->check = calculate_checksum(inner_ip, sizeof(iphdr));
+
+    // 3. 构造内层 L4 报头 (只截取前 8 字节，包含源端口和目的端口)
+    std::uint8_t* inner_l4 = packet.data() + sizeof(icmphdr) + sizeof(iphdr);
+    std::uint16_t sport = htons(peer.port);  // NAT的端口
+    std::uint16_t dport = htons(local.port); // 服务器的端口
+    std::memcpy(inner_l4, &sport, 2);
+    std::memcpy(inner_l4 + 2, &dport, 2);
+    // 对于 TCP，这里之后的 4 字节原本是 Seq Number。我们保留为 0，因为绝大多数 NAT 是依据 5 元组来匹配映射的。
+
+    // 计算外层 ICMP 的校验和
+    icmp->checksum = calculate_checksum(packet.data(), packet.size());
+
+    // 发送数据
+    sockaddr_in dest{};
+    dest.sin_family = AF_INET;
+    std::memcpy(&dest.sin_addr, peer.address.data(), 4);
+
+    ssize_t sent = sendto(raw_fd, packet.data(), packet.size(), 0, reinterpret_cast<sockaddr*>(&dest), sizeof(dest));
+    close(raw_fd);
+    
+    return sent == static_cast<ssize_t>(packet.size());
+}
+// ---------------------------------------------------------
+
+
 bool try_connect_from_source(const IpEndpoint& source_address_only, const IpEndpoint& target, int timeout_ms) {
     int socket_fd = socket(target.family, SOCK_STREAM, IPPROTO_TCP);
     if (socket_fd < 0) {
@@ -304,6 +388,7 @@ void handle_tcp_client(int client_fd,
             throw system_error("getpeername failed");
         }
         IpEndpoint peer_endpoint = from_sockaddr(reinterpret_cast<sockaddr*>(&peer), peer_length);
+        
         while (true) {
             std::string command = recv_line(client_fd);
             if (command.empty()) {
@@ -351,13 +436,24 @@ void handle_tcp_client(int client_fd,
                 send_all(client_fd, std::string("R=") + (connected ? "1" : "0") + "\n");
                 continue;
             }
+            // 新增: TCP 指令 `I`，用于触发 ICMP 错误测试
+            if (command == "I") {
+                sockaddr_storage local_addr{};
+                socklen_t local_length = sizeof(local_addr);
+                getsockname(client_fd, reinterpret_cast<sockaddr*>(&local_addr), &local_length);
+                IpEndpoint local_endpoint = from_sockaddr(reinterpret_cast<sockaddr*>(&local_addr), local_length);
+
+                bool icmp_sent = send_ipv4_icmp_error(peer_endpoint, local_endpoint, IPPROTO_TCP);
+                send_all(client_fd, std::string("I=") + (icmp_sent ? "1" : "0") + "\n");
+                continue;
+            }
             send_all(client_fd, "ERR\n");
         }
     } catch (...) {
     }
 }
 
-void handle_udp_packet(int udp_fd) {
+void handle_udp_packet(int udp_fd, const IpEndpoint& server_endpoint) {
     constexpr std::size_t UDP_BUFFER_SIZE = 4096;
     sockaddr_storage peer{};
     socklen_t peer_length = sizeof(peer);
@@ -367,11 +463,21 @@ void handle_udp_packet(int udp_fd) {
         return;
     }
 
-    const bool is_mapping_request = received <= 2 && buffer[0] == 'M';
+    const bool is_mapping_request = received >= 1 && buffer[0] == 'M';
     if (is_mapping_request) {
         IpEndpoint peer_endpoint = from_sockaddr(reinterpret_cast<sockaddr*>(&peer), peer_length);
         std::string payload = endpoint_line(peer_endpoint);
         sendto(udp_fd, payload.data(), payload.size(), 0, reinterpret_cast<sockaddr*>(&peer), peer_length);
+        return;
+    }
+
+    // 新增: UDP 指令 `I`，触发发往该 UDP 映射的 ICMP 包
+    const bool is_icmp_request = received >= 1 && buffer[0] == 'I';
+    if (is_icmp_request) {
+        IpEndpoint peer_endpoint = from_sockaddr(reinterpret_cast<sockaddr*>(&peer), peer_length);
+        bool sent = send_ipv4_icmp_error(peer_endpoint, server_endpoint, IPPROTO_UDP);
+        std::string reply = std::string("I=") + (sent ? "1" : "0") + "\n";
+        sendto(udp_fd, reply.data(), reply.size(), 0, reinterpret_cast<sockaddr*>(&peer), peer_length);
         return;
     }
 
@@ -401,7 +507,7 @@ int main(int argc, char** argv) {
             } else if (token == "--syn-delay-ms" && index + 1 < argc) {
                 syn_delay_ms = std::stoi(argv[++index]);
             } else if (token == "--help" || token == "-h") {
-                std::cout << "Usage: nat_type_tester_rfc5382_server --primary host[:port] --secondary host[:port] [--probe-timeout-ms 1200] [--syn-delay-ms 350]\n";
+                std::cout << "Usage: sudo nat_type_tester_rfc5382_server --primary host[:port] --secondary host[:port] [--probe-timeout-ms 1200] [--syn-delay-ms 350]\n";
                 return 0;
             } else {
                 fail("Unknown or incomplete argument: " + token);
@@ -428,6 +534,7 @@ int main(int argc, char** argv) {
 
         std::cout << "Server ready. Primary=" << primary_host << ":" << primary_port
                   << " Secondary=" << secondary_host << ":" << secondary_port << '\n';
+        std::cout << "Note: Must run as root (sudo) for ICMP Raw socket testing to work.\n";
 
         while (true) {
             std::array<pollfd, 4> descriptors{{
@@ -442,10 +549,10 @@ int main(int argc, char** argv) {
             }
 
             if (descriptors[2].revents & POLLIN) {
-                handle_udp_packet(primary_udp_fd);
+                handle_udp_packet(primary_udp_fd, primary_server);
             }
             if (descriptors[3].revents & POLLIN) {
-                handle_udp_packet(secondary_udp_fd);
+                handle_udp_packet(secondary_udp_fd, secondary_server);
             }
             if (descriptors[0].revents & POLLIN) {
                 sockaddr_storage client{};
