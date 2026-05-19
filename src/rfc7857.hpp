@@ -21,8 +21,8 @@ struct Rfc7857Result {
 
 ProbeStatus classify_rfc7857_eim_protocol_independence(const std::optional<IpEndpoint>& udp_public,
                                                        const std::optional<IpEndpoint>& tcp_public);
-ProbeStatus classify_rfc7857_eif_protocol_independence(FilteringBehavior udp_filtering,
-                                                       FilteringBehavior tcp_filtering);
+ProbeStatus classify_rfc7857_eif_protocol_independence(const std::optional<bool>& tcp_mapping_allows_udp,
+                                                       const std::optional<bool>& udp_mapping_allows_tcp);
 
 Rfc7857Result run_rfc7857_tests(const RequestOptions& options,
                                 const IpEndpoint& stun_server,

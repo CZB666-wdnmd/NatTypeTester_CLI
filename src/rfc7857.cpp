@@ -30,13 +30,12 @@ ProbeStatus classify_rfc7857_eim_protocol_independence(const std::optional<IpEnd
     return *udp_public == *tcp_public ? ProbeStatus::Fail : ProbeStatus::Pass;
 }
 
-ProbeStatus classify_rfc7857_eif_protocol_independence(FilteringBehavior udp_filtering,
-                                                       FilteringBehavior tcp_filtering) {
-    if (udp_filtering == FilteringBehavior::Unknown || tcp_filtering == FilteringBehavior::Unknown) {
+ProbeStatus classify_rfc7857_eif_protocol_independence(const std::optional<bool>& tcp_mapping_allows_udp,
+                                                       const std::optional<bool>& udp_mapping_allows_tcp) {
+    if (!tcp_mapping_allows_udp.has_value() || !udp_mapping_allows_tcp.has_value()) {
         return ProbeStatus::Inconclusive;
     }
-    if (udp_filtering == FilteringBehavior::EndpointIndependent &&
-        tcp_filtering == FilteringBehavior::EndpointIndependent) {
+    if (*tcp_mapping_allows_udp || *udp_mapping_allows_tcp) {
         return ProbeStatus::Fail;
     }
     return ProbeStatus::Pass;
@@ -63,8 +62,8 @@ Rfc7857Result run_rfc7857_tests(const RequestOptions& options,
     result.tcp_public_endpoint = tcp_result.tcp_public_endpoint;
     result.eim_protocol_independence =
         classify_rfc7857_eim_protocol_independence(result.udp_public_endpoint, result.tcp_public_endpoint);
-    result.eif_protocol_independence =
-        classify_rfc7857_eif_protocol_independence(result.udp_filtering_behavior, result.tcp_filtering_behavior);
+    result.eif_protocol_independence = classify_rfc7857_eif_protocol_independence(
+        tcp_result.tcp_mapping_allows_udp, tcp_result.udp_mapping_allows_tcp);
     result.port_parity_preservation =
         classify_port_parity(result.local_endpoint, result.udp_public_endpoint, result.tcp_public_endpoint);
 

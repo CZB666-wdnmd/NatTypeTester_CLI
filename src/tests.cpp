@@ -161,13 +161,10 @@ void test_rfc7857_eim_protocol_independence() {
 }
 
 void test_rfc7857_eif_protocol_independence() {
-    expect(classify_rfc7857_eif_protocol_independence(FilteringBehavior::EndpointIndependent,
-                                                      FilteringBehavior::EndpointIndependent) == ProbeStatus::Fail);
-    expect(classify_rfc7857_eif_protocol_independence(FilteringBehavior::AddressDependent,
-                                                      FilteringBehavior::EndpointIndependent) == ProbeStatus::Pass);
-    expect(classify_rfc7857_eif_protocol_independence(FilteringBehavior::Unknown,
-                                                      FilteringBehavior::EndpointIndependent) ==
-           ProbeStatus::Inconclusive);
+    expect(classify_rfc7857_eif_protocol_independence(false, false) == ProbeStatus::Pass);
+    expect(classify_rfc7857_eif_protocol_independence(true, false) == ProbeStatus::Fail);
+    expect(classify_rfc7857_eif_protocol_independence(false, true) == ProbeStatus::Fail);
+    expect(classify_rfc7857_eif_protocol_independence(std::nullopt, false) == ProbeStatus::Inconclusive);
 }
 
 } // namespace

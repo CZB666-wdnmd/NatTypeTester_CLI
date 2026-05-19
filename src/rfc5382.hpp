@@ -10,6 +10,8 @@ struct Rfc5382TcpResult {
     FilteringBehavior filtering_behavior{FilteringBehavior::Unknown};
     std::optional<IpEndpoint> tcp_public_endpoint;
     std::optional<IpEndpoint> udp_public_endpoint;
+    std::optional<bool> tcp_mapping_allows_udp;
+    std::optional<bool> udp_mapping_allows_tcp;
     std::optional<IpEndpoint> local_endpoint;
     ProbeStatus simultaneous_open{ProbeStatus::Unknown};
     ProbeStatus unexpected_syn{ProbeStatus::Unknown};

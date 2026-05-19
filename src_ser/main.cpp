@@ -174,6 +174,13 @@ int create_udp_listener(const IpEndpoint& endpoint) {
     }
 }
 
+void bind_socket(int socket_fd, const IpEndpoint& endpoint) {
+    SocketAddress address = to_sockaddr(endpoint);
+    if (bind(socket_fd, reinterpret_cast<sockaddr*>(&address.storage), address.length) != 0) {
+        throw system_error("bind failed");
+    }
+}
+
 std::string endpoint_host(const IpEndpoint& endpoint) {
     char buffer[INET6_ADDRSTRLEN]{};
     if (endpoint.family == AF_INET) {
@@ -262,6 +269,27 @@ bool try_connect_from_source(const IpEndpoint& source_address_only, const IpEndp
     return success;
 }
 
+bool try_send_udp_from_source(const IpEndpoint& source_address_only, const IpEndpoint& target, std::string_view payload) {
+    int socket_fd = socket(target.family, SOCK_DGRAM, IPPROTO_UDP);
+    if (socket_fd < 0) {
+        return false;
+    }
+
+    bool success = false;
+    try {
+        set_reuse_options(socket_fd);
+        bind_socket(socket_fd, source_address_only);
+        SocketAddress destination = to_sockaddr(target);
+        const ssize_t sent =
+            sendto(socket_fd, payload.data(), payload.size(), 0, reinterpret_cast<sockaddr*>(&destination.storage), destination.length);
+        success = sent > 0;
+    } catch (...) {
+        success = false;
+    }
+    close(socket_fd);
+    return success;
+}
+
 void handle_tcp_client(int client_fd,
                        const IpEndpoint& primary_server,
                        const IpEndpoint& secondary_server,
@@ -302,6 +330,24 @@ void handle_tcp_client(int client_fd,
                 std::this_thread::sleep_for(std::chrono::milliseconds(syn_delay_ms));
                 bool delayed_ok = try_connect_from_source(delayed_source, peer_endpoint, connection_probe_timeout_ms);
                 send_all(client_fd, std::string("I=") + (immediate_ok ? "1" : "0") + " D=" + (delayed_ok ? "1" : "0") + "\n");
+                continue;
+            }
+            if (command == "U") {
+                IpEndpoint udp_source = primary_server;
+                udp_source.port = 0;
+                constexpr std::string_view payload = "RFC7857-UDP-PROBE\n";
+                bool sent = try_send_udp_from_source(udp_source, peer_endpoint, payload);
+                send_all(client_fd, std::string("R=") + (sent ? "1" : "0") + "\n");
+                continue;
+            }
+            if (command.rfind("C ", 0) == 0) {
+                const std::string endpoint_literal = command.substr(2);
+                auto [target_host, target_port] = split_host_port(endpoint_literal, 0);
+                IpEndpoint target = resolve_endpoint(target_host, target_port);
+                IpEndpoint source = primary_server;
+                source.port = 0;
+                bool connected = try_connect_from_source(source, target, connection_probe_timeout_ms);
+                send_all(client_fd, std::string("R=") + (connected ? "1" : "0") + "\n");
                 continue;
             }
             send_all(client_fd, "ERR\n");

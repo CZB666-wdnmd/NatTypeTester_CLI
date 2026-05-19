@@ -244,8 +244,8 @@ nat_type_tester_cli rfc7857 --stun_server host[:port] --primary_server host[:por
   - 若 `UdpPublicEnd != TcpPublicEnd` → `Pass`
   - 若 `UdpPublicEnd == TcpPublicEnd` → `Fail`
 - `EifProtocolIndependence`
-  - 只要 UDP/TCP 过滤不是“同时都为 `EndpointIndependent`” → `Pass`
-  - UDP/TCP Filtering 都是 `EndpointIndependent` → `Fail`
+  - 先建立 TCP 映射后，外部 UDP 直入若被拦截，且先建立 UDP 映射后，外部 TCP 直入也被拦截 → `Pass`
+  - 任一方向出现“跨协议可直入”（TCP 映射可被 UDP 直入，或 UDP 映射可被 TCP 直入）→ `Fail`
 - `PortParityPreservation`
   - 本地端口与 UDP/TCP 外网端口奇偶都一致 → `Pass`
   - 否则 `Fail`
