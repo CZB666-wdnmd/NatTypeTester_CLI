@@ -284,6 +284,16 @@ std::string to_string(FilteringBehavior value) {
     return "Unknown";
 }
 
+std::string to_string(ProbeStatus value) {
+    switch (value) {
+    case ProbeStatus::Unknown: return "Unknown";
+    case ProbeStatus::Pass: return "Pass";
+    case ProbeStatus::Fail: return "Fail";
+    case ProbeStatus::Inconclusive: return "Inconclusive";
+    }
+    return "Unknown";
+}
+
 std::string to_string(TransportType value) {
     switch (value) {
     case TransportType::Udp: return "udp";

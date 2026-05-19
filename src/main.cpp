@@ -1,5 +1,7 @@
 #include "discovery.hpp"
+#include "rfc4787.hpp"
 #include "rfc5382.hpp"
+#include "rfc7857.hpp"
 
 #include <sys/socket.h>
 
@@ -8,14 +10,27 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
-#include <vector>
+#include <string_view>
 
 namespace {
 
+using natcli::BindingTestResult;
 using natcli::IpEndpoint;
+using natcli::MappingBehavior;
+using natcli::ProbeStatus;
 using natcli::RequestOptions;
+using natcli::Rfc4787TestType;
 using natcli::StunTestType;
 using natcli::TransportType;
+
+enum class Rfc5382TestType {
+    All,
+    Mapping,
+    Filtering,
+    SimultaneousOpen,
+    UnexpectedSyn,
+    Icmp,
+};
 
 struct ParsedArguments {
     std::string command;
@@ -28,7 +43,7 @@ struct ParsedArguments {
 
 ParsedArguments parse_arguments(int argc, char** argv) {
     if (argc < 2) {
-        fail("Expected subcommand: rfc3489 or rfc5780");
+        fail("Expected subcommand: rfc3489, rfc5780, rfc4787, rfc5382, or rfc7857");
     }
 
     ParsedArguments result;
@@ -61,10 +76,15 @@ void print_help() {
     std::cout
         << "NatTypeTester standalone C++ CLI\n\n"
         << "Usage:\n"
-        << "  nat_type_tester_cli rfc3489 --server host[:port] [--local host[:port]] [--timeout-ms 3000]\n"
-        << "  nat_type_tester_cli rfc5780 --server host[:port] [--local host[:port]] [--transport udp|tcp|tls]\n"
-        << "                               [--server2 host[:port]]\n"
-        << "                               [--test-type combining|binding|mapping|filtering|tcp-filtering|protocol-correlation] [--skip-cert] [--timeout-ms 3000]\n";
+        << "  nat_type_tester_cli rfc3489 --stun_server host[:port] [--local host[:port]] [--timeout-ms 3000]\n"
+        << "  nat_type_tester_cli rfc5780 --stun_server host[:port] [--local host[:port]] [--transport udp|tcp|tls]\n"
+        << "                               [--test-type combining|binding|mapping|filtering] [--skip-cert 0|1] [--timeout-ms 3000]\n"
+        << "  nat_type_tester_cli rfc4787 --stun_server host[:port] --primary_server host[:port] --secondary_server host[:port]\n"
+        << "                               [--local host[:port]] [--test-type all|mapping|filtering|port-allocation|icmp|fragmentation] [--timeout-ms 3000]\n"
+        << "  nat_type_tester_cli rfc5382 --stun_server host[:port] --primary_server host[:port] --secondary_server host[:port]\n"
+        << "                               [--local host[:port]] [--test-type all|mapping|filtering|simultaneous-open|unexpected-syn|icmp] [--timeout-ms 3000]\n"
+        << "  nat_type_tester_cli rfc7857 --stun_server host[:port] --primary_server host[:port] --secondary_server host[:port]\n"
+        << "                               [--local host[:port]] [--timeout-ms 3000]\n";
 }
 
 std::string require_option(const ParsedArguments& args, const std::string& name) {
@@ -97,7 +117,21 @@ TransportType parse_transport(const ParsedArguments& args) {
     fail("Unsupported transport: " + value);
 }
 
-StunTestType parse_test_type(const ParsedArguments& args) {
+bool parse_bool_option(const ParsedArguments& args, const std::string& name, bool default_value = false) {
+    std::optional<std::string> value = find_option(args, name);
+    if (!value.has_value()) {
+        return default_value;
+    }
+    if (*value == "1" || *value == "true") {
+        return true;
+    }
+    if (*value == "0" || *value == "false") {
+        return false;
+    }
+    fail("Unsupported boolean option value for " + name + ": " + *value);
+}
+
+StunTestType parse_stun_test_type(const ParsedArguments& args) {
     std::string value = find_option(args, "--test-type").value_or("combining");
     if (value == "combining") {
         return StunTestType::Combining;
@@ -111,22 +145,62 @@ StunTestType parse_test_type(const ParsedArguments& args) {
     if (value == "filtering") {
         return StunTestType::Filtering;
     }
-    if (value == "tcp-filtering") {
-        return StunTestType::TcpFiltering;
-    }
-    if (value == "protocol-correlation") { 
-        return StunTestType::ProtocolCorrelation;
-    }
     fail("Unsupported test type: " + value);
 }
 
-std::optional<IpEndpoint> parse_local_bind(const ParsedArguments& args, int family) {
+Rfc4787TestType parse_rfc4787_test_type(const ParsedArguments& args) {
+    std::string value = find_option(args, "--test-type").value_or("all");
+    if (value == "all") {
+        return Rfc4787TestType::All;
+    }
+    if (value == "mapping") {
+        return Rfc4787TestType::Mapping;
+    }
+    if (value == "filtering") {
+        return Rfc4787TestType::Filtering;
+    }
+    if (value == "port-allocation") {
+        return Rfc4787TestType::PortAllocation;
+    }
+    if (value == "icmp") {
+        return Rfc4787TestType::Icmp;
+    }
+    if (value == "fragmentation") {
+        return Rfc4787TestType::Fragmentation;
+    }
+    fail("Unsupported RFC4787 test type: " + value);
+}
+
+Rfc5382TestType parse_rfc5382_test_type(const ParsedArguments& args) {
+    std::string value = find_option(args, "--test-type").value_or("all");
+    if (value == "all") {
+        return Rfc5382TestType::All;
+    }
+    if (value == "mapping") {
+        return Rfc5382TestType::Mapping;
+    }
+    if (value == "filtering") {
+        return Rfc5382TestType::Filtering;
+    }
+    if (value == "simultaneous-open") {
+        return Rfc5382TestType::SimultaneousOpen;
+    }
+    if (value == "unexpected-syn") {
+        return Rfc5382TestType::UnexpectedSyn;
+    }
+    if (value == "icmp") {
+        return Rfc5382TestType::Icmp;
+    }
+    fail("Unsupported RFC5382 test type: " + value);
+}
+
+std::optional<IpEndpoint> parse_local_bind(const ParsedArguments& args, int family, int socket_type) {
     std::optional<std::string> local = find_option(args, "--local");
     if (!local.has_value()) {
         return std::nullopt;
     }
     auto [host, port] = natcli::split_host_port(*local, 0);
-    return natcli::resolve_endpoint(host, port, SOCK_STREAM, family);
+    return natcli::resolve_endpoint(host, port, socket_type, family);
 }
 
 void print_row(const std::string& key, const std::string& value) {
@@ -137,18 +211,22 @@ std::string endpoint_or_dash(const std::optional<IpEndpoint>& endpoint) {
     return endpoint.has_value() ? natcli::to_string(*endpoint) : "-";
 }
 
-std::string classify_protocol_correlation(const std::optional<IpEndpoint>& udp,
-                                          const std::optional<IpEndpoint>& tcp) {
-    if (!udp.has_value() || !tcp.has_value()) {
-        return "Unknown";
+void print_mapping_if_available(MappingBehavior behavior) {
+    if (behavior != MappingBehavior::Unknown) {
+        print_row("MappingBehavior", natcli::to_string(behavior));
     }
-    if (*udp == *tcp) {
-        return "Independent (RFC 5382 Req 2 Supported)";
+}
+
+void print_binding_if_available(BindingTestResult result) {
+    if (result != BindingTestResult::Unknown) {
+        print_row("BindingTest", natcli::to_string(result));
     }
-    if (udp->address == tcp->address) {
-        return "Address-Independent, Port-Dependent";
+}
+
+void print_probe_if_available(const std::string& name, ProbeStatus status) {
+    if (status != ProbeStatus::Unknown) {
+        print_row(name, natcli::to_string(status));
     }
-    return "Dependent (RFC 5382 Req 2 Unsupported)";
 }
 
 } // namespace
@@ -161,61 +239,121 @@ int main(int argc, char** argv) {
             return 0;
         }
 
-        if (args.command != "rfc3489" && args.command != "rfc5780") {
+        if (args.command != "rfc3489" && args.command != "rfc5780" && args.command != "rfc4787" &&
+            args.command != "rfc5382" && args.command != "rfc7857") {
             fail("Unknown subcommand: " + args.command);
         }
 
         constexpr std::uint16_t default_port = 3478;
-        auto [server_host, server_port] = natcli::split_host_port(require_option(args, "--server"), default_port);
-        TransportType transport = args.command == "rfc3489" ? TransportType::Udp : parse_transport(args);
-        int socket_type = transport == TransportType::Udp ? SOCK_DGRAM : SOCK_STREAM;
-        IpEndpoint server = natcli::resolve_endpoint(server_host, server_port, socket_type);
-        std::optional<IpEndpoint> local_bind = parse_local_bind(args, server.family);
+        auto [stun_host, stun_port] = natcli::split_host_port(require_option(args, "--stun_server"), default_port);
+        IpEndpoint stun_server = natcli::resolve_endpoint(stun_host, stun_port, SOCK_DGRAM);
 
         RequestOptions options;
-        options.transport = transport;
-        options.server_name = server_host;
-        options.skip_certificate_validation = args.options.contains("--skip-cert");
+        options.transport = TransportType::Udp;
+        options.server_name = stun_host;
+        options.skip_certificate_validation = parse_bool_option(args, "--skip-cert", false);
         if (std::optional<std::string> timeout = find_option(args, "--timeout-ms"); timeout.has_value()) {
             options.timeout = std::chrono::milliseconds(std::stoi(*timeout));
         }
 
         if (args.command == "rfc3489") {
-            natcli::ClassicStunResult result = natcli::run_rfc3489_test(options, server, local_bind);
+            std::optional<IpEndpoint> local_bind = parse_local_bind(args, stun_server.family, SOCK_DGRAM);
+            natcli::ClassicStunResult result = natcli::run_rfc3489_test(options, stun_server, local_bind);
             print_row("NatType", natcli::to_string(result.nat_type));
             print_row("PublicEnd", endpoint_or_dash(result.public_endpoint));
             print_row("LocalEnd", endpoint_or_dash(result.local_endpoint));
             return 0;
         }
 
-        StunTestType test_type = parse_test_type(args);
-        if (test_type == StunTestType::TcpFiltering || test_type == StunTestType::ProtocolCorrelation) {
-            auto [server2_host, server2_port] = natcli::split_host_port(require_option(args, "--server2"), default_port);
-            IpEndpoint server2 = natcli::resolve_endpoint(server2_host, server2_port, SOCK_STREAM, server.family);
-            natcli::Rfc5382TcpResult result = natcli::run_rfc5382_tcp_tests(options, server, server2, local_bind);
+        if (args.command == "rfc5780") {
+            options.transport = parse_transport(args);
+            std::optional<IpEndpoint> local_bind = parse_local_bind(
+                args, stun_server.family, options.transport == TransportType::Udp ? SOCK_DGRAM : SOCK_STREAM);
+            StunTestType test_type = parse_stun_test_type(args);
+            natcli::StunResult5389 result = natcli::run_rfc5780_test(options, test_type, stun_server, local_bind);
+
+            if (test_type == StunTestType::Combining || test_type == StunTestType::Binding) {
+                print_row("BindingTest", natcli::to_string(result.binding_test_result));
+            }
+            if (test_type == StunTestType::Combining || test_type == StunTestType::Mapping) {
+                print_row("MappingBehavior", natcli::to_string(result.mapping_behavior));
+            }
+            if (test_type == StunTestType::Filtering ||
+                (test_type == StunTestType::Combining && options.transport == TransportType::Udp)) {
+                print_row("FilteringBehavior", natcli::to_string(result.filtering_behavior));
+            }
+            print_row("PublicEnd", endpoint_or_dash(result.public_endpoint));
             print_row("LocalEnd", endpoint_or_dash(result.local_endpoint));
-            print_row("TCP PublicEnd", endpoint_or_dash(result.tcp_public_endpoint));
-            print_row("UDP PublicEnd", endpoint_or_dash(result.udp_public_endpoint));
-            print_row("TcpFilteringBehavior", natcli::to_string(result.filtering_behavior));
-            print_row("ProtocolCorrelation", classify_protocol_correlation(result.udp_public_endpoint, result.tcp_public_endpoint));
+            print_row("OtherEnd", endpoint_or_dash(result.other_endpoint));
             return 0;
         }
 
-        natcli::StunResult5389 result = natcli::run_rfc5780_test(options, test_type, server, local_bind);
+        auto [primary_host, primary_port] = natcli::split_host_port(require_option(args, "--primary_server"), default_port);
+        auto [secondary_host, secondary_port] =
+            natcli::split_host_port(require_option(args, "--secondary_server"), default_port);
+        IpEndpoint primary_server = natcli::resolve_endpoint(primary_host, primary_port, SOCK_STREAM, stun_server.family);
+        IpEndpoint secondary_server =
+            natcli::resolve_endpoint(secondary_host, secondary_port, SOCK_STREAM, stun_server.family);
+        std::optional<IpEndpoint> local_bind = parse_local_bind(args, stun_server.family, SOCK_STREAM);
 
-        if (test_type == StunTestType::Combining || test_type == StunTestType::Binding) {
-            print_row("BindingTest", natcli::to_string(result.binding_test_result));
+        if (args.command == "rfc4787") {
+            Rfc4787TestType test_type = parse_rfc4787_test_type(args);
+            natcli::Rfc4787Result result =
+                natcli::run_rfc4787_tests(options, test_type, stun_server, primary_server, secondary_server, local_bind);
+            print_binding_if_available(result.binding_test_result);
+            print_mapping_if_available(result.mapping_behavior);
+            if (result.filtering_behavior != natcli::FilteringBehavior::Unknown) {
+                print_row("FilteringBehavior", natcli::to_string(result.filtering_behavior));
+            }
+            print_probe_if_available("PortRangePreservation", result.port_range_preservation);
+            print_probe_if_available("PortParityPreservation", result.port_parity_preservation);
+            print_probe_if_available("IcmpErrorHandling", result.icmp_error_handling);
+            print_probe_if_available("OutboundFragmentation", result.outbound_fragmentation);
+            print_probe_if_available("InboundFragmentation", result.inbound_fragmentation);
+            print_row("PublicEnd", endpoint_or_dash(result.public_endpoint));
+            print_row("LocalEnd", endpoint_or_dash(result.local_endpoint));
+            return 0;
         }
-        if (test_type == StunTestType::Combining || test_type == StunTestType::Mapping) {
-            print_row("MappingBehavior", natcli::to_string(result.mapping_behavior));
+
+        if (args.command == "rfc5382") {
+            Rfc5382TestType test_type = parse_rfc5382_test_type(args);
+            natcli::StunResult5389 mapping_result =
+                natcli::run_rfc5780_test(options, StunTestType::Mapping, stun_server, local_bind);
+            natcli::Rfc5382TcpResult server_result =
+                natcli::run_rfc5382_tests(options, primary_server, secondary_server, local_bind);
+
+            if (test_type == Rfc5382TestType::All || test_type == Rfc5382TestType::Mapping) {
+                print_row("MappingBehavior", natcli::to_string(mapping_result.mapping_behavior));
+                print_row("UdpPublicEnd", endpoint_or_dash(mapping_result.public_endpoint));
+            }
+            if (test_type == Rfc5382TestType::All || test_type == Rfc5382TestType::Filtering) {
+                print_row("FilteringBehavior", natcli::to_string(server_result.filtering_behavior));
+                print_row("TcpPublicEnd", endpoint_or_dash(server_result.tcp_public_endpoint));
+            }
+            if (test_type == Rfc5382TestType::All || test_type == Rfc5382TestType::SimultaneousOpen) {
+                print_row("TcpSimultaneousOpen", natcli::to_string(server_result.simultaneous_open));
+            }
+            if (test_type == Rfc5382TestType::All || test_type == Rfc5382TestType::UnexpectedSyn) {
+                print_row("UnexpectedSynHandling", natcli::to_string(server_result.unexpected_syn));
+            }
+            if (test_type == Rfc5382TestType::All || test_type == Rfc5382TestType::Icmp) {
+                print_row("IcmpErrorHandling", natcli::to_string(server_result.icmp_error_handling));
+            }
+            print_row("LocalEnd", endpoint_or_dash(server_result.local_endpoint));
+            return 0;
         }
-        if (test_type == StunTestType::Filtering ||
-            (test_type == StunTestType::Combining && transport == TransportType::Udp)) {
-            print_row("FilteringBehavior", natcli::to_string(result.filtering_behavior));
-        }
-        print_row("PublicEnd", endpoint_or_dash(result.public_endpoint));
+
+        natcli::Rfc7857Result result =
+            natcli::run_rfc7857_tests(options, stun_server, primary_server, secondary_server, local_bind);
+        print_row("UdpMappingBehavior", natcli::to_string(result.udp_mapping_behavior));
+        print_row("UdpFilteringBehavior", natcli::to_string(result.udp_filtering_behavior));
+        print_row("TcpFilteringBehavior", natcli::to_string(result.tcp_filtering_behavior));
+        print_row("EimProtocolIndependence", natcli::to_string(result.eim_protocol_independence));
+        print_row("EifProtocolIndependence", natcli::to_string(result.eif_protocol_independence));
+        print_row("PortParityPreservation", natcli::to_string(result.port_parity_preservation));
+        print_row("UdpPublicEnd", endpoint_or_dash(result.udp_public_endpoint));
+        print_row("TcpPublicEnd", endpoint_or_dash(result.tcp_public_endpoint));
         print_row("LocalEnd", endpoint_or_dash(result.local_endpoint));
-        print_row("OtherEnd", endpoint_or_dash(result.other_endpoint));
         return 0;
     } catch (const std::exception& exception) {
         std::cerr << "Error: " << exception.what() << '\n';

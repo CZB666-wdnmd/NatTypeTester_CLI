@@ -25,6 +25,8 @@ struct SocketAddress {
     socklen_t length{};
 };
 
+void bind_socket(int socket_fd, const IpEndpoint& endpoint);
+
 std::runtime_error system_error(const std::string& message) {
     return std::runtime_error(message + ": " + std::strerror(errno));
 }
@@ -78,6 +80,78 @@ IpEndpoint socket_local_endpoint(int socket_fd) {
         throw system_error("getsockname failed");
     }
     return from_sockaddr(reinterpret_cast<sockaddr*>(&storage), length);
+}
+
+bool is_wildcard_endpoint_address(const IpEndpoint& endpoint) {
+    if (endpoint.family == AF_INET) {
+        constexpr std::size_t ipv4_size = 4;
+        for (std::size_t index = 0; index < ipv4_size; ++index) {
+            if (endpoint.address[index] != 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if (endpoint.family == AF_INET6) {
+        constexpr std::size_t ipv6_size = 16;
+        for (std::size_t index = 0; index < ipv6_size; ++index) {
+            if (endpoint.address[index] != 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
+IpEndpoint infer_local_source_for_remote(const IpEndpoint& remote) {
+    int socket_fd = socket(remote.family, SOCK_DGRAM, IPPROTO_UDP);
+    if (socket_fd < 0) {
+        throw system_error("socket failed");
+    }
+    try {
+        SocketAddress remote_address = to_sockaddr(remote);
+        if (connect(socket_fd, reinterpret_cast<sockaddr*>(&remote_address.storage), remote_address.length) != 0) {
+            throw system_error("connect failed");
+        }
+        IpEndpoint local = socket_local_endpoint(socket_fd);
+        close(socket_fd);
+        return local;
+    } catch (...) {
+        close(socket_fd);
+        throw;
+    }
+}
+
+bool can_connect_udp_from_local_address(const IpEndpoint& local, const IpEndpoint& remote) {
+    int socket_fd = socket(remote.family, SOCK_DGRAM, IPPROTO_UDP);
+    if (socket_fd < 0) {
+        return false;
+    }
+    bool ok = false;
+    try {
+        IpEndpoint local_address_only = local;
+        local_address_only.port = 0;
+        bind_socket(socket_fd, local_address_only);
+        SocketAddress remote_address = to_sockaddr(remote);
+        ok = connect(socket_fd, reinterpret_cast<sockaddr*>(&remote_address.storage), remote_address.length) == 0;
+    } catch (...) {
+        ok = false;
+    }
+    close(socket_fd);
+    return ok;
+}
+
+IpEndpoint select_control_local_endpoint(const IpEndpoint& local, const IpEndpoint& remote) {
+    IpEndpoint selected = local;
+    if (!is_wildcard_endpoint_address(local) && can_connect_udp_from_local_address(local, remote)) {
+        return selected;
+    }
+    IpEndpoint routed_local = infer_local_source_for_remote(remote);
+    selected.address = routed_local.address;
+    selected.address_length = routed_local.address_length;
+    selected.family = routed_local.family;
+    return selected;
 }
 
 void set_reuse_options(int socket_fd) {
@@ -194,6 +268,23 @@ std::pair<bool, bool> parse_filter_line(const std::string& line) {
     return {parse_flag(p_field, 'P'), parse_flag(s_field, 'S')};
 }
 
+std::pair<bool, bool> parse_syn_line(const std::string& line) {
+    std::istringstream stream(line);
+    std::string immediate_field;
+    std::string delayed_field;
+    if (!(stream >> immediate_field >> delayed_field)) {
+        throw std::runtime_error("Invalid SYN probe response");
+    }
+    auto parse_flag = [](const std::string& field, const char key) -> bool {
+        constexpr std::size_t SYN_FLAG_FIELD_SIZE = 3; // "I=1" / "D=0"
+        if (field.size() != SYN_FLAG_FIELD_SIZE || field[0] != key || field[1] != '=') {
+            throw std::runtime_error("Invalid SYN probe response field");
+        }
+        return field[2] == '1';
+    };
+    return {parse_flag(immediate_field, 'I'), parse_flag(delayed_field, 'D')};
+}
+
 std::string request_tcp_command(const IpEndpoint& local,
                                 const IpEndpoint& server,
                                 std::string_view command,
@@ -204,6 +295,13 @@ std::string request_tcp_command(const IpEndpoint& local,
     }
     try {
         set_reuse_options(control);
+        
+        // 关键修正: 配置 SO_LINGER，在关闭 socket 时直接发送 RST。
+        // 这将跳过 TCP 的 TIME_WAIT 状态，释放掉五元组，
+        // 使得后续的 connect 能够成功，从而解决 EADDRNOTAVAIL 报错。
+        linger sl{1, 0};
+        setsockopt(control, SOL_SOCKET, SO_LINGER, &sl, sizeof(sl));
+
         bind_socket(control, local);
         connect_with_timeout(control, server, timeout);
         send_all(control, command);
@@ -251,10 +349,10 @@ std::optional<IpEndpoint> request_udp_mapping(const IpEndpoint& local, const IpE
 
 } // namespace
 
-Rfc5382TcpResult run_rfc5382_tcp_tests(const RequestOptions& options,
-                                       const IpEndpoint& primary_server,
-                                       const IpEndpoint& secondary_server,
-                                       const std::optional<IpEndpoint>& local_bind) {
+Rfc5382TcpResult run_rfc5382_tests(const RequestOptions& options,
+                                   const IpEndpoint& primary_server,
+                                   const IpEndpoint& secondary_server,
+                                   const std::optional<IpEndpoint>& local_bind) {
     if (primary_server.family != secondary_server.family) {
         throw std::runtime_error("Primary and secondary server must use the same IP family.");
     }
@@ -272,15 +370,18 @@ Rfc5382TcpResult run_rfc5382_tcp_tests(const RequestOptions& options,
             throw system_error("listen failed");
         }
         result.local_endpoint = socket_local_endpoint(listener);
-        result.tcp_public_endpoint = parse_endpoint_line(
-            request_tcp_command(*result.local_endpoint, primary_server, "M\n", options.timeout), primary_server.family);
+        IpEndpoint control_local = select_control_local_endpoint(*result.local_endpoint, primary_server);
+        result.local_endpoint = control_local;
+        
+        result.tcp_public_endpoint =
+            parse_endpoint_line(request_tcp_command(control_local, primary_server, "M\n", options.timeout), primary_server.family);
 
         if (result.local_endpoint.has_value()) {
             result.udp_public_endpoint = request_udp_mapping(*result.local_endpoint, primary_server, options.timeout);
         }
 
         auto [primary_ok, secondary_ok] = parse_filter_line(
-            request_tcp_command(*result.local_endpoint, primary_server, "F\n", options.timeout));
+            request_tcp_command(control_local, primary_server, "F\n", options.timeout));
         result.primary_probe_success = primary_ok;
         result.secondary_probe_success = secondary_ok;
         if (secondary_ok) {
@@ -290,6 +391,11 @@ Rfc5382TcpResult run_rfc5382_tcp_tests(const RequestOptions& options,
         } else {
             result.filtering_behavior = FilteringBehavior::AddressAndPortDependent;
         }
+        auto [immediate_ok, delayed_ok] =
+            parse_syn_line(request_tcp_command(control_local, primary_server, "S\n", options.timeout));
+        result.simultaneous_open = immediate_ok ? ProbeStatus::Pass : ProbeStatus::Fail;
+        result.unexpected_syn = delayed_ok ? ProbeStatus::Pass : ProbeStatus::Fail;
+        result.icmp_error_handling = ProbeStatus::Inconclusive;
 
         constexpr int max_drain_accepts = 4; // server sends up to primary+secondary probe connections plus retries
         for (int index = 0; index < max_drain_accepts; ++index) {
