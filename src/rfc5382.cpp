@@ -80,6 +80,47 @@ IpEndpoint socket_local_endpoint(int socket_fd) {
     return from_sockaddr(reinterpret_cast<sockaddr*>(&storage), length);
 }
 
+bool is_wildcard_endpoint_address(const IpEndpoint& endpoint) {
+    if (endpoint.family == AF_INET) {
+        constexpr std::size_t ipv4_size = 4;
+        for (std::size_t index = 0; index < ipv4_size; ++index) {
+            if (endpoint.address[index] != 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if (endpoint.family == AF_INET6) {
+        constexpr std::size_t ipv6_size = 16;
+        for (std::size_t index = 0; index < ipv6_size; ++index) {
+            if (endpoint.address[index] != 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
+IpEndpoint infer_local_source_for_remote(const IpEndpoint& remote) {
+    int socket_fd = socket(remote.family, SOCK_DGRAM, IPPROTO_UDP);
+    if (socket_fd < 0) {
+        throw system_error("socket failed");
+    }
+    try {
+        SocketAddress remote_address = to_sockaddr(remote);
+        if (connect(socket_fd, reinterpret_cast<sockaddr*>(&remote_address.storage), remote_address.length) != 0) {
+            throw system_error("connect failed");
+        }
+        IpEndpoint local = socket_local_endpoint(socket_fd);
+        close(socket_fd);
+        return local;
+    } catch (...) {
+        close(socket_fd);
+        throw;
+    }
+}
+
 void set_reuse_options(int socket_fd) {
     int reuse = 1;
     setsockopt(socket_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
@@ -289,15 +330,23 @@ Rfc5382TcpResult run_rfc5382_tests(const RequestOptions& options,
             throw system_error("listen failed");
         }
         result.local_endpoint = socket_local_endpoint(listener);
-        result.tcp_public_endpoint = parse_endpoint_line(
-            request_tcp_command(*result.local_endpoint, primary_server, "M\n", options.timeout), primary_server.family);
+        IpEndpoint control_local = *result.local_endpoint;
+        if (is_wildcard_endpoint_address(control_local)) {
+            IpEndpoint routed_local = infer_local_source_for_remote(primary_server);
+            control_local.address = routed_local.address;
+            control_local.address_length = routed_local.address_length;
+            control_local.family = routed_local.family;
+        }
+        result.local_endpoint = control_local;
+        result.tcp_public_endpoint =
+            parse_endpoint_line(request_tcp_command(control_local, primary_server, "M\n", options.timeout), primary_server.family);
 
         if (result.local_endpoint.has_value()) {
             result.udp_public_endpoint = request_udp_mapping(*result.local_endpoint, primary_server, options.timeout);
         }
 
         auto [primary_ok, secondary_ok] = parse_filter_line(
-            request_tcp_command(*result.local_endpoint, primary_server, "F\n", options.timeout));
+            request_tcp_command(control_local, primary_server, "F\n", options.timeout));
         result.primary_probe_success = primary_ok;
         result.secondary_probe_success = secondary_ok;
         if (secondary_ok) {
@@ -308,7 +357,7 @@ Rfc5382TcpResult run_rfc5382_tests(const RequestOptions& options,
             result.filtering_behavior = FilteringBehavior::AddressAndPortDependent;
         }
         auto [immediate_ok, delayed_ok] =
-            parse_syn_line(request_tcp_command(*result.local_endpoint, primary_server, "S\n", options.timeout));
+            parse_syn_line(request_tcp_command(control_local, primary_server, "S\n", options.timeout));
         result.simultaneous_open = immediate_ok ? ProbeStatus::Pass : ProbeStatus::Fail;
         result.unexpected_syn = delayed_ok ? ProbeStatus::Pass : ProbeStatus::Fail;
         result.icmp_error_handling = ProbeStatus::Inconclusive;
