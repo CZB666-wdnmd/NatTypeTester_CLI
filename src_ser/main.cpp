@@ -8,6 +8,7 @@
 
 #include <array>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
@@ -16,6 +17,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -263,7 +265,8 @@ bool try_connect_from_source(const IpEndpoint& source_address_only, const IpEndp
 void handle_tcp_client(int client_fd,
                        const IpEndpoint& primary_server,
                        const IpEndpoint& secondary_server,
-                       int connection_probe_timeout_ms) {
+                       int connection_probe_timeout_ms,
+                       int syn_delay_ms) {
     try {
         sockaddr_storage peer{};
         socklen_t peer_length = sizeof(peer);
@@ -290,23 +293,41 @@ void handle_tcp_client(int client_fd,
                 send_all(client_fd, std::string("P=") + (primary_ok ? "1" : "0") + " S=" + (secondary_ok ? "1" : "0") + "\n");
                 continue;
             }
+            if (command == "S") {
+                IpEndpoint immediate_source = secondary_server;
+                immediate_source.port = 0;
+                IpEndpoint delayed_source = primary_server;
+                delayed_source.port = 0;
+                bool immediate_ok = try_connect_from_source(immediate_source, peer_endpoint, connection_probe_timeout_ms);
+                std::this_thread::sleep_for(std::chrono::milliseconds(syn_delay_ms));
+                bool delayed_ok = try_connect_from_source(delayed_source, peer_endpoint, connection_probe_timeout_ms);
+                send_all(client_fd, std::string("I=") + (immediate_ok ? "1" : "0") + " D=" + (delayed_ok ? "1" : "0") + "\n");
+                continue;
+            }
             send_all(client_fd, "ERR\n");
         }
     } catch (...) {
     }
 }
 
-void handle_udp_map(int udp_fd) {
+void handle_udp_packet(int udp_fd) {
     sockaddr_storage peer{};
     socklen_t peer_length = sizeof(peer);
-    std::array<char, 512> buffer{};
+    std::vector<char> buffer(4096);
     ssize_t received = recvfrom(udp_fd, buffer.data(), buffer.size(), 0, reinterpret_cast<sockaddr*>(&peer), &peer_length);
     if (received <= 0) {
         return;
     }
-    IpEndpoint peer_endpoint = from_sockaddr(reinterpret_cast<sockaddr*>(&peer), peer_length);
-    std::string payload = endpoint_line(peer_endpoint);
-    sendto(udp_fd, payload.data(), payload.size(), 0, reinterpret_cast<sockaddr*>(&peer), peer_length);
+
+    const bool is_mapping_request = received <= 2 && buffer[0] == 'M';
+    if (is_mapping_request) {
+        IpEndpoint peer_endpoint = from_sockaddr(reinterpret_cast<sockaddr*>(&peer), peer_length);
+        std::string payload = endpoint_line(peer_endpoint);
+        sendto(udp_fd, payload.data(), payload.size(), 0, reinterpret_cast<sockaddr*>(&peer), peer_length);
+        return;
+    }
+
+    sendto(udp_fd, buffer.data(), static_cast<std::size_t>(received), 0, reinterpret_cast<sockaddr*>(&peer), peer_length);
 }
 
 } // namespace
@@ -320,6 +341,7 @@ int main(int argc, char** argv) {
         std::optional<std::string> primary_arg;
         std::optional<std::string> secondary_arg;
         int connection_probe_timeout_ms = 1200;
+        int syn_delay_ms = 350;
         for (int index = 1; index < argc; ++index) {
             std::string token = argv[index];
             if (token == "--primary" && index + 1 < argc) {
@@ -328,8 +350,10 @@ int main(int argc, char** argv) {
                 secondary_arg = argv[++index];
             } else if (token == "--probe-timeout-ms" && index + 1 < argc) {
                 connection_probe_timeout_ms = std::stoi(argv[++index]);
+            } else if (token == "--syn-delay-ms" && index + 1 < argc) {
+                syn_delay_ms = std::stoi(argv[++index]);
             } else if (token == "--help" || token == "-h") {
-                std::cout << "Usage: nat_type_tester_rfc5382_server --primary host[:port] --secondary host[:port] [--probe-timeout-ms 1200]\n";
+                std::cout << "Usage: nat_type_tester_rfc5382_server --primary host[:port] --secondary host[:port] [--probe-timeout-ms 1200] [--syn-delay-ms 350]\n";
                 return 0;
             } else {
                 fail("Unknown or incomplete argument: " + token);
@@ -352,15 +376,17 @@ int main(int argc, char** argv) {
         int primary_tcp_fd = create_tcp_listener(primary_server);
         int secondary_tcp_fd = create_tcp_listener(secondary_server);
         int primary_udp_fd = create_udp_listener(primary_server);
+        int secondary_udp_fd = create_udp_listener(secondary_server);
 
         std::cout << "Server ready. Primary=" << primary_host << ":" << primary_port
                   << " Secondary=" << secondary_host << ":" << secondary_port << '\n';
 
         while (true) {
-            std::array<pollfd, 3> descriptors{{
+            std::array<pollfd, 4> descriptors{{
                 {primary_tcp_fd, POLLIN, 0},
                 {secondary_tcp_fd, POLLIN, 0},
                 {primary_udp_fd, POLLIN, 0},
+                {secondary_udp_fd, POLLIN, 0},
             }};
             int rc = poll(descriptors.data(), descriptors.size(), -1);
             if (rc < 0) {
@@ -368,14 +394,17 @@ int main(int argc, char** argv) {
             }
 
             if (descriptors[2].revents & POLLIN) {
-                handle_udp_map(primary_udp_fd);
+                handle_udp_packet(primary_udp_fd);
+            }
+            if (descriptors[3].revents & POLLIN) {
+                handle_udp_packet(secondary_udp_fd);
             }
             if (descriptors[0].revents & POLLIN) {
                 sockaddr_storage client{};
                 socklen_t length = sizeof(client);
                 int client_fd = accept(primary_tcp_fd, reinterpret_cast<sockaddr*>(&client), &length);
                 if (client_fd >= 0) {
-                    handle_tcp_client(client_fd, primary_server, secondary_server, connection_probe_timeout_ms);
+                    handle_tcp_client(client_fd, primary_server, secondary_server, connection_probe_timeout_ms, syn_delay_ms);
                     close(client_fd);
                 }
             }
@@ -384,7 +413,7 @@ int main(int argc, char** argv) {
                 socklen_t length = sizeof(client);
                 int client_fd = accept(secondary_tcp_fd, reinterpret_cast<sockaddr*>(&client), &length);
                 if (client_fd >= 0) {
-                    handle_tcp_client(client_fd, primary_server, secondary_server, connection_probe_timeout_ms);
+                    handle_tcp_client(client_fd, primary_server, secondary_server, connection_probe_timeout_ms, syn_delay_ms);
                     close(client_fd);
                 }
             }

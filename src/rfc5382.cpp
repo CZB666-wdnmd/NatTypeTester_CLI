@@ -194,6 +194,23 @@ std::pair<bool, bool> parse_filter_line(const std::string& line) {
     return {parse_flag(p_field, 'P'), parse_flag(s_field, 'S')};
 }
 
+std::pair<bool, bool> parse_syn_line(const std::string& line) {
+    std::istringstream stream(line);
+    std::string immediate_field;
+    std::string delayed_field;
+    if (!(stream >> immediate_field >> delayed_field)) {
+        throw std::runtime_error("Invalid SYN probe response");
+    }
+    auto parse_flag = [](const std::string& field, const char key) -> bool {
+        constexpr std::size_t FLAG_FIELD_SIZE = 3; // "I=1" / "D=0"
+        if (field.size() != FLAG_FIELD_SIZE || field[0] != key || field[1] != '=') {
+            throw std::runtime_error("Invalid SYN probe response field");
+        }
+        return field[2] == '1';
+    };
+    return {parse_flag(immediate_field, 'I'), parse_flag(delayed_field, 'D')};
+}
+
 std::string request_tcp_command(const IpEndpoint& local,
                                 const IpEndpoint& server,
                                 std::string_view command,
@@ -251,10 +268,10 @@ std::optional<IpEndpoint> request_udp_mapping(const IpEndpoint& local, const IpE
 
 } // namespace
 
-Rfc5382TcpResult run_rfc5382_tcp_tests(const RequestOptions& options,
-                                       const IpEndpoint& primary_server,
-                                       const IpEndpoint& secondary_server,
-                                       const std::optional<IpEndpoint>& local_bind) {
+Rfc5382TcpResult run_rfc5382_tests(const RequestOptions& options,
+                                   const IpEndpoint& primary_server,
+                                   const IpEndpoint& secondary_server,
+                                   const std::optional<IpEndpoint>& local_bind) {
     if (primary_server.family != secondary_server.family) {
         throw std::runtime_error("Primary and secondary server must use the same IP family.");
     }
@@ -290,6 +307,11 @@ Rfc5382TcpResult run_rfc5382_tcp_tests(const RequestOptions& options,
         } else {
             result.filtering_behavior = FilteringBehavior::AddressAndPortDependent;
         }
+        auto [immediate_ok, delayed_ok] =
+            parse_syn_line(request_tcp_command(*result.local_endpoint, primary_server, "S\n", options.timeout));
+        result.simultaneous_open = immediate_ok ? ProbeStatus::Pass : ProbeStatus::Fail;
+        result.unexpected_syn = delayed_ok ? ProbeStatus::Pass : ProbeStatus::Fail;
+        result.icmp_error_handling = ProbeStatus::Inconclusive;
 
         constexpr int max_drain_accepts = 4; // server sends up to primary+secondary probe connections plus retries
         for (int index = 0; index < max_drain_accepts; ++index) {

@@ -48,6 +48,13 @@ enum class FilteringBehavior {
     None,
 };
 
+enum class ProbeStatus {
+    Unknown,
+    Pass,
+    Fail,
+    Inconclusive,
+};
+
 enum class TransportType {
     Udp,
     Tcp,
@@ -122,6 +129,7 @@ std::string to_string(NatType value);
 std::string to_string(BindingTestResult value);
 std::string to_string(MappingBehavior value);
 std::string to_string(FilteringBehavior value);
+std::string to_string(ProbeStatus value);
 std::string to_string(TransportType value);
 std::string to_string(StunTestType value);
 
