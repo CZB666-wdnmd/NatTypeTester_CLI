@@ -3,7 +3,7 @@
 一个基于 C++ 的 NAT 行为测试命令行工具，覆盖：
 
 - RFC 3489（经典 NAT Type）
-- RFC 5780 / RFC 8489 体系下的 Binding / Mapping / Filtering 行为探测
+- RFC 5780 / RFC 5389 / RFC 8489 体系下的 Binding / Mapping / Filtering 行为探测
 - RFC 4787（UDP NAT 行为要求）
 - RFC 5382（TCP NAT 行为要求）
 - RFC 7857（NAT 行为的一致性与协议独立性）
@@ -20,7 +20,7 @@
 ### 协议支持
 
 - [x] IPv4
-- [x] IPv6
+- [ ] IPv6（未测试）
 
 ### 传输支持
 
@@ -97,7 +97,7 @@ nat_type_tester_cli rfc7857 --stun_server host[:port] --primary_server host[:por
 - `rfc5382`
 - `rfc7857`
 
-原因：这三类测试包含“非标准 STUN 回路”与“主动回连探测”，普通公网 STUN 服务器通常不提供该能力。
+原因：这三类测试包含“非标准 STUN 回路”与“主动回连探测”，普通公网 STUN 服务器不提供该能力。
 
 启动方式示例：
 
@@ -193,6 +193,12 @@ nat_type_tester_cli rfc7857 --stun_server host[:port] --primary_server host[:por
   - `OutboundFragmentation` / `InboundFragmentation` 用 Pass/Fail 表示
 - `icmp`：当前实现返回 `Inconclusive`
 
+尚未实现的检测:
+- [ ] REQ-2：如果 NAT 有多个公网 IP，推荐（RECOMMENDED）使用“成对（Paired）”的 IP 地址池行为。
+- [ ] REQ-5：NAT 的 UDP 映射超时时间绝不能（MUST NOT）小于 2 分钟，推荐默认超时时间为 5 分钟或以上。
+- [ ] REQ-6：NAT 必须（MUST）在有“出站（Outbound）”流量时刷新超时定时器。
+- [ ] REQ-12：接收到 ICMP 错误消息绝不能（MUST NOT）导致 NAT 销毁映射。
+
 ## 5.4 `rfc5382`：TCP NAT 行为要求
 
 `rfc5382` 的实现由两部分组成：
@@ -219,6 +225,11 @@ nat_type_tester_cli rfc7857 --stun_server host[:port] --primary_server host[:por
 - `IcmpErrorHandling`
   - 当前实现返回 `Inconclusive`
 
+尚未实现的检测:
+- [ ] REQ-5：对于已建立（Established）的 TCP 连接，NAT 的空闲超时时间不得少于 2 小时 4 分钟。对于过渡状态，超时时间不得少于 4 分钟。
+- [ ] REQ-9：NAT 应该翻译 ICMP 目标不可达消息。
+- [ ] REQ-10：收到任何类型的 ICMP 消息，NAT 都“绝对不能”终结 TCP 连接或删掉映射。
+
 ## 5.5 `rfc7857`：跨协议一致性（UDP + TCP）
 
 `rfc7857` 组合以下结果：
@@ -238,6 +249,15 @@ nat_type_tester_cli rfc7857 --stun_server host[:port] --primary_server host[:por
 - `PortParityPreservation`
   - 本地端口与 UDP/TCP 外网端口奇偶都一致 → `Pass`
   - 否则 `Fail`
+
+尚未实现的检测:
+- [ ] TCP 会话跟踪
+- [ ] EIF 映射刷新与出站错误包
+
+## 5.6 没有计划实现的检测
+IP地址池
+ALG应用层网关
+Hairpinning
 
 ---
 
