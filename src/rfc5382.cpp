@@ -20,6 +20,8 @@
 namespace natcli {
 namespace {
 
+constexpr std::string_view kUdpMappingRequest = "M\n";
+
 struct SocketAddress {
     sockaddr_storage storage{};
     socklen_t length{};
@@ -285,7 +287,7 @@ std::pair<bool, bool> parse_syn_line(const std::string& line) {
     return {parse_flag(immediate_field, 'I'), parse_flag(delayed_field, 'D')};
 }
 
-bool parse_single_flag_line(const std::string& line, char key) {
+bool parse_flag_response(const std::string& line, char key) {
     if (line.size() != 3 || line[0] != key || line[1] != '=') {
         throw std::runtime_error("Invalid single-flag response");
     }
@@ -337,7 +339,8 @@ std::optional<IpEndpoint> request_udp_mapping(const IpEndpoint& local, const IpE
         set_reuse_options(socket_fd);
         bind_socket(socket_fd, local);
         SocketAddress remote = to_sockaddr(server);
-        ssize_t sent = sendto(socket_fd, "M\n", 2, 0, reinterpret_cast<sockaddr*>(&remote.storage), remote.length);
+        ssize_t sent = sendto(socket_fd, kUdpMappingRequest.data(), kUdpMappingRequest.size(), 0,
+                              reinterpret_cast<sockaddr*>(&remote.storage), remote.length);
         if (sent <= 0) {
             throw system_error("sendto failed");
         }
@@ -372,7 +375,7 @@ std::optional<bool> probe_tcp_mapping_allows_udp(const IpEndpoint& local,
         set_reuse_options(socket_fd);
         bind_socket(socket_fd, local);
         const bool server_probe_sent =
-            parse_single_flag_line(request_tcp_command(local, server, "U\n", timeout), 'R');
+            parse_flag_response(request_tcp_command(local, server, "U\n", timeout), 'R');
         if (!server_probe_sent) {
             close(socket_fd);
             return std::nullopt;
@@ -408,7 +411,8 @@ std::optional<bool> probe_udp_mapping_allows_tcp(const IpEndpoint& local,
         bind_socket(udp_socket, local);
 
         SocketAddress remote = to_sockaddr(server);
-        ssize_t sent = sendto(udp_socket, "M\n", 2, 0, reinterpret_cast<sockaddr*>(&remote.storage), remote.length);
+        ssize_t sent = sendto(udp_socket, kUdpMappingRequest.data(), kUdpMappingRequest.size(), 0,
+                              reinterpret_cast<sockaddr*>(&remote.storage), remote.length);
         if (sent <= 0) {
             throw system_error("sendto failed");
         }
@@ -430,7 +434,7 @@ std::optional<bool> probe_udp_mapping_allows_tcp(const IpEndpoint& local,
         }
 
         const std::string command = "C " + to_string(*udp_public) + "\n";
-        const bool tcp_probe_connected = parse_single_flag_line(request_tcp_command(local, server, command, timeout), 'R');
+        const bool tcp_probe_connected = parse_flag_response(request_tcp_command(local, server, command, timeout), 'R');
         close(udp_socket);
         return tcp_probe_connected;
     } catch (...) {

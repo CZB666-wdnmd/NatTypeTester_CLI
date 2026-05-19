@@ -22,6 +22,8 @@
 
 namespace {
 
+constexpr std::string_view kRfc7857UdpProbePayload = "RFC7857-UDP-PROBE\n";
+
 struct IpEndpoint {
     int family{};
     std::array<std::uint8_t, 16> address{};
@@ -335,8 +337,7 @@ void handle_tcp_client(int client_fd,
             if (command == "U") {
                 IpEndpoint udp_source = primary_server;
                 udp_source.port = 0;
-                constexpr std::string_view payload = "RFC7857-UDP-PROBE\n";
-                bool sent = try_send_udp_from_source(udp_source, peer_endpoint, payload);
+                bool sent = try_send_udp_from_source(udp_source, peer_endpoint, kRfc7857UdpProbePayload);
                 send_all(client_fd, std::string("R=") + (sent ? "1" : "0") + "\n");
                 continue;
             }
