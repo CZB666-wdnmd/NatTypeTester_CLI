@@ -191,7 +191,7 @@ nat_type_tester_cli rfc7857 --stun_server host[:port] --primary_server host[:por
   - `PortParityPreservation`：内外端口奇偶性是否保持
 - `fragmentation`：向 `primary/secondary` 发送 2000 字节 UDP 负载并等待回显
   - `OutboundFragmentation` / `InboundFragmentation` 用 Pass/Fail 表示
-- `icmp`：建立 UDP 映射后触发 ICMP 错误探测，输出 `IcmpErrorHandling`；该子命令只包含 UDP Hairpinning（`UdpHairpinning`）
+- `icmp`：建立 UDP 映射后触发 ICMP 错误探测，输出 `IcmpErrorHandling`；该子命令只包含 UDP 回环（`UdpHairpinning`）
 
 尚未实现的检测:
 - [ ] REQ-2：如果 NAT 有多个公网 IP，推荐（RECOMMENDED）使用“成对（Paired）”的 IP 地址池行为。

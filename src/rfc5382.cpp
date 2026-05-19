@@ -218,7 +218,7 @@ bool wait_for_readable(int socket_fd, std::chrono::milliseconds timeout) {
 }
 
 bool wait_for_error(int socket_fd, std::chrono::milliseconds timeout) {
-    pollfd descriptor{socket_fd, POLLERR, 0};
+    pollfd descriptor{socket_fd, 0, 0};
     int rc = poll(&descriptor, 1, static_cast<int>(timeout.count()));
     if (rc <= 0 || (descriptor.revents & POLLERR) == 0) {
         return false;
@@ -573,9 +573,9 @@ ProbeStatus run_udp_icmp_mapping_validation(const IpEndpoint& stun_server,
             return ProbeStatus::Inconclusive;
         }
 
-        auto run_single_error_probe = [&](std::uint16_t offset) -> bool {
+        auto run_single_error_probe = [&](std::uint16_t port_offset) -> bool {
             IpEndpoint target = *mapped_before;
-            target.port = static_cast<std::uint16_t>(target.port + offset);
+            target.port = static_cast<std::uint16_t>(target.port + port_offset);
             if (target.port == mapped_before->port) {
                 target.port = static_cast<std::uint16_t>(target.port + 1);
             }
@@ -593,11 +593,11 @@ ProbeStatus run_udp_icmp_mapping_validation(const IpEndpoint& stun_server,
         };
 
         const bool unreachable_error = run_single_error_probe(1);
-        const bool secondary_error = run_single_error_probe(2);
+        const bool second_unreachable_error = run_single_error_probe(2);
         std::optional<IpEndpoint> mapped_after = request_stun_udp_mapping(socket_fd, stun_server, timeout);
         close(socket_fd);
 
-        if (!unreachable_error || !secondary_error) {
+        if (!unreachable_error || !second_unreachable_error) {
             return ProbeStatus::Fail;
         }
         if (!mapped_after.has_value() || *mapped_after != *mapped_before) {
