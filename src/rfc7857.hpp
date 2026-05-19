@@ -17,6 +17,9 @@ struct Rfc7857Result {
     ProbeStatus eim_protocol_independence{ProbeStatus::Unknown};
     ProbeStatus eif_protocol_independence{ProbeStatus::Unknown};
     ProbeStatus port_parity_preservation{ProbeStatus::Unknown};
+    ProbeStatus udp_hairpinning{ProbeStatus::Unknown};
+    ProbeStatus tcp_hairpinning{ProbeStatus::Unknown};
+    ProbeStatus icmp_hairpinning{ProbeStatus::Unknown};
 };
 
 ProbeStatus classify_rfc7857_eim_protocol_independence(const std::optional<IpEndpoint>& udp_public,

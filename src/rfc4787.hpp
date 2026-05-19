@@ -24,6 +24,9 @@ struct Rfc4787Result {
     ProbeStatus port_range_preservation{ProbeStatus::Unknown};
     ProbeStatus port_parity_preservation{ProbeStatus::Unknown};
     ProbeStatus icmp_error_handling{ProbeStatus::Unknown};
+    ProbeStatus udp_hairpinning{ProbeStatus::Unknown};
+    ProbeStatus tcp_hairpinning{ProbeStatus::Unknown};
+    ProbeStatus icmp_hairpinning{ProbeStatus::Unknown};
     ProbeStatus outbound_fragmentation{ProbeStatus::Unknown};
     ProbeStatus inbound_fragmentation{ProbeStatus::Unknown};
 };

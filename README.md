@@ -191,7 +191,7 @@ nat_type_tester_cli rfc7857 --stun_server host[:port] --primary_server host[:por
   - `PortParityPreservation`：内外端口奇偶性是否保持
 - `fragmentation`：向 `primary/secondary` 发送 2000 字节 UDP 负载并等待回显
   - `OutboundFragmentation` / `InboundFragmentation` 用 Pass/Fail 表示
-- `icmp`：当前实现返回 `Inconclusive`
+- `icmp`：建立 UDP 映射后触发 ICMP 错误探测，输出 `IcmpErrorHandling`；该子命令只包含 UDP 回环（`UdpHairpinning`）
 
 尚未实现的检测:
 - [ ] REQ-2：如果 NAT 有多个公网 IP，推荐（RECOMMENDED）使用“成对（Paired）”的 IP 地址池行为。
@@ -223,7 +223,9 @@ nat_type_tester_cli rfc7857 --stun_server host[:port] --primary_server host[:por
 - `UnexpectedSynHandling`
   - `D=1` → `Pass`，否则 `Fail`
 - `IcmpErrorHandling`
-  - 当前实现返回 `Inconclusive`
+  - 在已建立 TCP 连接后触发 ICMP 错误探测，并检查连接/映射是否保持
+- Hairpinning
+  - RFC5382 仅输出 `TcpHairpinning`
 
 尚未实现的检测:
 - [ ] REQ-5：对于已建立（Established）的 TCP 连接，NAT 的空闲超时时间不得少于 2 小时 4 分钟。对于过渡状态，超时时间不得少于 4 分钟。
@@ -237,6 +239,8 @@ nat_type_tester_cli rfc7857 --stun_server host[:port] --primary_server host[:por
 - UDP Mapping：来自 RFC5780 Mapping
 - UDP Filtering：来自 RFC5780 Filtering
 - TCP Filtering：来自 RFC5382
+- Hairpinning（UDP/TCP）：分别使用 RFC4787 的 UDP 回环和 RFC5382 的 TCP 回环
+- ICMP Hairpinning：在已建立 UDP/TCP 连接下联合验证 ICMP 错误可达性与映射保持
 
 并计算三项一致性：
 
@@ -257,7 +261,6 @@ nat_type_tester_cli rfc7857 --stun_server host[:port] --primary_server host[:por
 ## 5.6 没有计划实现的检测
 IP地址池
 ALG应用层网关
-Hairpinning
 
 ---
 
@@ -275,6 +278,8 @@ Hairpinning
 - `TcpSimultaneousOpen`：TCP 同时打开能力
 - `UnexpectedSynHandling`：异常/延迟 SYN 处理能力
 - `IcmpErrorHandling`：ICMP 错误处理（当前多为 Inconclusive）
+- `UdpHairpinning` / `TcpHairpinning`：协议对应的回环探测
+- `IcmpHairpinning`：RFC7857 中基于已建立 UDP/TCP 连接的 ICMP 错误联合探测
 - `UdpMappingBehavior` / `UdpFilteringBehavior` / `TcpFilteringBehavior`：RFC7857 汇总字段
 - `EimProtocolIndependence`：EIM 跨协议独立性
 - `EifProtocolIndependence`：EIF 跨协议独立性
