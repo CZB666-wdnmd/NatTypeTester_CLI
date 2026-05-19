@@ -21,6 +21,8 @@ namespace natcli {
 namespace {
 
 constexpr std::string_view kUdpMappingRequest = "M\n";
+constexpr std::string_view kRfc7857UdpProbePayload = "RFC7857-UDP-PROBE\n";
+constexpr char kProbeResultFlagKey = 'R';
 
 struct SocketAddress {
     sockaddr_storage storage{};
@@ -375,7 +377,7 @@ std::optional<bool> probe_tcp_mapping_allows_udp(const IpEndpoint& local,
         set_reuse_options(socket_fd);
         bind_socket(socket_fd, local);
         const bool server_probe_sent =
-            parse_flag_response(request_tcp_command(local, server, "U\n", timeout), 'R');
+            parse_flag_response(request_tcp_command(local, server, "U\n", timeout), kProbeResultFlagKey);
         if (!server_probe_sent) {
             close(socket_fd);
             return std::nullopt;
@@ -391,7 +393,8 @@ std::optional<bool> probe_tcp_mapping_allows_udp(const IpEndpoint& local,
         if (received <= 0) {
             return false;
         }
-        return true;
+        const std::string_view received_payload(buffer.data(), static_cast<std::size_t>(received));
+        return received_payload == kRfc7857UdpProbePayload;
     } catch (...) {
         close(socket_fd);
         throw;
@@ -434,7 +437,8 @@ std::optional<bool> probe_udp_mapping_allows_tcp(const IpEndpoint& local,
         }
 
         const std::string command = "C " + to_string(*udp_public) + "\n";
-        const bool tcp_probe_connected = parse_flag_response(request_tcp_command(local, server, command, timeout), 'R');
+        const bool tcp_probe_connected =
+            parse_flag_response(request_tcp_command(local, server, command, timeout), kProbeResultFlagKey);
         close(udp_socket);
         return tcp_probe_connected;
     } catch (...) {

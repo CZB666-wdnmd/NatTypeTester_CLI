@@ -27,6 +27,7 @@ ProbeStatus classify_rfc7857_eim_protocol_independence(const std::optional<IpEnd
     if (!udp_public.has_value() || !tcp_public.has_value()) {
         return ProbeStatus::Inconclusive;
     }
+    // Per project requirement: cross-protocol endpoint reuse means protocol-independence is not preserved.
     return *udp_public == *tcp_public ? ProbeStatus::Fail : ProbeStatus::Pass;
 }
 
