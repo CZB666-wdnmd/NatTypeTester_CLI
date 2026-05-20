@@ -236,9 +236,11 @@ sudo ./src_ser/build/nat_type_tester_rfc5382_server \
 - `PortParityPreservation`
   - 本地端口与 UDP/TCP 外网端口奇偶都一致 → `Pass`
   - 否则 `Fail`
-- `Section9PortRandomization`
+- `PortRandomization`
   - 快速连续创建 20 个 UDP 映射（本地随机端口），输出公网端口序列并判断是否呈现小步递增（如 +1/+2）。若明显递增判定为 `Fail`，否则 `Pass`。
-- `Section10Ipv4IdPreservation`
+- `AllocationBehavior`
+  - 同上“端口分配预测性”测试，分析输出端口分配行为Preserved (Delta = 0)，Sequential (Delta = +1 或 +2)，Random (完全随机，极难打洞)，Contiguous Port Block (处于某个特定的连续端口块内)
+- `Ipv4IdPreservation`
   - 发送携带随机 IPv4 ID 的 UDP 包，并将 ID 同步写入 payload，由服务端比对观测到的外层 IP ID，判断 NAT 是否改写该字段。
 
 尚未实现的检测:
@@ -274,9 +276,10 @@ ALG应用层网关
 - `UdpMappingBehavior` / `UdpFilteringBehavior` / `TcpFilteringBehavior`：RFC7857 汇总字段
 - `EimProtocolIndependence`：EIM 跨协议独立性
 - `EifProtocolIndependence`：EIF 跨协议独立性
-- `Section9PortRandomization`：RFC7857 section9 端口随机化建议测试结果
-- `Section9PublicPorts`：section9 测试中观测到的公网端口序列
-- `Section10Ipv4IdPreservation`：RFC7857 section10 IPv4 ID 保持性测试结果
+- `PortRandomization`：RFC7857 section9 端口随机化建议测试结果
+- `PublicPorts`：section9 测试中观测到的公网端口序列
+- `AllocationBehavior`：测试中分析出的端口分配行为
+- `Ipv4IdPreservation`：RFC7857 section10 IPv4 ID 保持性测试结果
 - `PublicEnd` / `UdpPublicEnd` / `TcpPublicEnd`：外网观测端点
 - `LocalEnd`：本地使用端点
 - `OtherEnd`：STUN 返回的 OTHER-ADDRESS
