@@ -26,6 +26,7 @@ struct Rfc7857Result {
     ProbeStatus section9_port_randomization{ProbeStatus::Unknown};
     ProbeStatus section10_ipv4_id_preservation{ProbeStatus::Unknown};
     std::string section9_public_ports;
+    std::string section9_allocation_behavior;
 };
 
 ProbeStatus classify_rfc7857_eim_protocol_independence(const std::optional<IpEndpoint>& udp_public,

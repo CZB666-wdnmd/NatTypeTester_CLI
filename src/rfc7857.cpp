@@ -21,6 +21,10 @@
 #include <vector>
 
 namespace natcli {
+
+std::string analyze_port_allocation_behavior(const std::vector<std::uint16_t>& local_ports,
+                                             const std::vector<std::uint16_t>& public_ports);
+
 namespace {
 
 struct SocketAddress {
@@ -31,6 +35,8 @@ struct SocketAddress {
 struct PortRandomizationProbeResult {
     ProbeStatus status{ProbeStatus::Unknown};
     std::vector<std::uint16_t> public_ports;
+    std::vector<std::uint16_t> local_ports;
+    std::string allocation_behavior;
 };
 
 std::runtime_error system_error(const std::string& message) {
@@ -205,9 +211,11 @@ PortRandomizationProbeResult run_section9_port_randomization_probe(const IpEndpo
             continue;
         }
         result.public_ports.push_back(mapped->port);
+        result.local_ports.push_back(local.port);
     }
 
     result.status = classify_rfc7857_port_randomization(result.public_ports);
+    result.allocation_behavior = analyze_port_allocation_behavior(result.local_ports, result.public_ports);
     return result;
 }
 
@@ -495,6 +503,60 @@ ProbeStatus classify_rfc7857_port_randomization(const std::vector<std::uint16_t>
     return small_increment_count >= kSequentialThreshold ? ProbeStatus::Fail : ProbeStatus::Pass;
 }
 
+std::string analyze_port_allocation_behavior(const std::vector<std::uint16_t>& local_ports,
+                                             const std::vector<std::uint16_t>& public_ports) {
+    if (public_ports.size() < 2 || local_ports.size() != public_ports.size()) {
+        return "Unknown";
+    }
+
+    // 1. 检查 Preserved (端口保留：公网端口 == 本地端口)
+    bool is_preserved = true;
+    for (std::size_t i = 0; i < public_ports.size(); ++i) {
+        if (public_ports[i] != local_ports[i]) {
+            is_preserved = false;
+            break;
+        }
+    }
+    if (is_preserved) {
+        return "Preserved (Delta = 0, Port = LocalPort)";
+    }
+
+    // 2. 计算 Delta (连续公网端口之间的差值)
+    std::size_t sequential_count = 0;
+    std::uint16_t min_port = public_ports[0];
+    std::uint16_t max_port = public_ports[0];
+
+    for (std::size_t i = 1; i < public_ports.size(); ++i) {
+        min_port = std::min(min_port, public_ports[i]);
+        max_port = std::max(max_port, public_ports[i]);
+
+        if (public_ports[i] > public_ports[i - 1]) {
+            std::uint16_t delta = public_ports[i] - public_ports[i - 1];
+            if (delta == 1 || delta == 2) {
+                sequential_count++;
+            }
+        } else if (public_ports[i - 1] > public_ports[i]) {
+            std::uint16_t delta = public_ports[i - 1] - public_ports[i];
+            if (delta == 1 || delta == 2) {
+                sequential_count++;
+            }
+        }
+    }
+
+    // 如果 70% 以上的分配是递增 1 或 2，判定为 Sequential
+    if (sequential_count >= (public_ports.size() - 1) * 0.7) {
+        return "Sequential (Delta = +1 or +2)";
+    }
+
+    // 3. 检查 Contiguous Port Block (在一个紧凑的端口块内，比如 CGNAT 分配了 256 个端口的块)
+    if ((max_port - min_port) < 100) {
+        return "Contiguous Port Block (Narrow Range)";
+    }
+
+    // 4. 其余情况视为 Random
+    return "Random";
+}
+
 Rfc7857Result run_rfc7857_tests(const RequestOptions& options,
                                 const IpEndpoint& stun_server,
                                 const IpEndpoint& primary_server,
@@ -527,6 +589,7 @@ Rfc7857Result run_rfc7857_tests(const RequestOptions& options,
     PortRandomizationProbeResult section9 = run_section9_port_randomization_probe(primary_server, primary_server.family, options.timeout);
     result.section9_port_randomization = section9.status;
     result.section9_public_ports = join_ports(section9.public_ports);
+    result.section9_allocation_behavior = section9.allocation_behavior;
     result.section10_ipv4_id_preservation =
         run_section10_ipv4_id_preservation_probe(primary_server, secondary_server, options.timeout, local_bind);
 
