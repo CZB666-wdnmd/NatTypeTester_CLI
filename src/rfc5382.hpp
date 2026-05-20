@@ -11,6 +11,11 @@ struct UdpHairpinningResult {
     ProbeStatus source_address_match{ProbeStatus::Unknown};
 };
 
+struct TcpHairpinningResult {
+    ProbeStatus connectivity{ProbeStatus::Unknown};
+    ProbeStatus source_address_match{ProbeStatus::Unknown};
+};
+
 struct Rfc5382TcpResult {
     FilteringBehavior filtering_behavior{FilteringBehavior::Unknown};
     std::optional<IpEndpoint> tcp_public_endpoint;
@@ -23,6 +28,7 @@ struct Rfc5382TcpResult {
     ProbeStatus icmp_error_handling{ProbeStatus::Inconclusive};
     ProbeStatus udp_hairpinning{ProbeStatus::Unknown};
     ProbeStatus tcp_hairpinning{ProbeStatus::Unknown};
+    ProbeStatus tcp_hairpinning_source_address{ProbeStatus::Unknown};
     ProbeStatus icmp_hairpinning{ProbeStatus::Unknown};
     bool primary_probe_success{false};
     bool secondary_probe_success{false};
@@ -37,6 +43,9 @@ UdpHairpinningResult run_udp_hairpinning_checks(const RequestOptions& options,
 ProbeStatus run_tcp_hairpinning_test(const RequestOptions& options,
                                      const IpEndpoint& stun_server,
                                      const std::optional<IpEndpoint>& local_bind);
+TcpHairpinningResult run_tcp_hairpinning_checks(const RequestOptions& options,
+                                                const IpEndpoint& stun_server,
+                                                const std::optional<IpEndpoint>& local_bind);
 ProbeStatus run_udp_icmp_error_handling_test(const RequestOptions& options,
                                              const IpEndpoint& primary_server,
                                              const std::optional<IpEndpoint>& local_bind);

@@ -527,21 +527,26 @@ UdpHairpinningResult run_udp_hairpin_probe(const IpEndpoint& stun_server,
     }
 }
 
-ProbeStatus run_tcp_hairpin_probe(const IpEndpoint& stun_server,
-                                  const std::optional<IpEndpoint>& local_bind,
-                                  std::chrono::milliseconds timeout) {
+TcpHairpinningResult run_tcp_hairpin_probe(const IpEndpoint& stun_server,
+                                           const std::optional<IpEndpoint>& local_bind,
+                                           std::chrono::milliseconds timeout) {
+    TcpHairpinningResult result;
     std::optional<IpEndpoint> mapped_public;
     std::optional<IpEndpoint> mapped_local;
     IpEndpoint mapping_bind = local_bind.value_or(wildcard_endpoint(stun_server.family));
     mapping_bind.port = 0;
     mapped_public = request_stun_tcp_mapping(mapping_bind, stun_server, timeout, &mapped_local);
     if (!mapped_public.has_value() || !mapped_local.has_value()) {
-        return ProbeStatus::Inconclusive;
+        result.connectivity = ProbeStatus::Inconclusive;
+        result.source_address_match = ProbeStatus::Inconclusive;
+        return result;
     }
 
     int listener = socket(stun_server.family, SOCK_STREAM, IPPROTO_TCP);
     if (listener < 0) {
-        return ProbeStatus::Inconclusive;
+        result.connectivity = ProbeStatus::Inconclusive;
+        result.source_address_match = ProbeStatus::Inconclusive;
+        return result;
     }
 
     try {
@@ -549,20 +554,25 @@ ProbeStatus run_tcp_hairpin_probe(const IpEndpoint& stun_server,
         bind_socket(listener, *mapped_local);
         if (listen(listener, 1) != 0) {
             close(listener);
-            return ProbeStatus::Inconclusive;
+            result.connectivity = ProbeStatus::Inconclusive;
+            result.source_address_match = ProbeStatus::Inconclusive;
+            return result;
         }
 
         int connector = socket(stun_server.family, SOCK_STREAM, IPPROTO_TCP);
         if (connector < 0) {
             close(listener);
-            return ProbeStatus::Inconclusive;
+            result.connectivity = ProbeStatus::Inconclusive;
+            result.source_address_match = ProbeStatus::Inconclusive;
+            return result;
         }
         set_reuse_options(connector);
         IpEndpoint connector_bind = local_bind.value_or(wildcard_endpoint(stun_server.family));
         connector_bind.port = 0;
         bind_socket(connector, connector_bind);
 
-        ProbeStatus status = ProbeStatus::Fail;
+        result.connectivity = ProbeStatus::Fail;
+        result.source_address_match = ProbeStatus::Fail;
         try {
             connect_with_timeout(connector, *mapped_public, timeout);
             if (wait_for_readable(listener, timeout)) {
@@ -570,20 +580,26 @@ ProbeStatus run_tcp_hairpin_probe(const IpEndpoint& stun_server,
                 socklen_t length = sizeof(incoming);
                 int accepted = accept(listener, reinterpret_cast<sockaddr*>(&incoming), &length);
                 if (accepted >= 0) {
-                    status = ProbeStatus::Pass;
+                    result.connectivity = ProbeStatus::Pass;
+                    const IpEndpoint source_endpoint = from_sockaddr(reinterpret_cast<sockaddr*>(&incoming), length);
+                    result.source_address_match =
+                        same_endpoint_address(source_endpoint, *mapped_public) ? ProbeStatus::Pass : ProbeStatus::Fail;
                     close(accepted);
                 }
             }
         } catch (...) {
-            status = ProbeStatus::Fail;
+            result.connectivity = ProbeStatus::Fail;
+            result.source_address_match = ProbeStatus::Fail;
         }
 
         close(connector);
         close(listener);
-        return status;
+        return result;
     } catch (...) {
         close(listener);
-        return ProbeStatus::Inconclusive;
+        result.connectivity = ProbeStatus::Inconclusive;
+        result.source_address_match = ProbeStatus::Inconclusive;
+        return result;
     }
 }
 
@@ -762,7 +778,7 @@ ProbeStatus run_server_assisted_tcp_icmp_test(const IpEndpoint& primary_server,
         // 2. 触发服务器发回带有 TCP 5元组的 ICMP 错误包
         send_all(control, "I\n");
         std::string i_resp = recv_line(control, timeout);
-        if (i_resp != "I=1") { close(control); return ProbeStatus::Inconclusive; }
+        if (i_resp != "I=1") { close(control); return ProbeStatus::Fail; }
 
         // 3. 延时等待 NAT 处理
         std::this_thread::sleep_for(std::chrono::milliseconds(300));
@@ -952,6 +968,12 @@ UdpHairpinningResult run_udp_hairpinning_checks(const RequestOptions& options,
 ProbeStatus run_tcp_hairpinning_test(const RequestOptions& options,
                                      const IpEndpoint& stun_server,
                                      const std::optional<IpEndpoint>& local_bind) {
+    return run_tcp_hairpinning_checks(options, stun_server, local_bind).connectivity;
+}
+
+TcpHairpinningResult run_tcp_hairpinning_checks(const RequestOptions& options,
+                                                const IpEndpoint& stun_server,
+                                                const std::optional<IpEndpoint>& local_bind) {
     return run_tcp_hairpin_probe(stun_server, local_bind, options.timeout);
 }
 
@@ -1024,7 +1046,9 @@ Rfc5382TcpResult run_rfc5382_tests(const RequestOptions& options,
         result.simultaneous_open = immediate_ok ? ProbeStatus::Pass : ProbeStatus::Fail;
         result.unexpected_syn = delayed_ok ? ProbeStatus::Pass : ProbeStatus::Fail;
         result.icmp_error_handling = run_tcp_icmp_error_handling_test(options, primary_server, local_bind);
-        result.tcp_hairpinning = run_tcp_hairpinning_test(options, stun_server, local_bind);
+        TcpHairpinningResult tcp_hairpinning = run_tcp_hairpinning_checks(options, stun_server, local_bind);
+        result.tcp_hairpinning = tcp_hairpinning.connectivity;
+        result.tcp_hairpinning_source_address = tcp_hairpinning.source_address_match;
         if (result.local_endpoint.has_value()) {
             result.tcp_mapping_allows_udp =
                 probe_tcp_mapping_allows_udp(*result.local_endpoint, primary_server, options.timeout);
