@@ -755,7 +755,7 @@ int main(int argc, char** argv) {
             } else if (token == "--syn-delay-ms" && index + 1 < argc) {
                 syn_delay_ms = std::stoi(argv[++index]);
             } else if (token == "--help" || token == "-h") {
-                std::cout << "Usage: sudo nat_type_tester_rfc5382_server --primary host[:port] --secondary host[:port] [--probe-timeout-ms 1200] [--syn-delay-ms 350]\n";
+                std::cout << "Usage: sudo nat_type_tester_server --primary host[:port] --secondary host[:port] [--probe-timeout-ms 1200] [--syn-delay-ms 350]\n";
                 return 0;
             } else {
                 fail("Unknown or incomplete argument: " + token);

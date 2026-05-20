@@ -43,5 +43,5 @@ jobs:
           name: nat_type_tester_binaries
           path: |
             src/build/nat_type_tester_cli
-            src_ser/build/nat_type_tester_rfc5382_server
+            src_ser/build/nat_type_tester_server
           if-no-files-found: error

@@ -84,7 +84,7 @@ nat_type_tester_cli rfc7857 --stun_server host[:port] --primary_server host[:por
  **重要**：为了测试 NAT 对外部 ICMP 错误的处理能力，服务端使用了 Raw Socket 伪造数据包，因此**必须使用 `sudo` 运行**。
 
 ```bash
-sudo ./src_ser/build/nat_type_tester_rfc5382_server \
+sudo ./src_ser/build/nat_type_tester_server \
   --primary 1.2.3.4:3478 \
   --secondary 5.6.7.8:3478
 ```
