@@ -316,36 +316,28 @@ std::uint16_t calculate_udp_checksum_ipv4(const iphdr& ip_header,
                                           const std::uint8_t* payload,
                                           std::size_t payload_len) {
     std::uint32_t sum = 0;
-    auto add16 = [&](std::uint16_t value) {
-        sum += value;
-        while (sum >> 16) {
-            sum = (sum & 0xFFFFu) + (sum >> 16);
+
+    auto add_buffer = [&](const void* data, std::size_t len) {
+        const auto* ptr = static_cast<const std::uint16_t*>(data);
+        while (len > 1) {
+            sum += *ptr++;
+            len -= 2;
+        }
+        if (len == 1) {
+            sum += *reinterpret_cast<const std::uint8_t*>(ptr);
         }
     };
 
-    const std::uint8_t* src = reinterpret_cast<const std::uint8_t*>(&ip_header.saddr);
-    const std::uint8_t* dst = reinterpret_cast<const std::uint8_t*>(&ip_header.daddr);
-    add16(static_cast<std::uint16_t>((src[0] << 8) | src[1]));
-    add16(static_cast<std::uint16_t>((src[2] << 8) | src[3]));
-    add16(static_cast<std::uint16_t>((dst[0] << 8) | dst[1]));
-    add16(static_cast<std::uint16_t>((dst[2] << 8) | dst[3]));
-    add16(htons(IPPROTO_UDP));
-    add16(udp_header.len);
+    add_buffer(&ip_header.saddr, 4);
+    add_buffer(&ip_header.daddr, 4);
+    std::uint16_t protocol_word = htons(IPPROTO_UDP); 
+    add_buffer(&protocol_word, 2);
+    add_buffer(&udp_header.len, 2);
+    add_buffer(&udp_header, sizeof(udphdr));
+    add_buffer(payload, payload_len);
 
-    const auto* udp_bytes = reinterpret_cast<const std::uint8_t*>(&udp_header);
-    for (std::size_t index = 0; index < sizeof(udphdr); index += 2) {
-        std::uint16_t word = static_cast<std::uint16_t>(udp_bytes[index] << 8);
-        if (index + 1 < sizeof(udphdr)) {
-            word = static_cast<std::uint16_t>(word | udp_bytes[index + 1]);
-        }
-        add16(word);
-    }
-    for (std::size_t index = 0; index < payload_len; index += 2) {
-        std::uint16_t word = static_cast<std::uint16_t>(payload[index] << 8);
-        if (index + 1 < payload_len) {
-            word = static_cast<std::uint16_t>(word | payload[index + 1]);
-        }
-        add16(word);
+    while (sum >> 16) {
+        sum = (sum & 0xFFFF) + (sum >> 16);
     }
 
     return static_cast<std::uint16_t>(~sum);
