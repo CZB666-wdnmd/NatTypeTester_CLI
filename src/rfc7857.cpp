@@ -524,7 +524,7 @@ Rfc7857Result run_rfc7857_tests(const RequestOptions& options,
     result.tcp_hairpinning = tcp_result.tcp_hairpinning;
     result.icmp_hairpinning = run_rfc7857_icmp_hairpinning_test(options, stun_server, primary_server, local_bind);
 
-    PortRandomizationProbeResult section9 = run_section9_port_randomization_probe(primary_server, stun_server.family, options.timeout);
+    PortRandomizationProbeResult section9 = run_section9_port_randomization_probe(primary_server, primary_server.family, options.timeout);
     result.section9_port_randomization = section9.status;
     result.section9_public_ports = join_ports(section9.public_ports);
     result.section10_ipv4_id_preservation =
