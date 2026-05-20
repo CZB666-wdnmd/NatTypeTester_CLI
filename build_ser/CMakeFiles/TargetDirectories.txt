@@ -1,0 +1,3 @@
+/home/runner/work/NatTypeTester_CLI/NatTypeTester_CLI/build_ser/CMakeFiles/nat_type_tester_rfc5382_server.dir
+/home/runner/work/NatTypeTester_CLI/NatTypeTester_CLI/build_ser/CMakeFiles/edit_cache.dir
+/home/runner/work/NatTypeTester_CLI/NatTypeTester_CLI/build_ser/CMakeFiles/rebuild_cache.dir
