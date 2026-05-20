@@ -312,8 +312,11 @@ int main(int argc, char** argv) {
             print_probe_if_available("PortParityPreservation", result.port_parity_preservation);
             print_probe_if_available("IcmpErrorHandling", result.icmp_error_handling);
             print_probe_if_available("UdpHairpinning", result.udp_hairpinning);
+            print_probe_if_available("UdpHairpinningSourceAddress", result.udp_hairpinning_source_address);
             print_probe_if_available("OutboundFragmentation", result.outbound_fragmentation);
+            print_probe_if_available("OutboundDfFragmentationError", result.outbound_df_fragmentation_error);
             print_probe_if_available("InboundFragmentation", result.inbound_fragmentation);
+            print_probe_if_available("OutOfOrderFragmentation", result.out_of_order_fragmentation);
             print_row("PublicEnd", endpoint_or_dash(result.public_endpoint));
             print_row("LocalEnd", endpoint_or_dash(result.local_endpoint));
             return 0;

@@ -6,6 +6,11 @@
 
 namespace natcli {
 
+struct UdpHairpinningResult {
+    ProbeStatus connectivity{ProbeStatus::Unknown};
+    ProbeStatus source_address_match{ProbeStatus::Unknown};
+};
+
 struct Rfc5382TcpResult {
     FilteringBehavior filtering_behavior{FilteringBehavior::Unknown};
     std::optional<IpEndpoint> tcp_public_endpoint;
@@ -26,6 +31,9 @@ struct Rfc5382TcpResult {
 ProbeStatus run_udp_hairpinning_test(const RequestOptions& options,
                                      const IpEndpoint& stun_server,
                                      const std::optional<IpEndpoint>& local_bind);
+UdpHairpinningResult run_udp_hairpinning_checks(const RequestOptions& options,
+                                                const IpEndpoint& stun_server,
+                                                const std::optional<IpEndpoint>& local_bind);
 ProbeStatus run_tcp_hairpinning_test(const RequestOptions& options,
                                      const IpEndpoint& stun_server,
                                      const std::optional<IpEndpoint>& local_bind);

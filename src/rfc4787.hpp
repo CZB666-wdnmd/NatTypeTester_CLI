@@ -25,10 +25,13 @@ struct Rfc4787Result {
     ProbeStatus port_parity_preservation{ProbeStatus::Unknown};
     ProbeStatus icmp_error_handling{ProbeStatus::Unknown};
     ProbeStatus udp_hairpinning{ProbeStatus::Unknown};
+    ProbeStatus udp_hairpinning_source_address{ProbeStatus::Unknown};
     ProbeStatus tcp_hairpinning{ProbeStatus::Unknown};
     ProbeStatus icmp_hairpinning{ProbeStatus::Unknown};
     ProbeStatus outbound_fragmentation{ProbeStatus::Unknown};
+    ProbeStatus outbound_df_fragmentation_error{ProbeStatus::Unknown};
     ProbeStatus inbound_fragmentation{ProbeStatus::Unknown};
+    ProbeStatus out_of_order_fragmentation{ProbeStatus::Unknown};
 };
 
 Rfc4787Result run_rfc4787_tests(const RequestOptions& options,
