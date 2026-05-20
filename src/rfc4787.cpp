@@ -51,6 +51,14 @@ bool wait_for_readable(int socket_fd, std::chrono::milliseconds timeout) {
     return rc > 0 && (descriptor.revents & POLLIN) != 0;
 }
 
+void set_reuse_options(int socket_fd) {
+    int reuse = 1;
+    setsockopt(socket_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+#ifdef SO_REUSEPORT
+    setsockopt(socket_fd, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse));
+#endif
+}
+
 ProbeStatus evaluate_port_range(const std::optional<IpEndpoint>& local, const std::optional<IpEndpoint>& mapped) {
     if (!local.has_value() || !mapped.has_value()) {
         return ProbeStatus::Inconclusive;
