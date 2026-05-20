@@ -208,9 +208,9 @@ sudo ./src_ser/build/nat_type_tester_rfc5382_server \
 - `UnexpectedSynHandling`
   - `D=1` → `Pass`，否则 `Fail`
 - `IcmpErrorHandling`
-  - 已建立 TCP 控制连接后，由服务端向客户端 NAT 注入携带 TCP 原始报头的 ICMP 错误，验证 NAT 是否违规掐断 TCP 连接 或能否正确翻译错误。
+  - 已建立 TCP 控制连接后，由服务端向客户端 NAT 注入携带 TCP 原始报头的 ICMP 错误，并在收到错误后继续验证映射仍存在（REC-10）。若未收到 ICMP 或映射消失，判定为 `Fail`。
 - Hairpinning
-  - RFC5382 仅输出 `TcpHairpinning`
+  - 输出 `TcpHairpinning` 与 `TcpHairpinningSourceAddress`，后者用于检查回环收到连接的源地址是否为 NAT 外网地址（REC-8a）。
 
 尚未实现的检测:
 - [ ] REQ-5：对于已建立（Established）的 TCP 连接，NAT 的空闲超时时间不得少于 2 小时 4 分钟。对于过渡状态，超时时间不得少于 4 分钟。
@@ -236,6 +236,10 @@ sudo ./src_ser/build/nat_type_tester_rfc5382_server \
 - `PortParityPreservation`
   - 本地端口与 UDP/TCP 外网端口奇偶都一致 → `Pass`
   - 否则 `Fail`
+- `Section9PortRandomization`
+  - 快速连续创建 20 个 UDP 映射（本地随机端口），输出公网端口序列并判断是否呈现小步递增（如 +1/+2）。若明显递增判定为 `Fail`，否则 `Pass`。
+- `Section10Ipv4IdPreservation`
+  - 发送携带随机 IPv4 ID 的 UDP 包，并将 ID 同步写入 payload，由服务端比对观测到的外层 IP ID，判断 NAT 是否改写该字段。
 
 尚未实现的检测:
 - [ ] TCP 会话跟踪
@@ -265,10 +269,14 @@ ALG应用层网关
 - `IcmpErrorHandling`：ICMP 错误处理（当前多为 Inconclusive）
 - `UdpHairpinning` / `TcpHairpinning`：协议对应的回环探测
 - `UdpHairpinningSourceAddress`：UDP 回环源地址是否匹配 NAT 外网地址（REC-9a）
+- `TcpHairpinningSourceAddress`：TCP 回环源地址是否匹配 NAT 外网地址（REC-8a）
 - `IcmpHairpinning`：RFC7857 中基于已建立 UDP/TCP 连接的 ICMP 错误联合探测
 - `UdpMappingBehavior` / `UdpFilteringBehavior` / `TcpFilteringBehavior`：RFC7857 汇总字段
 - `EimProtocolIndependence`：EIM 跨协议独立性
 - `EifProtocolIndependence`：EIF 跨协议独立性
+- `Section9PortRandomization`：RFC7857 section9 端口随机化建议测试结果
+- `Section9PublicPorts`：section9 测试中观测到的公网端口序列
+- `Section10Ipv4IdPreservation`：RFC7857 section10 IPv4 ID 保持性测试结果
 - `PublicEnd` / `UdpPublicEnd` / `TcpPublicEnd`：外网观测端点
 - `LocalEnd`：本地使用端点
 - `OtherEnd`：STUN 返回的 OTHER-ADDRESS

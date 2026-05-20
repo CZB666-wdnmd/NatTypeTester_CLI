@@ -440,6 +440,99 @@ bool send_out_of_order_fragmented_udp_ipv4(const IpEndpoint& peer, const IpEndpo
 }
 // ---------------------------------------------------------
 
+std::optional<std::uint16_t> parse_payload_id(std::string_view payload, std::string_view token) {
+    const std::string prefix = "VID:" + std::string(token) + ":";
+    if (!payload.starts_with(prefix)) {
+        return std::nullopt;
+    }
+    std::string_view id_text = payload.substr(prefix.size());
+    const std::size_t newline = id_text.find('\n');
+    if (newline != std::string_view::npos) {
+        id_text = id_text.substr(0, newline);
+    }
+    if (id_text.empty()) {
+        return std::nullopt;
+    }
+    try {
+        const int parsed = std::stoi(std::string(id_text));
+        if (parsed < 0 || parsed > 65535) {
+            return std::nullopt;
+        }
+        return static_cast<std::uint16_t>(parsed);
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+std::optional<std::uint16_t> observe_udp_ipv4_id(const IpEndpoint& peer,
+                                                 const IpEndpoint& local,
+                                                 std::string_view token,
+                                                 int timeout_ms) {
+    if (peer.family != AF_INET || local.family != AF_INET) {
+        return std::nullopt;
+    }
+    int raw_fd = socket(AF_INET, SOCK_RAW, IPPROTO_UDP);
+    if (raw_fd < 0) {
+        return std::nullopt;
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    try {
+        while (std::chrono::steady_clock::now() < deadline) {
+            const int remaining = static_cast<int>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count());
+            if (remaining <= 0) {
+                break;
+            }
+            pollfd descriptor{raw_fd, POLLIN, 0};
+            if (poll(&descriptor, 1, remaining) <= 0 || (descriptor.revents & POLLIN) == 0) {
+                continue;
+            }
+
+            std::array<std::uint8_t, 2048> buffer{};
+            const ssize_t received = recv(raw_fd, buffer.data(), buffer.size(), 0);
+            if (received <= static_cast<ssize_t>(sizeof(iphdr) + sizeof(udphdr))) {
+                continue;
+            }
+
+            const auto* ip_header = reinterpret_cast<const iphdr*>(buffer.data());
+            if (ip_header->version != 4 || ip_header->protocol != IPPROTO_UDP) {
+                continue;
+            }
+            const std::size_t ip_header_length = static_cast<std::size_t>(ip_header->ihl) * 4;
+            if (ip_header_length < sizeof(iphdr) || received <= static_cast<ssize_t>(ip_header_length + sizeof(udphdr))) {
+                continue;
+            }
+            const auto* udp_header =
+                reinterpret_cast<const udphdr*>(buffer.data() + ip_header_length);
+            if (ntohs(udp_header->dest) != local.port) {
+                continue;
+            }
+            if (std::memcmp(&ip_header->saddr, peer.address.data(), 4) != 0 ||
+                std::memcmp(&ip_header->daddr, local.address.data(), 4) != 0) {
+                continue;
+            }
+
+            const char* payload_data = reinterpret_cast<const char*>(buffer.data() + ip_header_length + sizeof(udphdr));
+            const std::size_t payload_size =
+                static_cast<std::size_t>(received) - ip_header_length - sizeof(udphdr);
+            std::string_view payload(payload_data, payload_size);
+            std::optional<std::uint16_t> payload_id = parse_payload_id(payload, token);
+            if (!payload_id.has_value()) {
+                continue;
+            }
+            const std::uint16_t observed_id = ntohs(ip_header->id);
+            close(raw_fd);
+            return observed_id;
+        }
+        close(raw_fd);
+        return std::nullopt;
+    } catch (...) {
+        close(raw_fd);
+        return std::nullopt;
+    }
+}
+
 
 bool try_connect_from_source(const IpEndpoint& source_address_only, const IpEndpoint& target, int timeout_ms) {
     int socket_fd = socket(target.family, SOCK_STREAM, IPPROTO_TCP);
@@ -575,6 +668,22 @@ void handle_tcp_client(int client_fd,
 
                 bool icmp_sent = send_ipv4_icmp_error(peer_endpoint, local_endpoint, IPPROTO_TCP);
                 send_all(client_fd, std::string("I=") + (icmp_sent ? "1" : "0") + "\n");
+                continue;
+            }
+            if (command.rfind("V ", 0) == 0) {
+                std::string token = command.substr(2);
+                sockaddr_storage local_addr{};
+                socklen_t local_length = sizeof(local_addr);
+                getsockname(client_fd, reinterpret_cast<sockaddr*>(&local_addr), &local_length);
+                IpEndpoint local_endpoint = from_sockaddr(reinterpret_cast<sockaddr*>(&local_addr), local_length);
+
+                std::optional<std::uint16_t> observed_id =
+                    observe_udp_ipv4_id(peer_endpoint, local_endpoint, token, connection_probe_timeout_ms);
+                if (!observed_id.has_value()) {
+                    send_all(client_fd, "V=-1\n");
+                } else {
+                    send_all(client_fd, "V=" + std::to_string(*observed_id) + "\n");
+                }
                 continue;
             }
             send_all(client_fd, "ERR\n");

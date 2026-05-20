@@ -167,6 +167,23 @@ void test_rfc7857_eif_protocol_independence() {
     expect(classify_rfc7857_eif_protocol_independence(std::nullopt, false) == ProbeStatus::Inconclusive);
 }
 
+void test_rfc7857_port_randomization() {
+    std::vector<std::uint16_t> increasing;
+    for (std::uint16_t port = 40000; port < 40020; ++port) {
+        increasing.push_back(port);
+    }
+    expect(classify_rfc7857_port_randomization(increasing) == ProbeStatus::Fail);
+
+    std::vector<std::uint16_t> random_like{
+        51001, 43022, 60111, 32234, 55000, 47003, 63012, 30012, 42077, 52031,
+        41005, 64009, 36008, 59077, 45033, 62001, 34044, 57012, 39009, 61015
+    };
+    expect(classify_rfc7857_port_randomization(random_like) == ProbeStatus::Pass);
+
+    std::vector<std::uint16_t> too_few{40000, 40001, 40002};
+    expect(classify_rfc7857_port_randomization(too_few) == ProbeStatus::Inconclusive);
+}
+
 } // namespace
 
 int main() {
@@ -178,6 +195,7 @@ int main() {
         test_rfc5389_filtering_address_dependent();
         test_rfc7857_eim_protocol_independence();
         test_rfc7857_eif_protocol_independence();
+        test_rfc7857_port_randomization();
         std::cout << "All nat_type_tester_cli_tests passed\n";
         return 0;
     } catch (const std::exception& exception) {

@@ -346,6 +346,7 @@ int main(int argc, char** argv) {
             if (test_type == Rfc5382TestType::All || test_type == Rfc5382TestType::Icmp) {
                 print_row("IcmpErrorHandling", natcli::to_string(server_result.icmp_error_handling));
                 print_row("TcpHairpinning", natcli::to_string(server_result.tcp_hairpinning));
+                print_row("TcpHairpinningSourceAddress", natcli::to_string(server_result.tcp_hairpinning_source_address));
             }
             print_row("LocalEnd", endpoint_or_dash(server_result.local_endpoint));
             return 0;
@@ -362,6 +363,9 @@ int main(int argc, char** argv) {
         print_row("UdpHairpinning", natcli::to_string(result.udp_hairpinning));
         print_row("TcpHairpinning", natcli::to_string(result.tcp_hairpinning));
         print_row("IcmpHairpinning", natcli::to_string(result.icmp_hairpinning));
+        print_row("Section9PortRandomization", natcli::to_string(result.section9_port_randomization));
+        print_row("Section9PublicPorts", result.section9_public_ports.empty() ? "-" : result.section9_public_ports);
+        print_row("Section10Ipv4IdPreservation", natcli::to_string(result.section10_ipv4_id_preservation));
         print_row("UdpPublicEnd", endpoint_or_dash(result.udp_public_endpoint));
         print_row("TcpPublicEnd", endpoint_or_dash(result.tcp_public_endpoint));
         print_row("LocalEnd", endpoint_or_dash(result.local_endpoint));
