@@ -334,7 +334,11 @@ std::uint16_t calculate_udp_checksum_ipv4(const iphdr& ip_header,
 
     const auto* udp_bytes = reinterpret_cast<const std::uint8_t*>(&udp_header);
     for (std::size_t index = 0; index < sizeof(udphdr); index += 2) {
-        add16(static_cast<std::uint16_t>((udp_bytes[index] << 8) | udp_bytes[index + 1]));
+        std::uint16_t word = static_cast<std::uint16_t>(udp_bytes[index] << 8);
+        if (index + 1 < sizeof(udphdr)) {
+            word = static_cast<std::uint16_t>(word | udp_bytes[index + 1]);
+        }
+        add16(word);
     }
     for (std::size_t index = 0; index < payload_len; index += 2) {
         std::uint16_t word = static_cast<std::uint16_t>(payload[index] << 8);
