@@ -8,6 +8,7 @@
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <netinet/ip_icmp.h>
+#include <netinet/udp.h>
 
 #include <array>
 #include <cerrno>
@@ -26,6 +27,7 @@
 namespace {
 
 constexpr std::string_view kRfc7857UdpProbePayload = "RFC7857-UDP-PROBE\n";
+constexpr std::string_view kRfc4787OutOfOrderFragmentPayload = "RFC4787-OOO-FRAGMENT\n";
 
 struct IpEndpoint {
     int family{};
@@ -308,6 +310,138 @@ bool send_ipv4_icmp_error(const IpEndpoint& peer, const IpEndpoint& local, int p
     
     return sent == static_cast<ssize_t>(packet.size());
 }
+
+std::uint16_t calculate_udp_checksum_ipv4(const iphdr& ip_header,
+                                          const udphdr& udp_header,
+                                          const std::uint8_t* payload,
+                                          std::size_t payload_len) {
+    std::uint32_t sum = 0;
+    auto add16 = [&](std::uint16_t value) {
+        sum += value;
+        while (sum >> 16) {
+            sum = (sum & 0xFFFFu) + (sum >> 16);
+        }
+    };
+
+    const std::uint8_t* src = reinterpret_cast<const std::uint8_t*>(&ip_header.saddr);
+    const std::uint8_t* dst = reinterpret_cast<const std::uint8_t*>(&ip_header.daddr);
+    add16(static_cast<std::uint16_t>((src[0] << 8) | src[1]));
+    add16(static_cast<std::uint16_t>((src[2] << 8) | src[3]));
+    add16(static_cast<std::uint16_t>((dst[0] << 8) | dst[1]));
+    add16(static_cast<std::uint16_t>((dst[2] << 8) | dst[3]));
+    add16(htons(IPPROTO_UDP));
+    add16(udp_header.len);
+
+    const auto* udp_bytes = reinterpret_cast<const std::uint8_t*>(&udp_header);
+    for (std::size_t index = 0; index < sizeof(udphdr); index += 2) {
+        add16(static_cast<std::uint16_t>((udp_bytes[index] << 8) | udp_bytes[index + 1]));
+    }
+    for (std::size_t index = 0; index < payload_len; index += 2) {
+        std::uint16_t word = static_cast<std::uint16_t>(payload[index] << 8);
+        if (index + 1 < payload_len) {
+            word = static_cast<std::uint16_t>(word | payload[index + 1]);
+        }
+        add16(word);
+    }
+
+    return static_cast<std::uint16_t>(~sum);
+}
+
+bool send_out_of_order_fragmented_udp_ipv4(const IpEndpoint& peer, const IpEndpoint& local) {
+    if (peer.family != AF_INET || local.family != AF_INET) {
+        return false;
+    }
+
+    int raw_fd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+    if (raw_fd < 0) {
+        std::cerr << "Warning: Failed to create raw socket for out-of-order fragments. Error: "
+                  << std::strerror(errno) << '\n';
+        return false;
+    }
+    int enable = 1;
+    if (setsockopt(raw_fd, IPPROTO_IP, IP_HDRINCL, &enable, sizeof(enable)) != 0) {
+        close(raw_fd);
+        return false;
+    }
+
+    constexpr std::size_t first_payload_size = 16;
+    constexpr std::size_t second_payload_size = kRfc4787OutOfOrderFragmentPayload.size() - first_payload_size;
+    constexpr std::size_t first_fragment_data_len = sizeof(udphdr) + first_payload_size;
+    constexpr std::size_t second_fragment_data_len = second_payload_size;
+
+    std::array<std::uint8_t, first_payload_size> first_payload{};
+    std::array<std::uint8_t, second_payload_size> second_payload{};
+    std::memcpy(first_payload.data(), kRfc4787OutOfOrderFragmentPayload.data(), first_payload.size());
+    std::memcpy(second_payload.data(),
+                kRfc4787OutOfOrderFragmentPayload.data() + first_payload.size(),
+                second_payload.size());
+
+    iphdr ip_base{};
+    ip_base.ihl = 5;
+    ip_base.version = 4;
+    ip_base.tos = 0;
+    ip_base.id = htons(0x4A87);
+    ip_base.ttl = 64;
+    ip_base.protocol = IPPROTO_UDP;
+    std::memcpy(&ip_base.saddr, local.address.data(), 4);
+    std::memcpy(&ip_base.daddr, peer.address.data(), 4);
+
+    udphdr udp{};
+    udp.source = htons(local.port);
+    udp.dest = htons(peer.port);
+    udp.len = htons(sizeof(udphdr) + first_payload.size() + second_payload.size());
+    udp.check = 0;
+    udp.check = calculate_udp_checksum_ipv4(ip_base, udp, reinterpret_cast<const std::uint8_t*>(kRfc4787OutOfOrderFragmentPayload.data()),
+                                            kRfc4787OutOfOrderFragmentPayload.size());
+    if (udp.check == 0) {
+        udp.check = 0xFFFF;
+    }
+
+    std::vector<std::uint8_t> first_fragment(sizeof(iphdr) + first_fragment_data_len, 0);
+    auto* first_ip = reinterpret_cast<iphdr*>(first_fragment.data());
+    *first_ip = ip_base;
+    first_ip->tot_len = htons(first_fragment.size());
+    first_ip->frag_off = htons(IP_MF);
+    first_ip->check = 0;
+    first_ip->check = calculate_checksum(first_ip, sizeof(iphdr));
+    std::memcpy(first_fragment.data() + sizeof(iphdr), &udp, sizeof(udphdr));
+    std::memcpy(first_fragment.data() + sizeof(iphdr) + sizeof(udphdr), first_payload.data(), first_payload.size());
+
+    std::vector<std::uint8_t> second_fragment(sizeof(iphdr) + second_fragment_data_len, 0);
+    auto* second_ip = reinterpret_cast<iphdr*>(second_fragment.data());
+    *second_ip = ip_base;
+    second_ip->tot_len = htons(second_fragment.size());
+    second_ip->frag_off = htons(static_cast<std::uint16_t>(first_fragment_data_len / 8));
+    second_ip->check = 0;
+    second_ip->check = calculate_checksum(second_ip, sizeof(iphdr));
+    std::memcpy(second_fragment.data() + sizeof(iphdr), second_payload.data(), second_payload.size());
+
+    sockaddr_in destination{};
+    destination.sin_family = AF_INET;
+    std::memcpy(&destination.sin_addr, peer.address.data(), 4);
+
+    ssize_t second_sent = sendto(raw_fd,
+                                 second_fragment.data(),
+                                 second_fragment.size(),
+                                 0,
+                                 reinterpret_cast<sockaddr*>(&destination),
+                                 sizeof(destination));
+    if (second_sent != static_cast<ssize_t>(second_fragment.size())) {
+        close(raw_fd);
+        return false;
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    ssize_t first_sent = sendto(raw_fd,
+                                first_fragment.data(),
+                                first_fragment.size(),
+                                0,
+                                reinterpret_cast<sockaddr*>(&destination),
+                                sizeof(destination));
+    close(raw_fd);
+    return first_sent == static_cast<ssize_t>(first_fragment.size());
+}
 // ---------------------------------------------------------
 
 
@@ -477,6 +611,15 @@ void handle_udp_packet(int udp_fd, const IpEndpoint& server_endpoint) {
         IpEndpoint peer_endpoint = from_sockaddr(reinterpret_cast<sockaddr*>(&peer), peer_length);
         bool sent = send_ipv4_icmp_error(peer_endpoint, server_endpoint, IPPROTO_UDP);
         std::string reply = std::string("I=") + (sent ? "1" : "0") + "\n";
+        sendto(udp_fd, reply.data(), reply.size(), 0, reinterpret_cast<sockaddr*>(&peer), peer_length);
+        return;
+    }
+
+    const bool is_out_of_order_fragment_request = received >= 1 && buffer[0] == 'O';
+    if (is_out_of_order_fragment_request) {
+        IpEndpoint peer_endpoint = from_sockaddr(reinterpret_cast<sockaddr*>(&peer), peer_length);
+        bool sent = send_out_of_order_fragmented_udp_ipv4(peer_endpoint, server_endpoint);
+        std::string reply = std::string("O=") + (sent ? "1" : "0") + "\n";
         sendto(udp_fd, reply.data(), reply.size(), 0, reinterpret_cast<sockaddr*>(&peer), peer_length);
         return;
     }

@@ -173,9 +173,12 @@ sudo ./src_ser/build/nat_type_tester_rfc5382_server \
   - `PortParityPreservation`：内外端口奇偶性是否保持
 - `fragmentation`：向 `primary/secondary` 发送 2000 字节 UDP 负载并等待回显
   - `OutboundFragmentation` / `InboundFragmentation` 用 Pass/Fail 表示
+  - `OutboundDfFragmentationError`：发送 DF=1 的大 UDP 包，检测是否收到“需要分片”错误
+  - `OutOfOrderFragmentation`：建立映射后，验证乱序分片（先第二片再第一片）是否可被正确重组并接收
 - `icmp`：
-  - `IcmpErrorHandling` (外部错误容忍)：由自定义服务端注入携带原始 UDP 五元组的真实 ICMP 错误，验证 NAT 收到外部 ICMP 后是否会违规销毁 UDP 映射 (REQ-12)。
-  - `UdpHairpinning` (内部回环)：向同一公网 IP 的相邻未映射端口发包，触发并验证 NAT 能否正确回传内部产生的 ICMP Port Unreachable。
+  - `IcmpErrorHandling` (外部错误容忍)：由自定义服务端注入携带原始 UDP 五元组的真实 ICMP 错误，并在错误后继续验证映射仍存在 (REQ-12)。
+  - `UdpHairpinning` (内部回环)：基础 UDP 回环连通性。
+  - `UdpHairpinningSourceAddress`：检查回环收到包的源地址是否为 NAT 外网地址 (REC-9a)。
 
 尚未实现的检测:
 - [ ] REQ-5：NAT 的 UDP 映射超时时间绝不能（MUST NOT）小于 2 分钟，推荐默认超时时间为 5 分钟或以上。
@@ -255,10 +258,13 @@ ALG应用层网关
 - `PortRangePreservation`：端口区间保持性
 - `PortParityPreservation`：端口奇偶保持性
 - `OutboundFragmentation` / `InboundFragmentation`：UDP 分片方向性探测
+- `OutboundDfFragmentationError`：DF=1 出站分片错误探测
+- `OutOfOrderFragmentation`：乱序分片接收探测
 - `TcpSimultaneousOpen`：TCP 同时打开能力
 - `UnexpectedSynHandling`：异常/延迟 SYN 处理能力
 - `IcmpErrorHandling`：ICMP 错误处理（当前多为 Inconclusive）
 - `UdpHairpinning` / `TcpHairpinning`：协议对应的回环探测
+- `UdpHairpinningSourceAddress`：UDP 回环源地址是否匹配 NAT 外网地址（REC-9a）
 - `IcmpHairpinning`：RFC7857 中基于已建立 UDP/TCP 连接的 ICMP 错误联合探测
 - `UdpMappingBehavior` / `UdpFilteringBehavior` / `TcpFilteringBehavior`：RFC7857 汇总字段
 - `EimProtocolIndependence`：EIM 跨协议独立性

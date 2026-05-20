@@ -3,11 +3,15 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netdb.h>
+#include <netinet/ip.h>
+#include <netinet/ip_icmp.h>
+#include <netinet/udp.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <cstring>
@@ -248,6 +252,13 @@ ProbeStatus merge_probe_status(ProbeStatus left, ProbeStatus right) {
     return ProbeStatus::Inconclusive;
 }
 
+bool same_endpoint_address(const IpEndpoint& left, const IpEndpoint& right) {
+    if (left.family != right.family || left.address_length != right.address_length) {
+        return false;
+    }
+    return std::equal(left.address.begin(), left.address.begin() + left.address_length, right.address.begin());
+}
+
 void send_all(int socket_fd, std::string_view payload) {
     std::size_t offset = 0;
     while (offset < payload.size()) {
@@ -429,10 +440,11 @@ std::optional<IpEndpoint> request_stun_tcp_mapping(const IpEndpoint& local_bind,
     }
 }
 
-ProbeStatus run_udp_hairpin_probe(const IpEndpoint& stun_server,
-                                  const std::optional<IpEndpoint>& local_bind,
-                                  std::chrono::milliseconds timeout,
-                                  std::optional<IpEndpoint>* public_endpoint) {
+UdpHairpinningResult run_udp_hairpin_probe(const IpEndpoint& stun_server,
+                                           const std::optional<IpEndpoint>& local_bind,
+                                           std::chrono::milliseconds timeout,
+                                           std::optional<IpEndpoint>* public_endpoint) {
+    UdpHairpinningResult result;
     int receiver = socket(stun_server.family, SOCK_DGRAM, IPPROTO_UDP);
     int sender = socket(stun_server.family, SOCK_DGRAM, IPPROTO_UDP);
     if (receiver < 0 || sender < 0) {
@@ -442,7 +454,9 @@ ProbeStatus run_udp_hairpin_probe(const IpEndpoint& stun_server,
         if (sender >= 0) {
             close(sender);
         }
-        return ProbeStatus::Inconclusive;
+        result.connectivity = ProbeStatus::Inconclusive;
+        result.source_address_match = ProbeStatus::Inconclusive;
+        return result;
     }
 
     try {
@@ -459,7 +473,9 @@ ProbeStatus run_udp_hairpin_probe(const IpEndpoint& stun_server,
         if (!public_endpoint->has_value()) {
             close(receiver);
             close(sender);
-            return ProbeStatus::Inconclusive;
+            result.connectivity = ProbeStatus::Inconclusive;
+            result.source_address_match = ProbeStatus::Inconclusive;
+            return result;
         }
 
         SocketAddress public_receiver = to_sockaddr(**public_endpoint);
@@ -472,27 +488,42 @@ ProbeStatus run_udp_hairpin_probe(const IpEndpoint& stun_server,
         if (sent != static_cast<ssize_t>(kHairpinUdpPayload.size())) {
             close(receiver);
             close(sender);
-            return ProbeStatus::Fail;
+            result.connectivity = ProbeStatus::Fail;
+            result.source_address_match = ProbeStatus::Fail;
+            return result;
         }
         if (!wait_for_readable(receiver, timeout)) {
             close(receiver);
             close(sender);
-            return ProbeStatus::Fail;
+            result.connectivity = ProbeStatus::Fail;
+            result.source_address_match = ProbeStatus::Fail;
+            return result;
         }
 
         std::array<char, 256> buffer{};
-        ssize_t received = recv(receiver, buffer.data(), buffer.size(), 0);
+        sockaddr_storage source{};
+        socklen_t source_length = sizeof(source);
+        ssize_t received =
+            recvfrom(receiver, buffer.data(), buffer.size(), 0, reinterpret_cast<sockaddr*>(&source), &source_length);
         close(receiver);
         close(sender);
         if (received != static_cast<ssize_t>(kHairpinUdpPayload.size())) {
-            return ProbeStatus::Fail;
+            result.connectivity = ProbeStatus::Fail;
+            result.source_address_match = ProbeStatus::Fail;
+            return result;
         }
         const std::string_view received_payload(buffer.data(), static_cast<std::size_t>(received));
-        return received_payload == kHairpinUdpPayload ? ProbeStatus::Pass : ProbeStatus::Fail;
+        result.connectivity = received_payload == kHairpinUdpPayload ? ProbeStatus::Pass : ProbeStatus::Fail;
+        const IpEndpoint source_endpoint = from_sockaddr(reinterpret_cast<sockaddr*>(&source), source_length);
+        result.source_address_match = same_endpoint_address(source_endpoint, **public_endpoint) ? ProbeStatus::Pass
+                                                                                                 : ProbeStatus::Fail;
+        return result;
     } catch (...) {
         close(receiver);
         close(sender);
-        return ProbeStatus::Inconclusive;
+        result.connectivity = ProbeStatus::Inconclusive;
+        result.source_address_match = ProbeStatus::Inconclusive;
+        return result;
     }
 }
 
@@ -685,7 +716,7 @@ ProbeStatus run_server_assisted_udp_icmp_test(const IpEndpoint& primary_server,
 
         // 2. 发送 I 指令，让服务器注入 ICMP 错误包
         std::string icmp_resp = exchange("I\n");
-        if (icmp_resp != "I=1\n") { close(socket_fd); return ProbeStatus::Inconclusive; }
+        if (icmp_resp != "I=1\n") { close(socket_fd); return ProbeStatus::Fail; }
 
         // 3. 延时等待 NAT 处理
         std::this_thread::sleep_for(std::chrono::milliseconds(300));
@@ -908,6 +939,12 @@ std::optional<bool> probe_udp_mapping_allows_tcp(const IpEndpoint& local,
 ProbeStatus run_udp_hairpinning_test(const RequestOptions& options,
                                      const IpEndpoint& stun_server,
                                      const std::optional<IpEndpoint>& local_bind) {
+    return run_udp_hairpinning_checks(options, stun_server, local_bind).connectivity;
+}
+
+UdpHairpinningResult run_udp_hairpinning_checks(const RequestOptions& options,
+                                                const IpEndpoint& stun_server,
+                                                const std::optional<IpEndpoint>& local_bind) {
     std::optional<IpEndpoint> udp_public_endpoint;
     return run_udp_hairpin_probe(stun_server, local_bind, options.timeout, &udp_public_endpoint);
 }
