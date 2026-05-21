@@ -304,6 +304,24 @@ int main(int argc, char** argv) {
             if (test_type == Rfc5508TestType::All || test_type == Rfc5508TestType::Filtering) {
                 print_row("FilteringBehavior", natcli::to_string(result.filtering_behavior));
             }
+            if (test_type == Rfc5508TestType::All) {
+                print_row("IcmpErrorPayloadValidation", natcli::to_string(result.icmp_error_payload_validation));
+                print_row("MalformedSrvBadOuterChecksumForwarded",
+                          result.malformed_server_outer_checksum_forwarded ? "Yes" : "No");
+                print_row("MalformedSrvBadInnerIpChecksumForwarded",
+                          result.malformed_server_inner_ip_checksum_forwarded ? "Yes" : "No");
+                print_row("MalformedSrvBadUdpChecksumForwarded",
+                          result.malformed_server_bad_udp_checksum_forwarded ? "Yes" : "No");
+                print_row("MalformedCliBadOuterChecksumForwarded",
+                          result.malformed_client_outer_checksum_forwarded ? "Yes" : "No");
+                print_row("MalformedCliBadInnerIpChecksumForwarded",
+                          result.malformed_client_inner_ip_checksum_forwarded ? "Yes" : "No");
+                print_row("MalformedCliBadUdpChecksumForwarded",
+                          result.malformed_client_bad_udp_checksum_forwarded ? "Yes" : "No");
+                print_row("OutboundIcmpError", natcli::to_string(result.outbound_icmp_error));
+                print_row("IcmpHairpinningQuery", natcli::to_string(result.icmp_hairpin_query));
+                print_row("IcmpHairpinningError", natcli::to_string(result.icmp_hairpin_error));
+            }
             print_row("LocalEnd", endpoint_or_dash(result.local_endpoint));
             print_row("LocalQuery", result.local_query.has_value() ? std::to_string(*result.local_query) : "-");
             return 0;
