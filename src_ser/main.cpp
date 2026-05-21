@@ -13,6 +13,7 @@
 #include <array>
 #include <cerrno>
 #include <chrono>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
@@ -73,6 +74,67 @@ enum class IcmpErrorVariant : std::uint8_t {
 
 std::runtime_error system_error(const std::string& message) {
     return std::runtime_error(message + ": " + std::strerror(errno));
+}
+
+bool run_shell_command(const std::string& command) {
+    return std::system(command.c_str()) == 0;
+}
+
+bool command_exists(const std::string& command) {
+    return run_shell_command("command -v " + command + " >/dev/null 2>&1");
+}
+
+bool ensure_iptables_icmp_notrack() {
+    if (!command_exists("iptables")) {
+        return false;
+    }
+    bool ok = true;
+    if (!run_shell_command("iptables -t raw -C OUTPUT -p icmp -j CT --notrack >/dev/null 2>&1")) {
+        ok = run_shell_command("iptables -t raw -I OUTPUT -p icmp -j CT --notrack >/dev/null 2>&1") && ok;
+    }
+    if (!run_shell_command("iptables -t raw -C PREROUTING -p icmp -j CT --notrack >/dev/null 2>&1")) {
+        ok = run_shell_command("iptables -t raw -I PREROUTING -p icmp -j CT --notrack >/dev/null 2>&1") && ok;
+    }
+    return ok;
+}
+
+bool ensure_nftables_icmp_notrack() {
+    if (!command_exists("nft")) {
+        return false;
+    }
+    bool ok = true;
+    ok = run_shell_command("nft list table ip raw >/dev/null 2>&1 || nft add table ip raw >/dev/null 2>&1") && ok;
+    ok = run_shell_command(
+             "nft list chain ip raw prerouting >/dev/null 2>&1 || nft add chain ip raw prerouting "
+             "'{ type filter hook prerouting priority raw; }' >/dev/null 2>&1") &&
+         ok;
+    ok = run_shell_command(
+             "nft list chain ip raw output >/dev/null 2>&1 || nft add chain ip raw output "
+             "'{ type filter hook output priority raw; }' >/dev/null 2>&1") &&
+         ok;
+    if (!run_shell_command("nft list chain ip raw output 2>/dev/null | grep -Fq 'ip protocol icmp notrack'")) {
+        ok = run_shell_command("nft add rule ip raw output ip protocol icmp notrack >/dev/null 2>&1") && ok;
+    }
+    if (!run_shell_command("nft list chain ip raw prerouting 2>/dev/null | grep -Fq 'ip protocol icmp notrack'")) {
+        ok = run_shell_command("nft add rule ip raw prerouting ip protocol icmp notrack >/dev/null 2>&1") && ok;
+    }
+    return ok;
+}
+
+void ensure_icmp_conntrack_bypass() {
+    bool configured = ensure_iptables_icmp_notrack();
+    if (!configured) {
+        configured = ensure_nftables_icmp_notrack();
+    }
+    if (configured) {
+        std::cout << "Note: ICMP conntrack bypass (notrack) is active for raw ICMP probes.\n";
+        return;
+    }
+    if (geteuid() != 0) {
+        std::cerr << "Warning: ICMP notrack rules not configured (run as root). Raw ICMP probes may be dropped as INVALID.\n";
+    } else {
+        std::cerr << "Warning: Failed to configure ICMP notrack rules via iptables/nft. Raw ICMP probes may be dropped as INVALID.\n";
+    }
 }
 
 SocketAddress to_sockaddr(const IpEndpoint& endpoint) {
@@ -1175,6 +1237,7 @@ int main(int argc, char** argv) {
             fail("Primary and secondary addresses must use the same family.");
         }
 
+        ensure_icmp_conntrack_bypass();
         try_disable_kernel_icmp_echo_auto_reply();
 
         int primary_tcp_fd = create_tcp_listener(primary_server);
