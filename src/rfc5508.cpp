@@ -298,7 +298,7 @@ bool send_ipv4_icmp_error_packet(int raw_send_fd,
     outer_ip->version = 4;
     outer_ip->tos = 0;
     outer_ip->tot_len = htons(packet.size());
-    outer_ip->id = htons(marker ^ 0x4000);
+    outer_ip->id = htons(marker);
     outer_ip->frag_off = 0;
     outer_ip->ttl = 64;
     outer_ip->protocol = IPPROTO_ICMP;
