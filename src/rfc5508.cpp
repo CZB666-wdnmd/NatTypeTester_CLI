@@ -274,30 +274,49 @@ bool parse_flag_response(const std::string& response, char key) {
     return response[2] == '1';
 }
 
-bool send_ipv4_icmp_error_packet(int raw_fd,
+bool send_ipv4_icmp_error_packet(int raw_send_fd,
                                  const IpEndpoint& target,
+                                 const IpEndpoint& outer_source,
                                  const IpEndpoint& inner_source,
                                  const IpEndpoint& inner_destination,
                                  std::uint16_t inner_source_port,
                                  std::uint16_t inner_destination_port,
                                  std::uint16_t marker,
-                                 IcmpErrorVariant variant,
-                                 IcmpInnerProtocol inner_protocol = IcmpInnerProtocol::Udp) {
-    if (target.family != AF_INET || inner_source.family != AF_INET || inner_destination.family != AF_INET) {
+                                  IcmpErrorVariant variant,
+                                  IcmpInnerProtocol inner_protocol = IcmpInnerProtocol::Udp) {
+    if (target.family != AF_INET || outer_source.family != AF_INET || inner_source.family != AF_INET ||
+        inner_destination.family != AF_INET) {
         return false;
     }
 
-    std::vector<std::uint8_t> packet(sizeof(icmphdr) + sizeof(iphdr) + sizeof(udphdr), 0);
-    auto* icmp = reinterpret_cast<icmphdr*>(packet.data());
+    const std::size_t inner_transport_size =
+        inner_protocol == IcmpInnerProtocol::Udp ? sizeof(udphdr) : sizeof(icmphdr);
+    std::vector<std::uint8_t> packet(sizeof(iphdr) + sizeof(icmphdr) + sizeof(iphdr) + inner_transport_size, 0);
+
+    auto* outer_ip = reinterpret_cast<iphdr*>(packet.data());
+    outer_ip->ihl = 5;
+    outer_ip->version = 4;
+    outer_ip->tos = 0;
+    outer_ip->tot_len = htons(packet.size());
+    outer_ip->id = htons(marker ^ 0x4000);
+    outer_ip->frag_off = 0;
+    outer_ip->ttl = 64;
+    outer_ip->protocol = IPPROTO_ICMP;
+    std::memcpy(&outer_ip->saddr, outer_source.address.data(), 4);
+    std::memcpy(&outer_ip->daddr, target.address.data(), 4);
+    outer_ip->check = 0;
+    outer_ip->check = calculate_checksum(outer_ip, sizeof(iphdr));
+
+    auto* icmp = reinterpret_cast<icmphdr*>(packet.data() + sizeof(iphdr));
     icmp->type = ICMP_DEST_UNREACH;
     icmp->code = ICMP_PORT_UNREACH;
     icmp->checksum = 0;
 
-    auto* inner_ip = reinterpret_cast<iphdr*>(packet.data() + sizeof(icmphdr));
+    auto* inner_ip = reinterpret_cast<iphdr*>(packet.data() + sizeof(iphdr) + sizeof(icmphdr));
     inner_ip->ihl = 5;
     inner_ip->version = 4;
     inner_ip->tos = 0;
-    inner_ip->tot_len = htons(sizeof(iphdr) + sizeof(udphdr));
+    inner_ip->tot_len = htons(sizeof(iphdr) + inner_transport_size);
     inner_ip->id = htons(marker);
     inner_ip->frag_off = 0;
     inner_ip->ttl = 64;
@@ -308,7 +327,7 @@ bool send_ipv4_icmp_error_packet(int raw_fd,
     inner_ip->check = calculate_checksum(inner_ip, sizeof(iphdr));
 
     if (inner_protocol == IcmpInnerProtocol::Udp) {
-        auto* inner_udp = reinterpret_cast<udphdr*>(packet.data() + sizeof(icmphdr) + sizeof(iphdr));
+        auto* inner_udp = reinterpret_cast<udphdr*>(packet.data() + sizeof(iphdr) + sizeof(icmphdr) + sizeof(iphdr));
         inner_udp->source = htons(inner_source_port);
         inner_udp->dest = htons(inner_destination_port);
         inner_udp->len = htons(sizeof(udphdr));
@@ -318,7 +337,7 @@ bool send_ipv4_icmp_error_packet(int raw_fd,
             inner_udp->check ^= htons(0x00FF);
         }
     } else {
-        auto* inner_icmp = reinterpret_cast<icmphdr*>(packet.data() + sizeof(icmphdr) + sizeof(iphdr));
+        auto* inner_icmp = reinterpret_cast<icmphdr*>(packet.data() + sizeof(iphdr) + sizeof(icmphdr) + sizeof(iphdr));
         inner_icmp->type = ICMP_ECHO;
         inner_icmp->code = 0;
         inner_icmp->un.echo.id = htons(inner_source_port);
@@ -331,13 +350,13 @@ bool send_ipv4_icmp_error_packet(int raw_fd,
         inner_ip->check ^= htons(0x00FF);
     }
 
-    icmp->checksum = calculate_checksum(packet.data(), packet.size());
+    icmp->checksum = calculate_checksum(icmp, packet.size() - sizeof(iphdr));
     if (variant == IcmpErrorVariant::BadOuterChecksum) {
         icmp->checksum ^= htons(0x00FF);
     }
 
     SocketAddress remote = to_sockaddr(target);
-    const ssize_t sent = sendto(raw_fd,
+    const ssize_t sent = sendto(raw_send_fd,
                                 packet.data(),
                                 packet.size(),
                                 0,
@@ -632,7 +651,7 @@ ProbeStatus status_from_expectations(bool invalid_outer_forwarded,
                : ProbeStatus::Fail;
 }
 
-ProbeStatus run_client_outbound_icmp_error_probe(int raw_fd,
+ProbeStatus run_client_outbound_icmp_error_probe(int raw_send_fd,
                                                  const IpEndpoint& control_local,
                                                  const IpEndpoint& primary_server,
                                                  const IpEndpoint& local_udp_endpoint,
@@ -646,8 +665,9 @@ ProbeStatus run_client_outbound_icmp_error_probe(int raw_fd,
     if (!parse_flag_response(reset, 'R')) {
         return ProbeStatus::Inconclusive;
     }
-    const bool sent = send_ipv4_icmp_error_packet(raw_fd,
+    const bool sent = send_ipv4_icmp_error_packet(raw_send_fd,
                                                   primary_server,
+                                                  control_local,
                                                   primary_server,
                                                   local_udp_endpoint,
                                                   primary_server.port,
@@ -665,6 +685,7 @@ ProbeStatus run_client_outbound_icmp_error_probe(int raw_fd,
 
 void run_icmp_payload_validation_probe(Rfc5508Result& result,
                                        int raw_fd,
+                                       int raw_send_fd,
                                        const IpEndpoint& control_local,
                                        const IpEndpoint& primary_server,
                                        const IpEndpoint& local_udp_endpoint,
@@ -707,24 +728,27 @@ void run_icmp_payload_validation_probe(Rfc5508Result& result,
     result.malformed_server_bad_udp_checksum_forwarded =
         was_marker_forwarded_from_source(inbound_observed, srv_udp_marker, primary_server);
 
-    const bool cli_outer_sent = send_ipv4_icmp_error_packet(raw_fd,
+    const bool cli_outer_sent = send_ipv4_icmp_error_packet(raw_send_fd,
                                                             primary_server,
+                                                            control_local,
                                                             primary_server,
                                                             local_udp_endpoint,
                                                             primary_server.port,
                                                             local_udp_endpoint.port,
                                                             cli_outer_marker,
                                                             IcmpErrorVariant::BadOuterChecksum);
-    const bool cli_inner_sent = send_ipv4_icmp_error_packet(raw_fd,
+    const bool cli_inner_sent = send_ipv4_icmp_error_packet(raw_send_fd,
                                                             primary_server,
+                                                            control_local,
                                                             primary_server,
                                                             local_udp_endpoint,
                                                             primary_server.port,
                                                             local_udp_endpoint.port,
                                                             cli_inner_marker,
                                                             IcmpErrorVariant::BadInnerIpChecksum);
-    const bool cli_udp_sent = send_ipv4_icmp_error_packet(raw_fd,
+    const bool cli_udp_sent = send_ipv4_icmp_error_packet(raw_send_fd,
                                                           primary_server,
+                                                          control_local,
                                                           primary_server,
                                                           local_udp_endpoint,
                                                           primary_server.port,
@@ -767,6 +791,7 @@ void run_icmp_payload_validation_probe(Rfc5508Result& result,
 
 void run_icmp_hairpinning_probes(Rfc5508Result& result,
                                  int raw_fd,
+                                 int raw_send_fd,
                                  const IpEndpoint& public_ip_only,
                                  const IpEndpoint& local_ip_only,
                                  std::uint16_t mapped_query_a,
@@ -807,8 +832,9 @@ void run_icmp_hairpinning_probes(Rfc5508Result& result,
     }
     result.icmp_hairpin_query = (qa_received && qb_received) ? ProbeStatus::Pass : ProbeStatus::Fail;
 
-    const bool send_error = send_ipv4_icmp_error_packet(raw_fd,
+    const bool send_error = send_ipv4_icmp_error_packet(raw_send_fd,
                                                         hairpin_target,
+                                                        local_ip_only,
                                                         public_ip_only,
                                                         local_ip_only,
                                                         mapped_query_a,
@@ -847,9 +873,19 @@ Rfc5508Result run_rfc5508_tests(const RequestOptions& options,
     if (raw_fd < 0) {
         throw system_error("socket failed");
     }
+    int raw_send_fd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+    if (raw_send_fd < 0) {
+        close(raw_fd);
+        throw system_error("socket failed");
+    }
 
     try {
         set_reuse_options(raw_fd);
+        set_reuse_options(raw_send_fd);
+        int ip_hdrincl = 1;
+        if (setsockopt(raw_send_fd, IPPROTO_IP, IP_HDRINCL, &ip_hdrincl, sizeof(ip_hdrincl)) != 0) {
+            throw system_error("setsockopt(IP_HDRINCL) failed");
+        }
         if (result.local_endpoint.has_value()) {
             IpEndpoint bind_local = *result.local_endpoint;
             bind_local.port = 0;
@@ -978,6 +1014,7 @@ Rfc5508Result run_rfc5508_tests(const RequestOptions& options,
                         const std::uint16_t payload_marker_base = static_cast<std::uint16_t>(query_dist(generator));
                         run_icmp_payload_validation_probe(result,
                                                           raw_fd,
+                                                          raw_send_fd,
                                                           *result.local_endpoint,
                                                           primary_server,
                                                           local_udp_endpoint,
@@ -986,7 +1023,7 @@ Rfc5508Result run_rfc5508_tests(const RequestOptions& options,
                                                           options.timeout);
 
                         const std::uint16_t outbound_marker = static_cast<std::uint16_t>(query_dist(generator));
-                        result.outbound_icmp_error = run_client_outbound_icmp_error_probe(raw_fd,
+                        result.outbound_icmp_error = run_client_outbound_icmp_error_probe(raw_send_fd,
                                                                                            *result.local_endpoint,
                                                                                            primary_server,
                                                                                            local_udp_endpoint,
@@ -1017,6 +1054,7 @@ Rfc5508Result run_rfc5508_tests(const RequestOptions& options,
                             local_ip_only.port = 0;
                             run_icmp_hairpinning_probes(result,
                                                         raw_fd,
+                                                        raw_send_fd,
                                                         *hairpin_a.public_endpoint,
                                                         local_ip_only,
                                                         *hairpin_a.public_query,
@@ -1048,9 +1086,11 @@ Rfc5508Result run_rfc5508_tests(const RequestOptions& options,
             }
         }
 
+        close(raw_send_fd);
         close(raw_fd);
         return result;
     } catch (...) {
+        close(raw_send_fd);
         close(raw_fd);
         throw;
     }
