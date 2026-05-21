@@ -13,6 +13,7 @@
 #include <array>
 #include <cerrno>
 #include <chrono>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
@@ -25,6 +26,7 @@
 #include <thread>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -56,6 +58,14 @@ struct IcmpRawContext {
     IpEndpoint secondary_server{};
     std::unordered_map<std::string, IcmpMappingRecord> mappings;
     std::mutex mappings_mutex;
+    std::unordered_set<std::uint16_t> observed_error_markers;
+    std::mutex observed_error_markers_mutex;
+};
+
+enum class IcmpErrorVariant : std::uint8_t {
+    BadOuterChecksum = 1,
+    BadInnerIpChecksum = 2,
+    BadUdpChecksum = 3,
 };
 
 [[noreturn]] void fail(const std::string& message) {
@@ -64,6 +74,80 @@ struct IcmpRawContext {
 
 std::runtime_error system_error(const std::string& message) {
     return std::runtime_error(message + ": " + std::strerror(errno));
+}
+
+bool run_shell_command(const std::string& command) {
+    return std::system(command.c_str()) == 0;
+}
+
+bool command_exists(const std::string& command) {
+    return run_shell_command("command -v " + command + " >/dev/null 2>&1");
+}
+
+bool ensure_iptables_icmp_notrack() {
+    if (!command_exists("iptables")) {
+        return false;
+    }
+    bool ok = true;
+    if (!run_shell_command("iptables -t raw -C OUTPUT -p icmp -j CT --notrack >/dev/null 2>&1")) {
+        if (!run_shell_command("iptables -t raw -I OUTPUT -p icmp -j CT --notrack >/dev/null 2>&1")) {
+            ok = false;
+        }
+    }
+    if (!run_shell_command("iptables -t raw -C PREROUTING -p icmp -j CT --notrack >/dev/null 2>&1")) {
+        if (!run_shell_command("iptables -t raw -I PREROUTING -p icmp -j CT --notrack >/dev/null 2>&1")) {
+            ok = false;
+        }
+    }
+    return ok;
+}
+
+bool ensure_nftables_icmp_notrack() {
+    if (!command_exists("nft")) {
+        return false;
+    }
+    bool ok = true;
+    if (!run_shell_command("nft list table ip raw >/dev/null 2>&1") &&
+        !run_shell_command("nft add table ip raw >/dev/null 2>&1")) {
+        ok = false;
+    }
+    if (!run_shell_command("nft list chain ip raw prerouting >/dev/null 2>&1") &&
+        !run_shell_command("nft add chain ip raw prerouting '{ type filter hook prerouting priority raw; }' >/dev/null 2>&1")) {
+        ok = false;
+    }
+    if (!run_shell_command("nft list chain ip raw output >/dev/null 2>&1") &&
+        !run_shell_command("nft add chain ip raw output '{ type filter hook output priority raw; }' >/dev/null 2>&1")) {
+        ok = false;
+    }
+    if (!run_shell_command(
+            "nft list chain ip raw output 2>/dev/null | grep -Eq '^[[:space:]]*ip protocol icmp notrack([[:space:]].*)?$'")) {
+        if (!run_shell_command("nft add rule ip raw output ip protocol icmp notrack >/dev/null 2>&1")) {
+            ok = false;
+        }
+    }
+    if (!run_shell_command(
+            "nft list chain ip raw prerouting 2>/dev/null | grep -Eq '^[[:space:]]*ip protocol icmp notrack([[:space:]].*)?$'")) {
+        if (!run_shell_command("nft add rule ip raw prerouting ip protocol icmp notrack >/dev/null 2>&1")) {
+            ok = false;
+        }
+    }
+    return ok;
+}
+
+void ensure_icmp_conntrack_bypass() {
+    bool configured = ensure_iptables_icmp_notrack();
+    if (!configured) {
+        configured = ensure_nftables_icmp_notrack();
+    }
+    if (configured) {
+        std::cout << "Note: ICMP conntrack bypass (notrack) is active for raw ICMP probes.\n";
+        return;
+    }
+    if (geteuid() != 0) {
+        std::cerr << "Warning: ICMP notrack rules not configured (run as root). Raw ICMP probes may be dropped as INVALID.\n";
+    } else {
+        std::cerr << "Warning: Failed to configure ICMP notrack rules via iptables/nft. Raw ICMP probes may be dropped as INVALID.\n";
+    }
 }
 
 SocketAddress to_sockaddr(const IpEndpoint& endpoint) {
@@ -340,14 +424,15 @@ std::string recv_line(int socket_fd, int timeout_ms) {
 // 新增: 构造并发送原生的 ICMP 错误包功能
 // ---------------------------------------------------------
 std::uint16_t calculate_checksum(const void* data, std::size_t len) {
-    const auto* ptr = static_cast<const std::uint16_t*>(data);
+    const auto* bytes = static_cast<const std::uint8_t*>(data);
     std::uint32_t sum = 0;
-    while (len > 1) {
-        sum += *ptr++;
+    while (len >= 2) {
+        sum += static_cast<std::uint16_t>((static_cast<std::uint16_t>(bytes[0]) << 8) | bytes[1]);
+        bytes += 2;
         len -= 2;
     }
     if (len == 1) {
-        sum += *reinterpret_cast<const std::uint8_t*>(ptr);
+        sum += static_cast<std::uint16_t>(static_cast<std::uint16_t>(bytes[0]) << 8);
     }
     sum = (sum >> 16) + (sum & 0xFFFF);
     sum += (sum >> 16);
@@ -422,13 +507,14 @@ std::uint16_t calculate_udp_checksum_ipv4(const iphdr& ip_header,
     std::uint32_t sum = 0;
 
     auto add_buffer = [&](const void* data, std::size_t len) {
-        const auto* ptr = static_cast<const std::uint16_t*>(data);
-        while (len > 1) {
-            sum += *ptr++;
+        const auto* bytes = static_cast<const std::uint8_t*>(data);
+        while (len >= 2) {
+            sum += static_cast<std::uint16_t>((static_cast<std::uint16_t>(bytes[0]) << 8) | bytes[1]);
+            bytes += 2;
             len -= 2;
         }
         if (len == 1) {
-            sum += *reinterpret_cast<const std::uint8_t*>(ptr);
+            sum += static_cast<std::uint16_t>(static_cast<std::uint16_t>(bytes[0]) << 8);
         }
     };
 
@@ -445,6 +531,92 @@ std::uint16_t calculate_udp_checksum_ipv4(const iphdr& ip_header,
     }
 
     return static_cast<std::uint16_t>(~sum);
+}
+
+bool send_ipv4_icmp_error_variant(const IpEndpoint& peer,
+                                  const IpEndpoint& outer_source,
+                                  const IpEndpoint& inner_source,
+                                  const IpEndpoint& inner_destination,
+                                  std::uint16_t inner_source_port,
+                                  std::uint16_t inner_destination_port,
+                                  std::uint16_t marker,
+                                  IcmpErrorVariant variant) {
+    if (peer.family != AF_INET || outer_source.family != AF_INET || inner_source.family != AF_INET ||
+        inner_destination.family != AF_INET) {
+        return false;
+    }
+
+    int raw_fd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+    if (raw_fd < 0) {
+        return false;
+    }
+    int enable = 1;
+    if (setsockopt(raw_fd, IPPROTO_IP, IP_HDRINCL, &enable, sizeof(enable)) != 0) {
+        close(raw_fd);
+        return false;
+    }
+
+    std::vector<std::uint8_t> packet(sizeof(iphdr) + sizeof(icmphdr) + sizeof(iphdr) + sizeof(udphdr), 0);
+    auto* outer_ip = reinterpret_cast<iphdr*>(packet.data());
+    outer_ip->ihl = 5;
+    outer_ip->version = 4;
+    outer_ip->tos = 0;
+    outer_ip->tot_len = htons(packet.size());
+    outer_ip->id = 0;
+    outer_ip->frag_off = 0;
+    outer_ip->ttl = 64;
+    outer_ip->protocol = IPPROTO_ICMP;
+    std::memcpy(&outer_ip->saddr, outer_source.address.data(), 4);
+    std::memcpy(&outer_ip->daddr, peer.address.data(), 4);
+    outer_ip->check = 0;
+    outer_ip->check = calculate_checksum(outer_ip, sizeof(iphdr));
+
+    auto* icmp = reinterpret_cast<icmphdr*>(packet.data() + sizeof(iphdr));
+    icmp->type = ICMP_DEST_UNREACH;
+    icmp->code = ICMP_PORT_UNREACH;
+    icmp->checksum = 0;
+
+    auto* inner_ip = reinterpret_cast<iphdr*>(packet.data() + sizeof(iphdr) + sizeof(icmphdr));
+    inner_ip->ihl = 5;
+    inner_ip->version = 4;
+    inner_ip->tos = 0;
+    inner_ip->tot_len = htons(sizeof(iphdr) + sizeof(udphdr));
+    inner_ip->id = htons(marker);
+    inner_ip->frag_off = 0;
+    inner_ip->ttl = 64;
+    inner_ip->protocol = IPPROTO_UDP;
+    std::memcpy(&inner_ip->saddr, inner_source.address.data(), 4);
+    std::memcpy(&inner_ip->daddr, inner_destination.address.data(), 4);
+    inner_ip->check = 0;
+    inner_ip->check = calculate_checksum(inner_ip, sizeof(iphdr));
+
+    auto* inner_udp = reinterpret_cast<udphdr*>(packet.data() + sizeof(iphdr) + sizeof(icmphdr) + sizeof(iphdr));
+    inner_udp->source = htons(inner_source_port);
+    inner_udp->dest = htons(inner_destination_port);
+    inner_udp->len = htons(sizeof(udphdr));
+    inner_udp->check = 0;
+    inner_udp->check = calculate_udp_checksum_ipv4(*inner_ip, *inner_udp, nullptr, 0);
+    if (inner_udp->check == 0) {
+        inner_udp->check = 0xFFFF;
+    }
+
+    if (variant == IcmpErrorVariant::BadInnerIpChecksum) {
+        inner_ip->check ^= htons(0x00FF);
+    } else if (variant == IcmpErrorVariant::BadUdpChecksum) {
+        inner_udp->check ^= htons(0x00FF);
+    }
+
+    icmp->checksum = calculate_checksum(icmp, packet.size() - sizeof(iphdr));
+    if (variant == IcmpErrorVariant::BadOuterChecksum) {
+        icmp->checksum ^= htons(0x00FF);
+    }
+
+    sockaddr_in dest{};
+    dest.sin_family = AF_INET;
+    std::memcpy(&dest.sin_addr, peer.address.data(), 4);
+    const ssize_t sent = sendto(raw_fd, packet.data(), packet.size(), 0, reinterpret_cast<sockaddr*>(&dest), sizeof(dest));
+    close(raw_fd);
+    return sent == static_cast<ssize_t>(packet.size());
 }
 
 bool send_out_of_order_fragmented_udp_ipv4(const IpEndpoint& peer, const IpEndpoint& local) {
@@ -739,6 +911,18 @@ void handle_icmp_packet(int raw_fd, IcmpRawContext& icmp_context) {
     }
 
     const auto* icmp = reinterpret_cast<const icmphdr*>(buffer.data() + ip_header_length);
+    if (icmp->type == ICMP_DEST_UNREACH && icmp->code == ICMP_PORT_UNREACH) {
+        const std::size_t min_size = ip_header_length + sizeof(icmphdr) + sizeof(iphdr) + sizeof(udphdr);
+        if (static_cast<std::size_t>(received) >= min_size) {
+            const auto* inner_ip = reinterpret_cast<const iphdr*>(buffer.data() + ip_header_length + sizeof(icmphdr));
+            if (inner_ip->version == 4 && inner_ip->protocol == IPPROTO_UDP) {
+                const std::uint16_t marker = ntohs(inner_ip->id);
+                std::lock_guard<std::mutex> lock(icmp_context.observed_error_markers_mutex);
+                icmp_context.observed_error_markers.insert(marker);
+            }
+        }
+        return;
+    }
     if (icmp->type != ICMP_ECHO || icmp->code != 0) {
         return;
     }
@@ -851,6 +1035,76 @@ void handle_tcp_client(int client_fd,
                 } else {
                     send_all(client_fd, "V=" + std::to_string(*observed_id) + "\n");
                 }
+                continue;
+            }
+            if (command.rfind("IE ", 0) == 0) {
+                std::istringstream stream(command);
+                std::string op;
+                std::string target_literal;
+                std::uint16_t marker_outer = 0;
+                std::uint16_t marker_inner = 0;
+                std::uint16_t marker_udp = 0;
+                if (!(stream >> op >> target_literal >> marker_outer >> marker_inner >> marker_udp)) {
+                    send_all(client_fd, "E=0\n");
+                    continue;
+                }
+
+                auto [target_host, target_port] = split_host_port(target_literal, 0);
+                IpEndpoint target = resolve_endpoint(target_host, target_port);
+                if (target.family != AF_INET || peer_endpoint.family != AF_INET || primary_server.family != AF_INET) {
+                    send_all(client_fd, "E=0\n");
+                    continue;
+                }
+
+                const bool sent_outer = send_ipv4_icmp_error_variant(target,
+                                                                     primary_server,
+                                                                     peer_endpoint,
+                                                                     primary_server,
+                                                                     target.port,
+                                                                     primary_server.port,
+                                                                     marker_outer,
+                                                                     IcmpErrorVariant::BadOuterChecksum);
+                const bool sent_inner = send_ipv4_icmp_error_variant(target,
+                                                                     primary_server,
+                                                                     peer_endpoint,
+                                                                     primary_server,
+                                                                     target.port,
+                                                                     primary_server.port,
+                                                                     marker_inner,
+                                                                     IcmpErrorVariant::BadInnerIpChecksum);
+                const bool sent_udp = send_ipv4_icmp_error_variant(target,
+                                                                    primary_server,
+                                                                    peer_endpoint,
+                                                                    primary_server,
+                                                                    target.port,
+                                                                    primary_server.port,
+                                                                    marker_udp,
+                                                                    IcmpErrorVariant::BadUdpChecksum);
+                send_all(client_fd, std::string("E=") + ((sent_outer && sent_inner && sent_udp) ? "1" : "0") + "\n");
+                continue;
+            }
+            if (command == "IRR") {
+                {
+                    std::lock_guard<std::mutex> lock(icmp_context.observed_error_markers_mutex);
+                    icmp_context.observed_error_markers.clear();
+                }
+                send_all(client_fd, "R=1\n");
+                continue;
+            }
+            if (command.rfind("IR ", 0) == 0) {
+                std::istringstream stream(command);
+                std::string op;
+                std::uint16_t marker = 0;
+                if (!(stream >> op >> marker)) {
+                    send_all(client_fd, "R=0\n");
+                    continue;
+                }
+                bool seen = false;
+                {
+                    std::lock_guard<std::mutex> lock(icmp_context.observed_error_markers_mutex);
+                    seen = icmp_context.observed_error_markers.contains(marker);
+                }
+                send_all(client_fd, std::string("R=") + (seen ? "1" : "0") + "\n");
                 continue;
             }
             if (command.rfind("IM ", 0) == 0) {
@@ -996,6 +1250,7 @@ int main(int argc, char** argv) {
             fail("Primary and secondary addresses must use the same family.");
         }
 
+        ensure_icmp_conntrack_bypass();
         try_disable_kernel_icmp_echo_auto_reply();
 
         int primary_tcp_fd = create_tcp_listener(primary_server);

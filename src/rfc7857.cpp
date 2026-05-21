@@ -233,14 +233,15 @@ ProbeStatus merge_probe_status(ProbeStatus left, ProbeStatus right) {
 }
 
 std::uint16_t calculate_checksum(const void* data, std::size_t len) {
-    const auto* ptr = static_cast<const std::uint16_t*>(data);
+    const auto* bytes = static_cast<const std::uint8_t*>(data);
     std::uint32_t sum = 0;
-    while (len > 1) {
-        sum += *ptr++;
+    while (len >= 2) {
+        sum += static_cast<std::uint16_t>((static_cast<std::uint16_t>(bytes[0]) << 8) | bytes[1]);
+        bytes += 2;
         len -= 2;
     }
     if (len == 1) {
-        sum += *reinterpret_cast<const std::uint8_t*>(ptr);
+        sum += static_cast<std::uint16_t>(static_cast<std::uint16_t>(bytes[0]) << 8);
     }
     while (sum >> 16) {
         sum = (sum & 0xFFFF) + (sum >> 16);
@@ -255,13 +256,14 @@ std::uint16_t calculate_udp_checksum_ipv4(const iphdr& ip_header,
     std::uint32_t sum = 0;
 
     auto add_buffer = [&](const void* data, std::size_t len) {
-        const auto* ptr = static_cast<const std::uint16_t*>(data);
-        while (len > 1) {
-            sum += *ptr++;
+        const auto* bytes = static_cast<const std::uint8_t*>(data);
+        while (len >= 2) {
+            sum += static_cast<std::uint16_t>((static_cast<std::uint16_t>(bytes[0]) << 8) | bytes[1]);
+            bytes += 2;
             len -= 2;
         }
         if (len == 1) {
-            sum += *reinterpret_cast<const std::uint8_t*>(ptr);
+            sum += static_cast<std::uint16_t>(static_cast<std::uint16_t>(bytes[0]) << 8);
         }
     };
 
