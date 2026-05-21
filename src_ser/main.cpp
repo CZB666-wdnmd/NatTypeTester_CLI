@@ -349,14 +349,15 @@ std::string recv_line(int socket_fd, int timeout_ms) {
 // 新增: 构造并发送原生的 ICMP 错误包功能
 // ---------------------------------------------------------
 std::uint16_t calculate_checksum(const void* data, std::size_t len) {
-    const auto* ptr = static_cast<const std::uint16_t*>(data);
+    const auto* bytes = static_cast<const std::uint8_t*>(data);
     std::uint32_t sum = 0;
-    while (len > 1) {
-        sum += *ptr++;
+    while (len >= 2) {
+        sum += static_cast<std::uint16_t>((static_cast<std::uint16_t>(bytes[0]) << 8) | bytes[1]);
+        bytes += 2;
         len -= 2;
     }
     if (len == 1) {
-        sum += *reinterpret_cast<const std::uint8_t*>(ptr);
+        sum += static_cast<std::uint16_t>(static_cast<std::uint16_t>(bytes[0]) << 8);
     }
     sum = (sum >> 16) + (sum & 0xFFFF);
     sum += (sum >> 16);
@@ -431,13 +432,14 @@ std::uint16_t calculate_udp_checksum_ipv4(const iphdr& ip_header,
     std::uint32_t sum = 0;
 
     auto add_buffer = [&](const void* data, std::size_t len) {
-        const auto* ptr = static_cast<const std::uint16_t*>(data);
-        while (len > 1) {
-            sum += *ptr++;
+        const auto* bytes = static_cast<const std::uint8_t*>(data);
+        while (len >= 2) {
+            sum += static_cast<std::uint16_t>((static_cast<std::uint16_t>(bytes[0]) << 8) | bytes[1]);
+            bytes += 2;
             len -= 2;
         }
         if (len == 1) {
-            sum += *reinterpret_cast<const std::uint8_t*>(ptr);
+            sum += static_cast<std::uint16_t>(static_cast<std::uint16_t>(bytes[0]) << 8);
         }
     };
 
@@ -457,28 +459,49 @@ std::uint16_t calculate_udp_checksum_ipv4(const iphdr& ip_header,
 }
 
 bool send_ipv4_icmp_error_variant(const IpEndpoint& peer,
+                                  const IpEndpoint& outer_source,
                                   const IpEndpoint& inner_source,
                                   const IpEndpoint& inner_destination,
                                   std::uint16_t inner_source_port,
                                   std::uint16_t inner_destination_port,
                                   std::uint16_t marker,
                                   IcmpErrorVariant variant) {
-    if (peer.family != AF_INET || inner_source.family != AF_INET || inner_destination.family != AF_INET) {
+    if (peer.family != AF_INET || outer_source.family != AF_INET || inner_source.family != AF_INET ||
+        inner_destination.family != AF_INET) {
         return false;
     }
 
-    int raw_fd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    int raw_fd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
     if (raw_fd < 0) {
         return false;
     }
+    int enable = 1;
+    if (setsockopt(raw_fd, IPPROTO_IP, IP_HDRINCL, &enable, sizeof(enable)) != 0) {
+        close(raw_fd);
+        return false;
+    }
 
-    std::vector<std::uint8_t> packet(sizeof(icmphdr) + sizeof(iphdr) + sizeof(udphdr), 0);
-    auto* icmp = reinterpret_cast<icmphdr*>(packet.data());
+    std::vector<std::uint8_t> packet(sizeof(iphdr) + sizeof(icmphdr) + sizeof(iphdr) + sizeof(udphdr), 0);
+    auto* outer_ip = reinterpret_cast<iphdr*>(packet.data());
+    outer_ip->ihl = 5;
+    outer_ip->version = 4;
+    outer_ip->tos = 0;
+    outer_ip->tot_len = htons(packet.size());
+    outer_ip->id = 0;
+    outer_ip->frag_off = 0;
+    outer_ip->ttl = 64;
+    outer_ip->protocol = IPPROTO_ICMP;
+    std::memcpy(&outer_ip->saddr, outer_source.address.data(), 4);
+    std::memcpy(&outer_ip->daddr, peer.address.data(), 4);
+    outer_ip->check = 0;
+    outer_ip->check = calculate_checksum(outer_ip, sizeof(iphdr));
+
+    auto* icmp = reinterpret_cast<icmphdr*>(packet.data() + sizeof(iphdr));
     icmp->type = ICMP_DEST_UNREACH;
     icmp->code = ICMP_PORT_UNREACH;
     icmp->checksum = 0;
 
-    auto* inner_ip = reinterpret_cast<iphdr*>(packet.data() + sizeof(icmphdr));
+    auto* inner_ip = reinterpret_cast<iphdr*>(packet.data() + sizeof(iphdr) + sizeof(icmphdr));
     inner_ip->ihl = 5;
     inner_ip->version = 4;
     inner_ip->tos = 0;
@@ -492,7 +515,7 @@ bool send_ipv4_icmp_error_variant(const IpEndpoint& peer,
     inner_ip->check = 0;
     inner_ip->check = calculate_checksum(inner_ip, sizeof(iphdr));
 
-    auto* inner_udp = reinterpret_cast<udphdr*>(packet.data() + sizeof(icmphdr) + sizeof(iphdr));
+    auto* inner_udp = reinterpret_cast<udphdr*>(packet.data() + sizeof(iphdr) + sizeof(icmphdr) + sizeof(iphdr));
     inner_udp->source = htons(inner_source_port);
     inner_udp->dest = htons(inner_destination_port);
     inner_udp->len = htons(sizeof(udphdr));
@@ -508,7 +531,7 @@ bool send_ipv4_icmp_error_variant(const IpEndpoint& peer,
         inner_udp->check ^= htons(0x00FF);
     }
 
-    icmp->checksum = calculate_checksum(packet.data(), packet.size());
+    icmp->checksum = calculate_checksum(icmp, packet.size() - sizeof(iphdr));
     if (variant == IcmpErrorVariant::BadOuterChecksum) {
         icmp->checksum ^= htons(0x00FF);
     }
@@ -959,6 +982,7 @@ void handle_tcp_client(int client_fd,
                 }
 
                 const bool sent_outer = send_ipv4_icmp_error_variant(target,
+                                                                     primary_server,
                                                                      peer_endpoint,
                                                                      primary_server,
                                                                      target.port,
@@ -966,6 +990,7 @@ void handle_tcp_client(int client_fd,
                                                                      marker_outer,
                                                                      IcmpErrorVariant::BadOuterChecksum);
                 const bool sent_inner = send_ipv4_icmp_error_variant(target,
+                                                                     primary_server,
                                                                      peer_endpoint,
                                                                      primary_server,
                                                                      target.port,
@@ -973,9 +998,10 @@ void handle_tcp_client(int client_fd,
                                                                      marker_inner,
                                                                      IcmpErrorVariant::BadInnerIpChecksum);
                 const bool sent_udp = send_ipv4_icmp_error_variant(target,
-                                                                   peer_endpoint,
-                                                                   primary_server,
-                                                                   target.port,
+                                                                    primary_server,
+                                                                    peer_endpoint,
+                                                                    primary_server,
+                                                                    target.port,
                                                                    primary_server.port,
                                                                    marker_udp,
                                                                    IcmpErrorVariant::BadUdpChecksum);
