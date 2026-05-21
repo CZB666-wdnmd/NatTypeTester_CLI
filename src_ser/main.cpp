@@ -18,10 +18,12 @@
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -39,6 +41,19 @@ struct IpEndpoint {
 struct SocketAddress {
     sockaddr_storage storage{};
     socklen_t length{};
+};
+
+struct IcmpMappingRecord {
+    std::string peer_host;
+    std::uint16_t mapped_query{};
+};
+
+struct IcmpRawContext {
+    int primary_socket{-1};
+    int secondary_socket{-1};
+    IpEndpoint primary_server{};
+    IpEndpoint secondary_server{};
+    std::unordered_map<std::string, IcmpMappingRecord> mappings;
 };
 
 [[noreturn]] void fail(const std::string& message) {
@@ -138,6 +153,82 @@ void set_reuse_options(int socket_fd) {
 #ifdef SO_REUSEPORT
     setsockopt(socket_fd, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse));
 #endif
+}
+
+void try_disable_kernel_icmp_echo_auto_reply() {
+    FILE* file = fopen("/proc/sys/net/ipv4/icmp_echo_ignore_all", "w");
+    if (file == nullptr) {
+        return;
+    }
+    fputs("1\n", file);
+    fclose(file);
+}
+
+int create_icmp_raw_listener(const IpEndpoint& endpoint) {
+    if (endpoint.family != AF_INET) {
+        return -1;
+    }
+    int socket_fd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    if (socket_fd < 0) {
+        throw system_error("socket failed");
+    }
+    try {
+        set_reuse_options(socket_fd);
+        IpEndpoint bind_endpoint = endpoint;
+        bind_endpoint.port = 0;
+        SocketAddress address = to_sockaddr(bind_endpoint);
+        if (bind(socket_fd, reinterpret_cast<sockaddr*>(&address.storage), address.length) != 0) {
+            throw system_error("bind failed");
+        }
+        return socket_fd;
+    } catch (...) {
+        close(socket_fd);
+        throw;
+    }
+}
+
+std::uint16_t calculate_icmp_checksum(const void* data, std::size_t len) {
+    const auto* ptr = static_cast<const std::uint16_t*>(data);
+    std::uint32_t sum = 0;
+    while (len > 1) {
+        sum += *ptr++;
+        len -= 2;
+    }
+    if (len == 1) {
+        sum += *reinterpret_cast<const std::uint8_t*>(ptr);
+    }
+    while (sum >> 16) {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    return static_cast<std::uint16_t>(~sum);
+}
+
+bool send_icmp_echo(int raw_fd,
+                    const IpEndpoint& target,
+                    std::uint8_t type,
+                    std::uint16_t identifier,
+                    std::uint16_t sequence,
+                    std::string_view payload) {
+    std::vector<std::uint8_t> packet(sizeof(icmphdr) + payload.size(), 0);
+    auto* icmp = reinterpret_cast<icmphdr*>(packet.data());
+    icmp->type = type;
+    icmp->code = 0;
+    icmp->un.echo.id = htons(identifier);
+    icmp->un.echo.sequence = htons(sequence);
+    if (!payload.empty()) {
+        std::memcpy(packet.data() + sizeof(icmphdr), payload.data(), payload.size());
+    }
+    icmp->checksum = 0;
+    icmp->checksum = calculate_icmp_checksum(packet.data(), packet.size());
+
+    SocketAddress destination = to_sockaddr(target);
+    const ssize_t sent = sendto(raw_fd,
+                                packet.data(),
+                                packet.size(),
+                                0,
+                                reinterpret_cast<sockaddr*>(&destination.storage),
+                                destination.length);
+    return sent == static_cast<ssize_t>(packet.size());
 }
 
 int create_tcp_listener(const IpEndpoint& endpoint) {
@@ -599,9 +690,70 @@ bool try_send_udp_from_source(const IpEndpoint& source_address_only, const IpEnd
     return success;
 }
 
+std::optional<std::string> parse_rfc5508_mapping_token(std::string_view payload) {
+    constexpr std::string_view prefix = "RFC5508-M:";
+    if (!payload.starts_with(prefix)) {
+        return std::nullopt;
+    }
+    std::string token(payload.substr(prefix.size()));
+    const std::size_t newline = token.find('\n');
+    if (newline != std::string::npos) {
+        token = token.substr(0, newline);
+    }
+    if (token.empty()) {
+        return std::nullopt;
+    }
+    return token;
+}
+
+void handle_icmp_packet(int raw_fd, IcmpRawContext& icmp_context) {
+    std::array<std::uint8_t, 4096> buffer{};
+    sockaddr_storage peer{};
+    socklen_t peer_length = sizeof(peer);
+    const ssize_t received =
+        recvfrom(raw_fd, buffer.data(), buffer.size(), 0, reinterpret_cast<sockaddr*>(&peer), &peer_length);
+    if (received <= static_cast<ssize_t>(sizeof(iphdr) + sizeof(icmphdr))) {
+        return;
+    }
+
+    const auto* ip_header = reinterpret_cast<const iphdr*>(buffer.data());
+    if (ip_header->version != 4 || ip_header->protocol != IPPROTO_ICMP) {
+        return;
+    }
+    const std::size_t ip_header_length = static_cast<std::size_t>(ip_header->ihl) * 4;
+    if (received <= static_cast<ssize_t>(ip_header_length + sizeof(icmphdr))) {
+        return;
+    }
+
+    const auto* icmp = reinterpret_cast<const icmphdr*>(buffer.data() + ip_header_length);
+    if (icmp->type != ICMP_ECHO || icmp->code != 0) {
+        return;
+    }
+
+    const char* payload_data = reinterpret_cast<const char*>(buffer.data() + ip_header_length + sizeof(icmphdr));
+    const std::size_t payload_size = static_cast<std::size_t>(received) - ip_header_length - sizeof(icmphdr);
+    std::string_view payload(payload_data, payload_size);
+
+    IpEndpoint peer_endpoint = from_sockaddr(reinterpret_cast<sockaddr*>(&peer), peer_length);
+    if (std::optional<std::string> token = parse_rfc5508_mapping_token(payload); token.has_value()) {
+        IcmpMappingRecord record;
+        record.peer_host = endpoint_host(peer_endpoint);
+        record.mapped_query = ntohs(icmp->un.echo.id);
+        icmp_context.mappings[*token] = record;
+    }
+
+    send_icmp_echo(raw_fd,
+                   peer_endpoint,
+                   ICMP_ECHOREPLY,
+                   ntohs(icmp->un.echo.id),
+                   ntohs(icmp->un.echo.sequence),
+                   std::string(payload));
+}
+
 void handle_tcp_client(int client_fd,
                        const IpEndpoint& primary_server,
                        const IpEndpoint& secondary_server,
+                       IcmpRawContext& icmp_context,
                        int connection_probe_timeout_ms,
                        int syn_delay_ms) {
     try {
@@ -684,6 +836,46 @@ void handle_tcp_client(int client_fd,
                 } else {
                     send_all(client_fd, "V=" + std::to_string(*observed_id) + "\n");
                 }
+                continue;
+            }
+            if (command.rfind("IM ", 0) == 0) {
+                const std::string token = command.substr(3);
+                auto it = icmp_context.mappings.find(token);
+                if (it == icmp_context.mappings.end()) {
+                    send_all(client_fd, "ERR\n");
+                    continue;
+                }
+                send_all(client_fd, "M " + it->second.peer_host + " " + std::to_string(it->second.mapped_query) + "\n");
+                continue;
+            }
+            if (command.rfind("IF ", 0) == 0) {
+                std::istringstream stream(command);
+                std::string op;
+                std::string role;
+                std::string token;
+                std::uint16_t probe_query = 0;
+                if (!(stream >> op >> role >> token >> probe_query) || role.size() != 1) {
+                    send_all(client_fd, "F=0\n");
+                    continue;
+                }
+                auto it = icmp_context.mappings.find(token);
+                if (it == icmp_context.mappings.end()) {
+                    send_all(client_fd, "F=0\n");
+                    continue;
+                }
+
+                int raw_fd = role[0] == 'P' ? icmp_context.primary_socket
+                                            : (role[0] == 'S' ? icmp_context.secondary_socket : -1);
+                if (raw_fd < 0) {
+                    send_all(client_fd, "F=0\n");
+                    continue;
+                }
+                IpEndpoint target = resolve_endpoint(it->second.peer_host, 0);
+                target.port = 0;
+                const std::string payload = "RFC5508-F:" + token + ":" + std::to_string(probe_query);
+                const bool sent =
+                    send_icmp_echo(raw_fd, target, ICMP_ECHO, it->second.mapped_query, probe_query, payload);
+                send_all(client_fd, std::string("F=") + (sent ? "1" : "0") + "\n");
                 continue;
             }
             send_all(client_fd, "ERR\n");
@@ -775,21 +967,32 @@ int main(int argc, char** argv) {
             fail("Primary and secondary addresses must use the same family.");
         }
 
+        try_disable_kernel_icmp_echo_auto_reply();
+
         int primary_tcp_fd = create_tcp_listener(primary_server);
         int secondary_tcp_fd = create_tcp_listener(secondary_server);
         int primary_udp_fd = create_udp_listener(primary_server);
         int secondary_udp_fd = create_udp_listener(secondary_server);
+        IcmpRawContext icmp_context;
+        icmp_context.primary_server = primary_server;
+        icmp_context.secondary_server = secondary_server;
+        if (primary_server.family == AF_INET) {
+            icmp_context.primary_socket = create_icmp_raw_listener(primary_server);
+            icmp_context.secondary_socket = create_icmp_raw_listener(secondary_server);
+        }
 
         std::cout << "Server ready. Primary=" << primary_host << ":" << primary_port
                   << " Secondary=" << secondary_host << ":" << secondary_port << '\n';
         std::cout << "Note: Must run as root (sudo) for ICMP Raw socket testing to work.\n";
 
         while (true) {
-            std::array<pollfd, 4> descriptors{{
+            std::array<pollfd, 6> descriptors{{
                 {primary_tcp_fd, POLLIN, 0},
                 {secondary_tcp_fd, POLLIN, 0},
                 {primary_udp_fd, POLLIN, 0},
                 {secondary_udp_fd, POLLIN, 0},
+                {icmp_context.primary_socket, POLLIN, 0},
+                {icmp_context.secondary_socket, POLLIN, 0},
             }};
             int rc = poll(descriptors.data(), descriptors.size(), -1);
             if (rc < 0) {
@@ -802,12 +1005,23 @@ int main(int argc, char** argv) {
             if (descriptors[3].revents & POLLIN) {
                 handle_udp_packet(secondary_udp_fd, secondary_server);
             }
+            if (icmp_context.primary_socket >= 0 && (descriptors[4].revents & POLLIN)) {
+                handle_icmp_packet(icmp_context.primary_socket, icmp_context);
+            }
+            if (icmp_context.secondary_socket >= 0 && (descriptors[5].revents & POLLIN)) {
+                handle_icmp_packet(icmp_context.secondary_socket, icmp_context);
+            }
             if (descriptors[0].revents & POLLIN) {
                 sockaddr_storage client{};
                 socklen_t length = sizeof(client);
                 int client_fd = accept(primary_tcp_fd, reinterpret_cast<sockaddr*>(&client), &length);
                 if (client_fd >= 0) {
-                    handle_tcp_client(client_fd, primary_server, secondary_server, connection_probe_timeout_ms, syn_delay_ms);
+                    handle_tcp_client(client_fd,
+                                      primary_server,
+                                      secondary_server,
+                                      icmp_context,
+                                      connection_probe_timeout_ms,
+                                      syn_delay_ms);
                     close(client_fd);
                 }
             }
@@ -816,7 +1030,12 @@ int main(int argc, char** argv) {
                 socklen_t length = sizeof(client);
                 int client_fd = accept(secondary_tcp_fd, reinterpret_cast<sockaddr*>(&client), &length);
                 if (client_fd >= 0) {
-                    handle_tcp_client(client_fd, primary_server, secondary_server, connection_probe_timeout_ms, syn_delay_ms);
+                    handle_tcp_client(client_fd,
+                                      primary_server,
+                                      secondary_server,
+                                      icmp_context,
+                                      connection_probe_timeout_ms,
+                                      syn_delay_ms);
                     close(client_fd);
                 }
             }

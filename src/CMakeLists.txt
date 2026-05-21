@@ -13,6 +13,7 @@ add_library(nat_type_tester_cli_lib
   discovery.cpp
   rfc5382.cpp
   rfc4787.cpp
+  rfc5508.cpp
   rfc7857.cpp
 )
 

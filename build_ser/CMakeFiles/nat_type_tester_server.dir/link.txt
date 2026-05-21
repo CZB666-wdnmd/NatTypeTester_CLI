@@ -1,1 +1,0 @@
-/usr/bin/c++ -Wl,--dependency-file=CMakeFiles/nat_type_tester_server.dir/link.d CMakeFiles/nat_type_tester_server.dir/main.cpp.o -o nat_type_tester_server

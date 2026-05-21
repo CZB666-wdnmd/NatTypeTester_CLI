@@ -1,5 +1,6 @@
 #include "discovery.hpp"
 #include "rfc4787.hpp"
+#include "rfc5508.hpp"
 #include "rfc5382.hpp"
 #include "rfc7857.hpp"
 
@@ -32,6 +33,12 @@ enum class Rfc5382TestType {
     Icmp,
 };
 
+enum class Rfc5508TestType {
+    All,
+    Mapping,
+    Filtering,
+};
+
 struct ParsedArguments {
     std::string command;
     std::map<std::string, std::string> options;
@@ -43,7 +50,7 @@ struct ParsedArguments {
 
 ParsedArguments parse_arguments(int argc, char** argv) {
     if (argc < 2) {
-        fail("Expected subcommand: rfc3489, rfc5780, rfc4787, rfc5382, or rfc7857");
+        fail("Expected subcommand: rfc3489, rfc5780, rfc4787, rfc5382, rfc5508, or rfc7857");
     }
 
     ParsedArguments result;
@@ -85,6 +92,8 @@ void print_help() {
         << "                               [--local host[:port]] [--test-type all|mapping|filtering|port-allocation|icmp|fragmentation] [--timeout-ms 3000]\n"
         << "  nat_type_tester_cli rfc5382 --stun_server host[:port] --primary_server host[:port] --secondary_server host[:port]\n"
         << "                               [--local host[:port]] [--test-type all|mapping|filtering|simultaneous-open|unexpected-syn|icmp] [--timeout-ms 3000]\n"
+        << "  nat_type_tester_cli rfc5508 --primary_server host[:port] --secondary_server host[:port]\n"
+        << "                               [--local host[:port]] [--test-type all|mapping|filtering] [--timeout-ms 3000]\n"
         << "  nat_type_tester_cli rfc7857 --stun_server host[:port] --primary_server host[:port] --secondary_server host[:port]\n"
         << "                               [--local host[:port]] [--timeout-ms 3000]\n\n";
 }
@@ -196,6 +205,20 @@ Rfc5382TestType parse_rfc5382_test_type(const ParsedArguments& args) {
     fail("Unsupported RFC5382 test type: " + value);
 }
 
+Rfc5508TestType parse_rfc5508_test_type(const ParsedArguments& args) {
+    std::string value = find_option(args, "--test-type").value_or("all");
+    if (value == "all") {
+        return Rfc5508TestType::All;
+    }
+    if (value == "mapping") {
+        return Rfc5508TestType::Mapping;
+    }
+    if (value == "filtering") {
+        return Rfc5508TestType::Filtering;
+    }
+    fail("Unsupported RFC5508 test type: " + value);
+}
+
 std::optional<IpEndpoint> parse_local_bind(const ParsedArguments& args, int family, int socket_type) {
     std::optional<std::string> local = find_option(args, "--local");
     if (!local.has_value()) {
@@ -242,21 +265,53 @@ int main(int argc, char** argv) {
         }
 
         if (args.command != "rfc3489" && args.command != "rfc5780" && args.command != "rfc4787" &&
+            args.command != "rfc5508" &&
             args.command != "rfc5382" && args.command != "rfc7857") {
             fail("Unknown subcommand: " + args.command);
         }
 
         constexpr std::uint16_t default_port = 3478;
-        auto [stun_host, stun_port] = natcli::split_host_port(require_option(args, "--stun_server"), default_port);
-        IpEndpoint stun_server = natcli::resolve_endpoint(stun_host, stun_port, SOCK_DGRAM);
-
         RequestOptions options;
         options.transport = TransportType::Udp;
-        options.server_name = stun_host;
         options.skip_certificate_validation = parse_bool_option(args, "--skip-cert", false);
         if (std::optional<std::string> timeout = find_option(args, "--timeout-ms"); timeout.has_value()) {
             options.timeout = std::chrono::milliseconds(std::stoi(*timeout));
         }
+
+        if (args.command == "rfc5508") {
+            auto [primary_host, primary_port] =
+                natcli::split_host_port(require_option(args, "--primary_server"), default_port);
+            auto [secondary_host, secondary_port] =
+                natcli::split_host_port(require_option(args, "--secondary_server"), default_port);
+            IpEndpoint primary_server = natcli::resolve_endpoint(primary_host, primary_port, SOCK_STREAM);
+            IpEndpoint secondary_server =
+                natcli::resolve_endpoint(secondary_host, secondary_port, SOCK_STREAM, primary_server.family);
+            std::optional<IpEndpoint> local_bind = parse_local_bind(args, primary_server.family, SOCK_DGRAM);
+            Rfc5508TestType test_type = parse_rfc5508_test_type(args);
+            natcli::Rfc5508Result result = natcli::run_rfc5508_tests(
+                options,
+                test_type == Rfc5508TestType::All ? natcli::Rfc5508TestType::All :
+                test_type == Rfc5508TestType::Mapping ? natcli::Rfc5508TestType::Mapping : natcli::Rfc5508TestType::Filtering,
+                primary_server,
+                secondary_server,
+                local_bind);
+
+            if (test_type == Rfc5508TestType::All || test_type == Rfc5508TestType::Mapping) {
+                print_row("MappingBehavior", natcli::to_string(result.mapping_behavior));
+                print_row("PublicEnd", endpoint_or_dash(result.public_endpoint));
+                print_row("PublicQuery", result.public_query.has_value() ? std::to_string(*result.public_query) : "-");
+            }
+            if (test_type == Rfc5508TestType::All || test_type == Rfc5508TestType::Filtering) {
+                print_row("FilteringBehavior", natcli::to_string(result.filtering_behavior));
+            }
+            print_row("LocalEnd", endpoint_or_dash(result.local_endpoint));
+            print_row("LocalQuery", result.local_query.has_value() ? std::to_string(*result.local_query) : "-");
+            return 0;
+        }
+
+        auto [stun_host, stun_port] = natcli::split_host_port(require_option(args, "--stun_server"), default_port);
+        IpEndpoint stun_server = natcli::resolve_endpoint(stun_host, stun_port, SOCK_DGRAM);
+        options.server_name = stun_host;
 
         if (args.command == "rfc3489") {
             std::optional<IpEndpoint> local_bind = parse_local_bind(args, stun_server.family, SOCK_DGRAM);
