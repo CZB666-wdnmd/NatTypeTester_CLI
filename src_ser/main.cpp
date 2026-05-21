@@ -23,6 +23,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -54,6 +55,7 @@ struct IcmpRawContext {
     IpEndpoint primary_server{};
     IpEndpoint secondary_server{};
     std::unordered_map<std::string, IcmpMappingRecord> mappings;
+    std::mutex mappings_mutex;
 };
 
 [[noreturn]] void fail(const std::string& message) {
@@ -304,10 +306,21 @@ void send_all(int socket_fd, std::string_view payload) {
     }
 }
 
-std::string recv_line(int socket_fd) {
+std::string recv_line(int socket_fd, int timeout_ms) {
     std::string line;
     std::array<char, 256> buffer{};
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     while (line.find('\n') == std::string::npos) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            throw std::runtime_error("recv timed out");
+        }
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+        pollfd descriptor{socket_fd, POLLIN, 0};
+        const int rc = poll(&descriptor, 1, static_cast<int>(remaining.count()));
+        if (rc <= 0 || (descriptor.revents & POLLIN) == 0) {
+            throw std::runtime_error("recv timed out");
+        }
         ssize_t received = recv(socket_fd, buffer.data(), buffer.size(), 0);
         if (received <= 0) {
             break;
@@ -739,6 +752,7 @@ void handle_icmp_packet(int raw_fd, IcmpRawContext& icmp_context) {
         IcmpMappingRecord record;
         record.peer_host = endpoint_host(peer_endpoint);
         record.mapped_query = ntohs(icmp->un.echo.id);
+        std::lock_guard<std::mutex> lock(icmp_context.mappings_mutex);
         icmp_context.mappings[*token] = record;
     }
 
@@ -757,6 +771,7 @@ void handle_tcp_client(int client_fd,
                        int connection_probe_timeout_ms,
                        int syn_delay_ms) {
     try {
+        constexpr int kTcpClientCommandTimeoutMs = 30 * 1000;
         sockaddr_storage peer{};
         socklen_t peer_length = sizeof(peer);
         if (getpeername(client_fd, reinterpret_cast<sockaddr*>(&peer), &peer_length) != 0) {
@@ -765,7 +780,7 @@ void handle_tcp_client(int client_fd,
         IpEndpoint peer_endpoint = from_sockaddr(reinterpret_cast<sockaddr*>(&peer), peer_length);
         
         while (true) {
-            std::string command = recv_line(client_fd);
+            std::string command = recv_line(client_fd, kTcpClientCommandTimeoutMs);
             if (command.empty()) {
                 return;
             }
@@ -840,12 +855,19 @@ void handle_tcp_client(int client_fd,
             }
             if (command.rfind("IM ", 0) == 0) {
                 const std::string token = command.substr(3);
-                auto it = icmp_context.mappings.find(token);
-                if (it == icmp_context.mappings.end()) {
+                std::optional<IcmpMappingRecord> record;
+                {
+                    std::lock_guard<std::mutex> lock(icmp_context.mappings_mutex);
+                    auto it = icmp_context.mappings.find(token);
+                    if (it != icmp_context.mappings.end()) {
+                        record = it->second;
+                    }
+                }
+                if (!record.has_value()) {
                     send_all(client_fd, "ERR\n");
                     continue;
                 }
-                send_all(client_fd, "M " + it->second.peer_host + " " + std::to_string(it->second.mapped_query) + "\n");
+                send_all(client_fd, "M " + record->peer_host + " " + std::to_string(record->mapped_query) + "\n");
                 continue;
             }
             if (command.rfind("IF ", 0) == 0) {
@@ -858,8 +880,15 @@ void handle_tcp_client(int client_fd,
                     send_all(client_fd, "F=0\n");
                     continue;
                 }
-                auto it = icmp_context.mappings.find(token);
-                if (it == icmp_context.mappings.end()) {
+                std::optional<IcmpMappingRecord> record;
+                {
+                    std::lock_guard<std::mutex> lock(icmp_context.mappings_mutex);
+                    auto it = icmp_context.mappings.find(token);
+                    if (it != icmp_context.mappings.end()) {
+                        record = it->second;
+                    }
+                }
+                if (!record.has_value()) {
                     send_all(client_fd, "F=0\n");
                     continue;
                 }
@@ -870,11 +899,11 @@ void handle_tcp_client(int client_fd,
                     send_all(client_fd, "F=0\n");
                     continue;
                 }
-                IpEndpoint target = resolve_endpoint(it->second.peer_host, 0);
+                IpEndpoint target = resolve_endpoint(record->peer_host, 0);
                 target.port = 0;
                 const std::string payload = "RFC5508-F:" + token + ":" + std::to_string(probe_query);
                 const bool sent =
-                    send_icmp_echo(raw_fd, target, ICMP_ECHO, it->second.mapped_query, probe_query, payload);
+                    send_icmp_echo(raw_fd, target, ICMP_ECHO, record->mapped_query, probe_query, payload);
                 send_all(client_fd, std::string("F=") + (sent ? "1" : "0") + "\n");
                 continue;
             }
@@ -1016,13 +1045,20 @@ int main(int argc, char** argv) {
                 socklen_t length = sizeof(client);
                 int client_fd = accept(primary_tcp_fd, reinterpret_cast<sockaddr*>(&client), &length);
                 if (client_fd >= 0) {
-                    handle_tcp_client(client_fd,
-                                      primary_server,
-                                      secondary_server,
-                                      icmp_context,
-                                      connection_probe_timeout_ms,
-                                      syn_delay_ms);
-                    close(client_fd);
+                    std::thread([client_fd,
+                                 primary_server,
+                                 secondary_server,
+                                 &icmp_context,
+                                 connection_probe_timeout_ms,
+                                 syn_delay_ms]() {
+                        handle_tcp_client(client_fd,
+                                          primary_server,
+                                          secondary_server,
+                                          icmp_context,
+                                          connection_probe_timeout_ms,
+                                          syn_delay_ms);
+                        close(client_fd);
+                    }).detach();
                 }
             }
             if (descriptors[1].revents & POLLIN) {
@@ -1030,13 +1066,20 @@ int main(int argc, char** argv) {
                 socklen_t length = sizeof(client);
                 int client_fd = accept(secondary_tcp_fd, reinterpret_cast<sockaddr*>(&client), &length);
                 if (client_fd >= 0) {
-                    handle_tcp_client(client_fd,
-                                      primary_server,
-                                      secondary_server,
-                                      icmp_context,
-                                      connection_probe_timeout_ms,
-                                      syn_delay_ms);
-                    close(client_fd);
+                    std::thread([client_fd,
+                                 primary_server,
+                                 secondary_server,
+                                 &icmp_context,
+                                 connection_probe_timeout_ms,
+                                 syn_delay_ms]() {
+                        handle_tcp_client(client_fd,
+                                          primary_server,
+                                          secondary_server,
+                                          icmp_context,
+                                          connection_probe_timeout_ms,
+                                          syn_delay_ms);
+                        close(client_fd);
+                    }).detach();
                 }
             }
         }
