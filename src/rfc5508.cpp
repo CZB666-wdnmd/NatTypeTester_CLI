@@ -23,6 +23,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <iostream>
 
 namespace natcli {
 namespace {
@@ -364,7 +365,12 @@ bool send_ipv4_icmp_error_packet(int raw_send_fd,
                                 0,
                                 reinterpret_cast<sockaddr*>(&remote.storage),
                                 remote.length);
-    return sent == static_cast<ssize_t>(packet.size());
+    if (sent != static_cast<ssize_t>(packet.size())) {
+        std::cerr << "\n[Debug] sendto failed: " << std::strerror(errno) 
+                  << " (sent " << sent << " of " << packet.size() << ")\n";
+        return false;
+    }
+    return true;
 }
 
 std::vector<ReceivedIcmpError> receive_icmp_errors_by_markers(int raw_fd,
