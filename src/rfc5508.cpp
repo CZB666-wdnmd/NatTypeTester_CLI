@@ -282,8 +282,8 @@ bool send_ipv4_icmp_error_packet(int raw_send_fd,
                                  std::uint16_t inner_source_port,
                                  std::uint16_t inner_destination_port,
                                  std::uint16_t marker,
-                                  IcmpErrorVariant variant,
-                                  IcmpInnerProtocol inner_protocol = IcmpInnerProtocol::Udp) {
+                                 IcmpErrorVariant variant,
+                                 IcmpInnerProtocol inner_protocol) {
     if (target.family != AF_INET || outer_source.family != AF_INET || inner_source.family != AF_INET ||
         inner_destination.family != AF_INET) {
         return false;
@@ -298,7 +298,7 @@ bool send_ipv4_icmp_error_packet(int raw_send_fd,
     outer_ip->version = 4;
     outer_ip->tos = 0;
     outer_ip->tot_len = htons(packet.size());
-    outer_ip->id = htons(marker);
+    outer_ip->id = 0;
     outer_ip->frag_off = 0;
     outer_ip->ttl = 64;
     outer_ip->protocol = IPPROTO_ICMP;
@@ -673,7 +673,8 @@ ProbeStatus run_client_outbound_icmp_error_probe(int raw_send_fd,
                                                   primary_server.port,
                                                   local_udp_endpoint.port,
                                                   marker,
-                                                  IcmpErrorVariant::Valid);
+                                                  IcmpErrorVariant::Valid,
+                                                  IcmpInnerProtocol::Udp);
     if (!sent) {
         return ProbeStatus::Fail;
     }
@@ -736,7 +737,8 @@ void run_icmp_payload_validation_probe(Rfc5508Result& result,
                                                             primary_server.port,
                                                             local_udp_endpoint.port,
                                                             cli_outer_marker,
-                                                            IcmpErrorVariant::BadOuterChecksum);
+                                                            IcmpErrorVariant::BadOuterChecksum,
+                                                            IcmpInnerProtocol::Udp);
     const bool cli_inner_sent = send_ipv4_icmp_error_packet(raw_send_fd,
                                                             primary_server,
                                                             control_local,
@@ -745,7 +747,8 @@ void run_icmp_payload_validation_probe(Rfc5508Result& result,
                                                             primary_server.port,
                                                             local_udp_endpoint.port,
                                                             cli_inner_marker,
-                                                            IcmpErrorVariant::BadInnerIpChecksum);
+                                                            IcmpErrorVariant::BadInnerIpChecksum,
+                                                            IcmpInnerProtocol::Udp);
     const bool cli_udp_sent = send_ipv4_icmp_error_packet(raw_send_fd,
                                                           primary_server,
                                                           control_local,
@@ -754,7 +757,8 @@ void run_icmp_payload_validation_probe(Rfc5508Result& result,
                                                           primary_server.port,
                                                           local_udp_endpoint.port,
                                                           cli_udp_marker,
-                                                          IcmpErrorVariant::BadUdpChecksum);
+                                                          IcmpErrorVariant::BadUdpChecksum,
+                                                          IcmpInnerProtocol::Udp);
     if (!cli_outer_sent || !cli_inner_sent || !cli_udp_sent) {
         result.icmp_error_payload_validation = ProbeStatus::Inconclusive;
         return;
