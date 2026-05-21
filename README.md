@@ -6,6 +6,7 @@
 - RFC 5780 / RFC 5389 / RFC 8489 体系下的 Binding / Mapping / Filtering 行为探测
 - RFC 4787（UDP NAT 行为要求）
 - RFC 5382（TCP NAT 行为要求）
+- RFC 5508（ICMP NAT 映射/过滤，非标准扩展测试）
 - RFC 7857（NAT 行为的一致性与协议独立性）
 
 项目提供两部分：
@@ -49,6 +50,9 @@ nat_type_tester_cli rfc4787 --stun_server host[:port] --primary_server host[:por
 nat_type_tester_cli rfc5382 --stun_server host[:port] --primary_server host[:port] --secondary_server host[:port]
                              [--local host[:port]] [--test-type all|mapping|filtering|simultaneous-open|unexpected-syn|icmp] [--timeout-ms 3000]
 
+nat_type_tester_cli rfc5508 --primary_server host[:port] --secondary_server host[:port]
+                             [--local host[:port]] [--test-type all|mapping|filtering] [--timeout-ms 3000]
+
 nat_type_tester_cli rfc7857 --stun_server host[:port] --primary_server host[:port] --secondary_server host[:port]
                              [--local host[:port]] [--timeout-ms 3000]
 ```
@@ -75,6 +79,7 @@ nat_type_tester_cli rfc7857 --stun_server host[:port] --primary_server host[:por
 
 - `rfc4787`
 - `rfc5382`
+- `rfc5508`
 - `rfc7857`
 
 **原因**：这三类测试包含“非标准 STUN 回路”、“主动 TCP 回连探测”以及“真实的外部 ICMP 错误注入”，普通公网 STUN 服务器无法提供这种定制化的网络控制能力。
@@ -339,3 +344,14 @@ ALG应用层网关
   --primary_server 1.2.3.4:3478 \
   --secondary_server 5.6.7.8:3478
 ```
+
+### 8.4 RFC5508（ICMP 映射/过滤，双 IP 服务端）
+
+```bash
+sudo ./src/build/nat_type_tester_cli rfc5508 \
+  --primary_server 1.2.3.4:3478 \
+  --secondary_server 5.6.7.8:3478 \
+  --test-type all
+```
+
+> 说明：RFC5508 测试使用 raw socket 收发 ICMP，服务端与客户端都需要 root 权限；并建议提前执行 `sysctl -w net.ipv4.icmp_echo_ignore_all=1` 关闭系统自动 ICMP Echo Reply。
