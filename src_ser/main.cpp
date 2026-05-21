@@ -107,25 +107,26 @@ bool ensure_nftables_icmp_notrack() {
         return false;
     }
     bool ok = true;
-    if (!run_shell_command("nft list table ip raw >/dev/null 2>&1 || nft add table ip raw >/dev/null 2>&1")) {
+    if (!run_shell_command("nft list table ip raw >/dev/null 2>&1") &&
+        !run_shell_command("nft add table ip raw >/dev/null 2>&1")) {
+        ok = false;
+    }
+    if (!run_shell_command("nft list chain ip raw prerouting >/dev/null 2>&1") &&
+        !run_shell_command("nft add chain ip raw prerouting '{ type filter hook prerouting priority raw; }' >/dev/null 2>&1")) {
+        ok = false;
+    }
+    if (!run_shell_command("nft list chain ip raw output >/dev/null 2>&1") &&
+        !run_shell_command("nft add chain ip raw output '{ type filter hook output priority raw; }' >/dev/null 2>&1")) {
         ok = false;
     }
     if (!run_shell_command(
-            "nft list chain ip raw prerouting >/dev/null 2>&1 || nft add chain ip raw prerouting "
-            "'{ type filter hook prerouting priority raw; }' >/dev/null 2>&1")) {
-        ok = false;
-    }
-    if (!run_shell_command(
-            "nft list chain ip raw output >/dev/null 2>&1 || nft add chain ip raw output "
-            "'{ type filter hook output priority raw; }' >/dev/null 2>&1")) {
-        ok = false;
-    }
-    if (!run_shell_command("nft list chain ip raw output 2>/dev/null | grep -Fq 'ip protocol icmp notrack'")) {
+            "nft list chain ip raw output 2>/dev/null | grep -Eq '^[[:space:]]*ip protocol icmp notrack([[:space:]].*)?$'")) {
         if (!run_shell_command("nft add rule ip raw output ip protocol icmp notrack >/dev/null 2>&1")) {
             ok = false;
         }
     }
-    if (!run_shell_command("nft list chain ip raw prerouting 2>/dev/null | grep -Fq 'ip protocol icmp notrack'")) {
+    if (!run_shell_command(
+            "nft list chain ip raw prerouting 2>/dev/null | grep -Eq '^[[:space:]]*ip protocol icmp notrack([[:space:]].*)?$'")) {
         if (!run_shell_command("nft add rule ip raw prerouting ip protocol icmp notrack >/dev/null 2>&1")) {
             ok = false;
         }
