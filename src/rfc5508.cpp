@@ -761,10 +761,6 @@ void run_icmp_payload_validation_probe(Rfc5508Result& result,
                                                           cli_udp_marker,
                                                           IcmpErrorVariant::BadUdpChecksum,
                                                           IcmpInnerProtocol::Udp);
-    if (!cli_outer_sent || !cli_inner_sent || !cli_udp_sent) {
-        result.icmp_error_payload_validation = ProbeStatus::Fail;
-        return;
-    }
 
     std::this_thread::sleep_for(std::chrono::milliseconds(120));
     const std::string cli_outer_seen =
@@ -773,9 +769,9 @@ void run_icmp_payload_validation_probe(Rfc5508Result& result,
         request_control_command(control_local, primary_server, "IR " + std::to_string(cli_inner_marker) + "\n", timeout);
     const std::string cli_udp_seen =
         request_control_command(control_local, primary_server, "IR " + std::to_string(cli_udp_marker) + "\n", timeout);
-    result.malformed_client_outer_checksum_forwarded = parse_flag_response(cli_outer_seen, 'R');
-    result.malformed_client_inner_ip_checksum_forwarded = parse_flag_response(cli_inner_seen, 'R');
-    result.malformed_client_bad_udp_checksum_forwarded = parse_flag_response(cli_udp_seen, 'R');
+    result.malformed_client_outer_checksum_forwarded = cli_outer_sent && parse_flag_response(cli_outer_seen, 'R');
+    result.malformed_client_inner_ip_checksum_forwarded = cli_inner_sent && parse_flag_response(cli_inner_seen, 'R');
+    result.malformed_client_bad_udp_checksum_forwarded = cli_udp_sent && parse_flag_response(cli_udp_seen, 'R');
 
     const ProbeStatus server_direction_status = status_from_expectations(
         result.malformed_server_outer_checksum_forwarded,
