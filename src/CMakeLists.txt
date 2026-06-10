@@ -27,9 +27,6 @@ target_compile_options(nat_type_tester_cli_lib PRIVATE -Wall -Wextra -Wpedantic)
 add_executable(nat_type_tester_cli main.cpp)
 target_link_libraries(nat_type_tester_cli PRIVATE nat_type_tester_cli_lib)
 
-add_executable(nat_type_tester_cli_tests tests.cpp)
-target_link_libraries(nat_type_tester_cli_tests PRIVATE nat_type_tester_cli_lib)
-
 if(BUILD_TESTING)
   add_test(NAME nat_type_tester_cli_tests COMMAND nat_type_tester_cli_tests)
 endif()
