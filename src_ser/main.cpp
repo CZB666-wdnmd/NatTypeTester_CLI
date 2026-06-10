@@ -48,6 +48,20 @@ struct SocketAddress {
     socklen_t length{};
 };
 
+struct StunNode {
+    int fd = -1;
+    IpEndpoint bind_ep{};
+    IpEndpoint pub_ep{};
+};
+
+struct StunContext {
+    // 0: IP_A, Port_1
+    // 1: IP_A, Port_2
+    // 2: IP_B, Port_1
+    // 3: IP_B, Port_2
+    StunNode nodes[4];
+};
+
 struct IcmpMappingRecord {
     std::string peer_host;
     std::uint16_t mapped_query{};
@@ -62,12 +76,6 @@ struct IcmpRawContext {
     std::mutex mappings_mutex;
     std::unordered_set<std::uint16_t> observed_error_markers;
     std::mutex observed_error_markers_mutex;
-};
-
-enum class IcmpErrorVariant : std::uint8_t {
-    BadOuterChecksum = 1,
-    BadInnerIpChecksum = 2,
-    BadUdpChecksum = 3,
 };
 
 [[noreturn]] void fail(const std::string& message) {
@@ -94,14 +102,6 @@ bool ensure_iptables_icmp_notrack() {
     }
     if (!run_shell_command("iptables -t raw -C PREROUTING -p icmp -j CT --notrack >/dev/null 2>&1")) {
         if (!run_shell_command("iptables -t raw -I PREROUTING -p icmp -j CT --notrack >/dev/null 2>&1")) ok = false;
-    }
-    if (command_exists("ip6tables")) {
-        if (!run_shell_command("ip6tables -t raw -C OUTPUT -p icmpv6 -j CT --notrack >/dev/null 2>&1")) {
-            run_shell_command("ip6tables -t raw -I OUTPUT -p icmpv6 -j CT --notrack >/dev/null 2>&1");
-        }
-        if (!run_shell_command("ip6tables -t raw -C PREROUTING -p icmpv6 -j CT --notrack >/dev/null 2>&1")) {
-            run_shell_command("ip6tables -t raw -I PREROUTING -p icmpv6 -j CT --notrack >/dev/null 2>&1");
-        }
     }
     return ok;
 }
@@ -215,8 +215,6 @@ void set_reuse_options(int socket_fd) {
 void try_disable_kernel_icmp_echo_auto_reply() {
     FILE* f1 = fopen("/proc/sys/net/ipv4/icmp_echo_ignore_all", "w");
     if (f1) { fputs("1\n", f1); fclose(f1); }
-    FILE* f2 = fopen("/proc/sys/net/ipv6/icmp/echo_ignore_all", "w");
-    if (f2) { fputs("1\n", f2); fclose(f2); }
 }
 
 int create_tcp_listener(const IpEndpoint& endpoint) {
@@ -234,7 +232,7 @@ int create_udp_listener(const IpEndpoint& endpoint) {
     if (socket_fd < 0) throw system_error("socket failed");
     set_reuse_options(socket_fd);
     SocketAddress address = to_sockaddr(endpoint);
-    if (bind(socket_fd, reinterpret_cast<sockaddr*>(&address.storage), address.length) != 0) throw system_error("bind failed");
+    if (bind(socket_fd, reinterpret_cast<sockaddr*>(&address.storage), address.length) != 0) throw system_error("bind failed on UDP");
     return socket_fd;
 }
 
@@ -251,25 +249,15 @@ std::string endpoint_line(const IpEndpoint& endpoint) {
     return endpoint_host(endpoint) + " " + std::to_string(endpoint.port) + "\n";
 }
 
-bool is_unspecified(const IpEndpoint& ep) {
-    for (std::size_t i = 0; i < ep.address_length; ++i) {
-        if (ep.address[i] != 0) return false;
-    }
-    return true;
-}
-
-// ---------------- STUN Implementation ----------------
-
 void append_stun_address(std::vector<uint8_t>& out, uint16_t attr_type, const IpEndpoint& ep, const uint8_t* tx_id, bool xor_mapped) {
     out.push_back(attr_type >> 8); 
     out.push_back(attr_type & 0xFF);
-    
     uint16_t len = (ep.family == AF_INET) ? 8 : 20;
     out.push_back(len >> 8); 
     out.push_back(len & 0xFF);
     
-    out.push_back(0); // Unused
-    out.push_back((ep.family == AF_INET) ? 1 : 2); // IPv4 = 0x01, IPv6 = 0x02
+    out.push_back(0); 
+    out.push_back((ep.family == AF_INET) ? 1 : 2); 
 
     uint16_t port = ep.port;
     if (xor_mapped && tx_id) {
@@ -281,20 +269,23 @@ void append_stun_address(std::vector<uint8_t>& out, uint16_t attr_type, const Ip
     if (ep.family == AF_INET) {
         for (int i = 0; i < 4; ++i) {
             uint8_t val = ep.address[i];
-            if (xor_mapped && tx_id) val ^= tx_id[i]; // IPv4 仅异或 Magic Cookie 的前4字节
+            if (xor_mapped && tx_id) val ^= tx_id[i]; 
             out.push_back(val);
         }
     } else {
         for (int i = 0; i < 16; ++i) {
             uint8_t val = ep.address[i];
-            if (xor_mapped && tx_id) val ^= tx_id[i]; // IPv6 异或所有 16 字节
+            if (xor_mapped && tx_id) val ^= tx_id[i]; 
             out.push_back(val);
         }
     }
 }
 
-void handle_udp_packet(int udp_fd, const IpEndpoint& server_public_ep,
-                       int alt_udp_fd, const IpEndpoint& alt_public_ep) {
+void handle_udp_packet(int rx_idx, const StunContext& ctx) {
+    const StunNode& rx_node = ctx.nodes[rx_idx];
+    int udp_fd = rx_node.fd;
+    if (udp_fd < 0) return;
+
     sockaddr_storage peer{}; socklen_t peer_length = sizeof(peer);
     std::vector<char> buffer(4096);
     ssize_t received = recvfrom(udp_fd, buffer.data(), buffer.size(), 0, reinterpret_cast<sockaddr*>(&peer), &peer_length);
@@ -302,7 +293,7 @@ void handle_udp_packet(int udp_fd, const IpEndpoint& server_public_ep,
 
     IpEndpoint peer_endpoint = from_sockaddr(reinterpret_cast<sockaddr*>(&peer), peer_length);
 
-    // 1. STUN Binding Request 分析 (RFC 3489 / RFC 5389 / RFC 5780)
+    // 1. STUN Binding Request
     if (received >= 20 && (buffer[0] & 0xC0) == 0) {
         uint16_t msg_type = static_cast<uint16_t>((static_cast<uint8_t>(buffer[0]) << 8) | static_cast<uint8_t>(buffer[1]));
         uint16_t msg_length = static_cast<uint16_t>((static_cast<uint8_t>(buffer[2]) << 8) | static_cast<uint8_t>(buffer[3]));
@@ -311,11 +302,9 @@ void handle_udp_packet(int udp_fd, const IpEndpoint& server_public_ep,
             bool change_ip = false, change_port = false;
             size_t offset = 20;
             
-            // 安全读取并解析 Attributes
             while (offset + 4 <= static_cast<size_t>(received) && offset + 4 <= 20U + msg_length) {
                 uint16_t attr_type = static_cast<uint16_t>((static_cast<uint8_t>(buffer[offset]) << 8) | static_cast<uint8_t>(buffer[offset + 1]));
                 uint16_t attr_len = static_cast<uint16_t>((static_cast<uint8_t>(buffer[offset + 2]) << 8) | static_cast<uint8_t>(buffer[offset + 3]));
-                
                 size_t next_offset = offset + 4 + ((attr_len + 3) & ~3);
                 if (next_offset > static_cast<size_t>(received) || next_offset > 20U + msg_length) break;
 
@@ -323,43 +312,46 @@ void handle_udp_packet(int udp_fd, const IpEndpoint& server_public_ep,
                     uint32_t change_flags = 0;
                     std::memcpy(&change_flags, buffer.data() + offset + 4, 4); 
                     change_flags = ntohl(change_flags);
-                    change_ip = (change_flags & 0x0004); // A 位
-                    change_port = (change_flags & 0x0002); // B 位
+                    change_ip = (change_flags & 0x0004); 
+                    change_port = (change_flags & 0x0002); 
                 }
                 offset = next_offset;
             }
 
-            int reply_fd = udp_fd;
-            IpEndpoint reply_source = server_public_ep;
+            // 完美的 4 端口矩阵路由逻辑 (0: A1, 1: A2, 2: B1, 3: B2)
+            int reply_idx = rx_idx;
+            int ip_bit = rx_idx & 2;     // 0 = IP A, 2 = IP B
+            int port_bit = rx_idx & 1;   // 0 = Port 1, 1 = Port 2
             
-            // 处理 NAT 打洞发现，根据客户端要求用别的公网 IP/Port 响应
-            if ((change_ip || change_port) && alt_udp_fd >= 0) {
-                reply_fd = alt_udp_fd;
-                reply_source = alt_public_ep;
-            }
+            if (change_ip) ip_bit ^= 2;
+            if (change_port) port_bit ^= 1;
+            reply_idx = ip_bit | port_bit;
+
+            // STUN 标准要求的 CHANGED-ADDRESS 是指向与接收端口"IP和Port均相反"的地址
+            int other_idx = rx_idx ^ 3; // 直接异或 3 翻转两个 bit
+
+            const StunNode& reply_node = ctx.nodes[reply_idx];
+            const StunNode& other_node = ctx.nodes[other_idx];
 
             std::vector<uint8_t> stun_resp(20, 0);
             stun_resp[0] = 0x01; stun_resp[1] = 0x01; // Success Binding Response
             std::memcpy(&stun_resp[4], buffer.data() + 4, 16); 
-
             const uint8_t* tx_id = reinterpret_cast<const uint8_t*>(buffer.data() + 4); 
             
-            // 防御性解析 Magic Cookie，安全判断是否支持 RFC 5389
             bool is_rfc5389 = (tx_id[0] == 0x21 && tx_id[1] == 0x12 && tx_id[2] == 0xA4 && tx_id[3] == 0x42);
 
             std::cout << "[STUN] Req from " << endpoint_host(peer_endpoint) << ":" << peer_endpoint.port 
                       << " | Type: " << (is_rfc5389 ? "RFC5389/5780" : "RFC3489") 
+                      << " | Rx: " << rx_node.pub_ep.port << " (IP-" << (rx_idx & 2 ? "B" : "A") << ")"
                       << " | ChgIP=" << change_ip << " ChgPort=" << change_port 
-                      << " | ReplySrc: " << endpoint_host(reply_source) << ":" << reply_source.port << "\n";
+                      << " | ReplySrc: " << endpoint_host(reply_node.pub_ep) << ":" << reply_node.pub_ep.port << "\n";
 
-            // 无论是 3489 还是 5780，我们都提供最全面的 Attributes 供其解析
             append_stun_address(stun_resp, 0x0001, peer_endpoint, tx_id, false); // MAPPED-ADDRESS
-            append_stun_address(stun_resp, 0x0004, reply_source, tx_id, false);  // SOURCE-ADDRESS
-            append_stun_address(stun_resp, 0x0005, alt_public_ep, tx_id, false); // CHANGED-ADDRESS
+            append_stun_address(stun_resp, 0x0004, reply_node.pub_ep, tx_id, false);  // SOURCE-ADDRESS
+            append_stun_address(stun_resp, 0x0005, other_node.pub_ep, tx_id, false); // CHANGED-ADDRESS
             
-            // RFC 5780 (NAT Behavior Discovery) 所必需的扩展字段（由于 > 0x7FFF，老旧客户端会自动忽略它们而不报错）
-            append_stun_address(stun_resp, 0x802b, reply_source, tx_id, false);  // RESPONSE-ORIGIN
-            append_stun_address(stun_resp, 0x802c, alt_public_ep, tx_id, false); // OTHER-ADDRESS
+            append_stun_address(stun_resp, 0x802b, reply_node.pub_ep, tx_id, false);  // RESPONSE-ORIGIN
+            append_stun_address(stun_resp, 0x802c, other_node.pub_ep, tx_id, false); // OTHER-ADDRESS
 
             if (is_rfc5389) {
                 append_stun_address(stun_resp, 0x0020, peer_endpoint, tx_id, true);  // XOR-MAPPED-ADDRESS
@@ -369,7 +361,7 @@ void handle_udp_packet(int udp_fd, const IpEndpoint& server_public_ep,
             stun_resp[2] = total_attr_len >> 8; 
             stun_resp[3] = total_attr_len & 0xFF;
 
-            sendto(reply_fd, stun_resp.data(), stun_resp.size(), 0, reinterpret_cast<sockaddr*>(&peer), peer_length);
+            sendto(reply_node.fd, stun_resp.data(), stun_resp.size(), 0, reinterpret_cast<sockaddr*>(&peer), peer_length);
             return;
         }
     }
@@ -400,53 +392,83 @@ int main(int argc, char** argv) {
 
         constexpr std::uint16_t default_port = 3478;
         
-        auto [ph_bind, pp_bind] = split_host_port(*primary_arg, default_port);
-        IpEndpoint primary_bind = resolve_endpoint(ph_bind, pp_bind);
-        IpEndpoint primary_public = primary_bind;
-        if (primary_public_arg) {
-            auto [ph_pub, pp_pub] = split_host_port(*primary_public_arg, default_port);
-            primary_public = resolve_endpoint(ph_pub, pp_pub);
+        // 解析传入的基础 Host 和 Port
+        auto [ph_bind_host, p_bind_port] = split_host_port(*primary_arg, default_port);
+        auto [ph_pub_host, p_pub_port] = primary_public_arg ? split_host_port(*primary_public_arg, default_port) : std::make_pair(ph_bind_host, p_bind_port);
+        
+        auto [sh_bind_host, s_bind_port] = split_host_port(*secondary_arg, default_port);
+        auto [sh_pub_host, s_pub_port] = secondary_public_arg ? split_host_port(*secondary_public_arg, default_port) : std::make_pair(sh_bind_host, s_bind_port);
+
+        uint16_t port_a = p_bind_port;
+        uint16_t port_b = s_bind_port;
+        
+        // 如果用户只给了同一个端口，系统强制分配下一个端口形成矩阵
+        if (port_a == port_b) {
+            port_b = port_a + 1;
         }
 
-        auto [sh_bind, sp_bind] = split_host_port(*secondary_arg, default_port);
-        IpEndpoint secondary_bind = resolve_endpoint(sh_bind, sp_bind);
-        IpEndpoint secondary_public = secondary_bind;
-        if (secondary_public_arg) {
-            auto [sh_pub, sp_pub] = split_host_port(*secondary_public_arg, default_port);
-            secondary_public = resolve_endpoint(sh_pub, sp_pub);
-        }
+        StunContext stun_ctx;
+        
+        // 节点 0: IP_A, Port_a
+        stun_ctx.nodes[0].bind_ep = resolve_endpoint(ph_bind_host, port_a);
+        stun_ctx.nodes[0].pub_ep = resolve_endpoint(ph_pub_host, port_a);
+        // 节点 1: IP_A, Port_b
+        stun_ctx.nodes[1].bind_ep = resolve_endpoint(ph_bind_host, port_b);
+        stun_ctx.nodes[1].pub_ep = resolve_endpoint(ph_pub_host, port_b);
+        // 节点 2: IP_B, Port_a
+        stun_ctx.nodes[2].bind_ep = resolve_endpoint(sh_bind_host, port_a);
+        stun_ctx.nodes[2].pub_ep = resolve_endpoint(sh_pub_host, port_a);
+        // 节点 3: IP_B, Port_b
+        stun_ctx.nodes[3].bind_ep = resolve_endpoint(sh_bind_host, port_b);
+        stun_ctx.nodes[3].pub_ep = resolve_endpoint(sh_pub_host, port_b);
 
         ensure_icmp_conntrack_bypass();
         try_disable_kernel_icmp_echo_auto_reply();
 
-        int primary_udp_fd = create_udp_listener(primary_bind);
-        int secondary_udp_fd = create_udp_listener(secondary_bind);
-
-        std::cout << "Server ready.\n"
-                  << "  Primary: Bind=" << endpoint_host(primary_bind) << ":" << primary_bind.port 
-                  << "  Public=" << endpoint_host(primary_public) << ":" << primary_public.port << '\n'
-                  << "Secondary: Bind=" << endpoint_host(secondary_bind) << ":" << secondary_bind.port 
-                  << "  Public=" << endpoint_host(secondary_public) << ":" << secondary_public.port << "\n\n";
-
-        if (primary_public.port == secondary_public.port) {
-            std::cerr << "=================================================================================\n"
-                      << "[FATAL WARNING] Primary and Secondary Public Ports are IDENTICAL (" << primary_public.port << ")\n"
-                      << "Standard STUN clients (like NATTypeTester) strictly check that the alternate \n"
-                      << "port differs from the primary. If they are the same, the STUN client will \n"
-                      << "instantly reject the server with 'UnsupportedServer'!\n"
-                      << "HOW TO FIX: Start the server using a DIFFERENT port for the secondary server:\n"
-                      << "e.g., --secondary 8.163.60.58:3479\n"
-                      << "=================================================================================\n\n";
+        std::cout << "STUN 4-Socket Matrix Starting...\n";
+        for (int i = 0; i < 4; ++i) {
+            stun_ctx.nodes[i].fd = create_udp_listener(stun_ctx.nodes[i].bind_ep);
+            std::cout << "  Node " << i << ": Bind=" << endpoint_host(stun_ctx.nodes[i].bind_ep) << ":" << stun_ctx.nodes[i].bind_ep.port 
+                      << "  Public=" << endpoint_host(stun_ctx.nodes[i].pub_ep) << ":" << stun_ctx.nodes[i].pub_ep.port << '\n';
         }
+        std::cout << "\n>>> Server ready for Full Cone / Restricted Cone discovery tests.\n";
+        std::cout << ">>> NOTE: Make sure your Firewall/Security Group allows UDP on BOTH ports (" 
+                  << port_a << " and " << port_b << ") for BOTH IPs.\n\n";
+
+        // TCP Legacy Server Keep Alive (使用 Node0 和 Node3 的信息作为 Primary/Secondary)
+        int primary_tcp_fd = create_tcp_listener(stun_ctx.nodes[0].bind_ep);
+        int secondary_tcp_fd = create_tcp_listener(stun_ctx.nodes[3].bind_ep);
 
         while (true) {
-            std::array<pollfd, 2> descriptors{{
-                {primary_udp_fd, POLLIN, 0}, {secondary_udp_fd, POLLIN, 0}
+            std::array<pollfd, 6> descriptors{{
+                {primary_tcp_fd, POLLIN, 0},
+                {secondary_tcp_fd, POLLIN, 0},
+                {stun_ctx.nodes[0].fd, POLLIN, 0},
+                {stun_ctx.nodes[1].fd, POLLIN, 0},
+                {stun_ctx.nodes[2].fd, POLLIN, 0},
+                {stun_ctx.nodes[3].fd, POLLIN, 0}
             }};
+            
             if (poll(descriptors.data(), descriptors.size(), -1) < 0) throw system_error("poll failed");
 
-            if (descriptors[0].revents & POLLIN) handle_udp_packet(primary_udp_fd, primary_public, secondary_udp_fd, secondary_public);
-            if (descriptors[1].revents & POLLIN) handle_udp_packet(secondary_udp_fd, secondary_public, primary_udp_fd, primary_public);
+            // 监听 4 个 UDP 端口
+            for (int i = 0; i < 4; ++i) {
+                if (descriptors[i + 2].revents & POLLIN) {
+                    handle_udp_packet(i, stun_ctx);
+                }
+            }
+            
+            // 忽略 TCP Accept 逻辑占位（如果不需要 TCP 测试其实可以直接移除）
+            if (descriptors[0].revents & POLLIN) {
+                sockaddr_storage client{}; socklen_t len = sizeof(client);
+                int client_fd = accept(primary_tcp_fd, reinterpret_cast<sockaddr*>(&client), &len);
+                if (client_fd >= 0) close(client_fd);
+            }
+            if (descriptors[1].revents & POLLIN) {
+                sockaddr_storage client{}; socklen_t len = sizeof(client);
+                int client_fd = accept(secondary_tcp_fd, reinterpret_cast<sockaddr*>(&client), &len);
+                if (client_fd >= 0) close(client_fd);
+            }
         }
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << '\n';
