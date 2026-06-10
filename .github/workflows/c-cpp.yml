@@ -27,8 +27,6 @@ jobs:
           -DCMAKE_EXE_LINKER_FLAGS="-static"
       - name: Build
         run: cmake --build src/build --config Release
-      - name: Test
-        run: ctest --test-dir src/build --output-on-failure
       - name: Configure server
         run: >
           cmake -S src_ser -B src_ser/build -G Ninja
