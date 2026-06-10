@@ -1,25 +1,19 @@
-#include "stun.hpp"
+#include "stun_utils.h"
 
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
 
 #include <arpa/inet.h>
-#include <fcntl.h>
 #include <netdb.h>
-#include <poll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
 
-#include <array>
-#include <cerrno>
 #include <cstring>
 #include <memory>
 #include <random>
-#include <sstream>
 #include <stdexcept>
-#include <utility>
 
 namespace natcli {
 namespace {
@@ -30,124 +24,6 @@ constexpr std::uint16_t kChangedAddress = 0x0005;
 constexpr std::uint16_t kXorMappedAddress = 0x0020;
 constexpr std::uint16_t kOtherAddress = 0x802C;
 constexpr std::uint32_t kMagicCookie = 0x2112A442u;
-
-struct SocketAddress {
-    sockaddr_storage storage{};
-    socklen_t length{};
-};
-
-std::runtime_error system_error(const std::string& message) {
-    return std::runtime_error(message + ": " + std::strerror(errno));
-}
-
-SocketAddress to_sockaddr(const IpEndpoint& endpoint) {
-    SocketAddress result;
-    result.length = endpoint.family == AF_INET ? sizeof(sockaddr_in) : sizeof(sockaddr_in6);
-    if (endpoint.family == AF_INET) {
-        auto* address = reinterpret_cast<sockaddr_in*>(&result.storage);
-        address->sin_family = AF_INET;
-        address->sin_port = htons(endpoint.port);
-        std::memcpy(&address->sin_addr, endpoint.address.data(), 4);
-    } else if (endpoint.family == AF_INET6) {
-        auto* address = reinterpret_cast<sockaddr_in6*>(&result.storage);
-        address->sin6_family = AF_INET6;
-        address->sin6_port = htons(endpoint.port);
-        std::memcpy(&address->sin6_addr, endpoint.address.data(), 16);
-    } else {
-        throw std::runtime_error("Unsupported address family");
-    }
-    return result;
-}
-
-IpEndpoint from_sockaddr(const sockaddr* address, socklen_t length) {
-    (void)length;
-    IpEndpoint result;
-    if (address->sa_family == AF_INET) {
-        const auto* ipv4 = reinterpret_cast<const sockaddr_in*>(address);
-        result.family = AF_INET;
-        result.address_length = 4;
-        result.port = ntohs(ipv4->sin_port);
-        std::memcpy(result.address.data(), &ipv4->sin_addr, 4);
-        return result;
-    }
-    if (address->sa_family == AF_INET6) {
-        const auto* ipv6 = reinterpret_cast<const sockaddr_in6*>(address);
-        result.family = AF_INET6;
-        result.address_length = 16;
-        result.port = ntohs(ipv6->sin6_port);
-        std::memcpy(result.address.data(), &ipv6->sin6_addr, 16);
-        return result;
-    }
-    throw std::runtime_error("Unsupported sockaddr family");
-}
-
-IpEndpoint socket_local_endpoint(int socket_fd) {
-    sockaddr_storage storage{};
-    socklen_t length = sizeof(storage);
-    if (getsockname(socket_fd, reinterpret_cast<sockaddr*>(&storage), &length) != 0) {
-        throw system_error("getsockname failed");
-    }
-    return from_sockaddr(reinterpret_cast<sockaddr*>(&storage), length);
-}
-
-void set_socket_timeouts(int socket_fd, std::chrono::milliseconds timeout) {
-    timeval value{};
-    value.tv_sec = static_cast<long>(timeout.count() / 1000);
-    value.tv_usec = static_cast<long>((timeout.count() % 1000) * 1000);
-    setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO, &value, sizeof(value));
-    setsockopt(socket_fd, SOL_SOCKET, SO_SNDTIMEO, &value, sizeof(value));
-}
-
-void bind_if_needed(int socket_fd, const IpEndpoint& local_bind) {
-    SocketAddress address = to_sockaddr(local_bind);
-    int reuse = 1;
-    setsockopt(socket_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-    if (bind(socket_fd, reinterpret_cast<sockaddr*>(&address.storage), address.length) != 0) {
-        throw system_error("bind failed");
-    }
-}
-
-void connect_with_timeout(int socket_fd, const IpEndpoint& remote, std::chrono::milliseconds timeout) {
-    SocketAddress address = to_sockaddr(remote);
-    const int flags = fcntl(socket_fd, F_GETFL, 0);
-    if (flags < 0) {
-        throw system_error("fcntl(F_GETFL) failed");
-    }
-    if (fcntl(socket_fd, F_SETFL, flags | O_NONBLOCK) != 0) {
-        throw system_error("fcntl(F_SETFL) failed");
-    }
-
-    int rc = connect(socket_fd, reinterpret_cast<sockaddr*>(&address.storage), address.length);
-    if (rc != 0 && errno != EINPROGRESS) {
-        throw system_error("connect failed");
-    }
-
-    pollfd descriptor{socket_fd, POLLOUT, 0};
-    rc = poll(&descriptor, 1, static_cast<int>(timeout.count()));
-    if (rc <= 0) {
-        throw std::runtime_error("connect timed out");
-    }
-
-    int error = 0;
-    socklen_t error_length = sizeof(error);
-    if (getsockopt(socket_fd, SOL_SOCKET, SO_ERROR, &error, &error_length) != 0) {
-        throw system_error("getsockopt(SO_ERROR) failed");
-    }
-    if (error != 0) {
-        errno = error;
-        throw system_error("connect failed");
-    }
-
-    if (fcntl(socket_fd, F_SETFL, flags) != 0) {
-        throw system_error("fcntl restore failed");
-    }
-}
-
-bool wait_for_readable(int socket_fd, std::chrono::milliseconds timeout) {
-    pollfd descriptor{socket_fd, POLLIN, 0};
-    int rc = poll(&descriptor, 1, static_cast<int>(timeout.count()));
-    return rc > 0 && (descriptor.revents & POLLIN) != 0;
-}
 
 bool is_ip_literal(const std::string& value) {
     in_addr address4{};
@@ -496,7 +372,8 @@ UdpSession::UdpSession(const IpEndpoint& server, const std::optional<IpEndpoint>
         throw system_error("socket failed");
     }
     try {
-        bind_if_needed(socket_, local_bind.value_or(wildcard_endpoint(server.family)));
+        set_reuse_options(socket_);
+        bind_socket(socket_, local_bind.value_or(wildcard_endpoint(server.family)));
         set_socket_timeouts(socket_, timeout_);
     } catch (...) {
         close(socket_);
@@ -516,13 +393,13 @@ std::optional<StunResponse> UdpSession::request(const StunDiscoveryAction& actio
     SocketAddress remote = to_sockaddr(action.send_to);
 
     const auto deadline = std::chrono::steady_clock::now() + timeout_;
-    
-    // RFC 5389 推荐的初始重传超时时间 (RTO) 为 500ms
-    std::chrono::milliseconds rto(500); 
+
+    // RFC 5389 recommended initial retransmission timeout (RTO) is 500ms
+    std::chrono::milliseconds rto(500);
     std::vector<std::uint8_t> buffer(65536);
 
     while (std::chrono::steady_clock::now() < deadline) {
-        // 1. 发送 (或重传) STUN 请求包
+        // 1. Send (or retransmit) STUN request packet
         ssize_t sent = sendto(socket_, payload.data(), payload.size(), 0, reinterpret_cast<sockaddr*>(&remote.storage), remote.length);
         if (sent < 0) {
             throw system_error("sendto failed");
@@ -530,21 +407,21 @@ std::optional<StunResponse> UdpSession::request(const StunDiscoveryAction& actio
 
         auto next_resend_time = std::chrono::steady_clock::now() + rto;
 
-        // 2. 在当前 RTO 窗口内，循环等待并接收响应
+        // 2. Within the current RTO window, loop to wait for and receive response
         while (std::chrono::steady_clock::now() < std::min(next_resend_time, deadline)) {
             auto now = std::chrono::steady_clock::now();
             auto wait_time = std::chrono::duration_cast<std::chrono::milliseconds>(std::min(next_resend_time, deadline) - now);
-            
+
             if (wait_time.count() <= 0) {
                 break;
             }
 
-            // 等待 Socket 可读
+            // Wait for socket to become readable
             if (!wait_for_readable(socket_, wait_time)) {
-                break; // 当前 RTO 超时，跳出内层循环去重传
+                break; // Current RTO timed out, exit inner loop to retransmit
             }
 
-            // Socket 可读，接收数据
+            // Socket is readable, receive data
             sockaddr_storage response_remote{};
             socklen_t response_length = sizeof(response_remote);
             ssize_t received = recvfrom(socket_, buffer.data(), buffer.size(), 0, reinterpret_cast<sockaddr*>(&response_remote), &response_length);
@@ -555,28 +432,28 @@ std::optional<StunResponse> UdpSession::request(const StunDiscoveryAction& actio
                 throw system_error("recvfrom failed");
             }
 
-            // 解析 STUN 消息
+            // Parse STUN message
             StunMessage response_message;
             if (!parse_message(buffer.data(), static_cast<std::size_t>(received), response_message)) {
-                continue; // 可能是杂音数据，忽略并继续等待
-            }
-            
-            // 校验 Magic Cookie 和 Transaction ID 是否匹配
-            if (response_message.magic_cookie != action.message.magic_cookie || 
-                response_message.transaction_id != action.message.transaction_id) {
-                continue; // 不是当前请求的响应，忽略并继续等待
+                continue; // May be noise data, ignore and continue waiting
             }
 
-            // 成功匹配，返回结果
+            // Verify Magic Cookie and Transaction ID match
+            if (response_message.magic_cookie != action.message.magic_cookie ||
+                response_message.transaction_id != action.message.transaction_id) {
+                continue; // Not a response to the current request, ignore and continue waiting
+            }
+
+            // Successfully matched, return result
             return StunResponse{response_message, from_sockaddr(reinterpret_cast<sockaddr*>(&response_remote), response_length),
                                 socket_local_endpoint(socket_)};
         }
 
-        // 3. 指数退避：如果没收到响应，把等待时间翻倍
-        rto *= 2; 
+        // 3. Exponential backoff: if no response received, double the wait time
+        rto *= 2;
     }
 
-    // 达到总超时时间，彻底失败
+    // Total timeout reached, complete failure
     return std::nullopt;
 }
 
@@ -598,7 +475,8 @@ std::optional<StunResponse> TcpSession::request(const StunDiscoveryAction& actio
     }
 
     try {
-        bind_if_needed(socket_fd, local_bind_.value_or(wildcard_endpoint(action.send_to.family)));
+        set_reuse_options(socket_fd);
+        bind_socket(socket_fd, local_bind_.value_or(wildcard_endpoint(action.send_to.family)));
         connect_with_timeout(socket_fd, action.send_to, timeout_);
         set_socket_timeouts(socket_fd, timeout_);
 

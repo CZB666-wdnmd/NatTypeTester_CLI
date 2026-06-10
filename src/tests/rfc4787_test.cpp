@@ -1,7 +1,7 @@
-#include "rfc4787.hpp"
-
-#include "discovery.hpp"
-#include "rfc5382.hpp"
+#include "rfc4787_test.h"
+#include "../utils/hairpin_utils.h"
+#include "../utils/stun_utils.h"
+#include "../utils/net_utils.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -15,49 +15,76 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstring>
+#include <iostream>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace natcli {
 namespace {
 
-struct SocketAddress {
-    sockaddr_storage storage{};
-    socklen_t length{};
-};
+// ---- Test wrapper helpers ----
 
-SocketAddress to_sockaddr(const IpEndpoint& endpoint) {
-    SocketAddress result;
-    result.length = endpoint.family == AF_INET ? sizeof(sockaddr_in) : sizeof(sockaddr_in6);
-    if (endpoint.family == AF_INET) {
-        auto* address = reinterpret_cast<sockaddr_in*>(&result.storage);
-        address->sin_family = AF_INET;
-        address->sin_port = htons(endpoint.port);
-        std::memcpy(&address->sin_addr, endpoint.address.data(), 4);
-        return result;
+std::string require_option(const std::map<std::string, std::string>& options, const std::string& name) {
+    auto it = options.find(name);
+    if (it == options.end()) {
+        throw std::runtime_error("Missing required option: " + name);
     }
-    auto* address = reinterpret_cast<sockaddr_in6*>(&result.storage);
-    address->sin6_family = AF_INET6;
-    address->sin6_port = htons(endpoint.port);
-    std::memcpy(&address->sin6_addr, endpoint.address.data(), 16);
-    return result;
+    return it->second;
 }
 
-bool wait_for_readable(int socket_fd, std::chrono::milliseconds timeout) {
-    pollfd descriptor{socket_fd, POLLIN, 0};
-    int rc = poll(&descriptor, 1, static_cast<int>(timeout.count()));
-    return rc > 0 && (descriptor.revents & POLLIN) != 0;
+std::optional<std::string> find_option(const std::map<std::string, std::string>& options, const std::string& name) {
+    auto it = options.find(name);
+    if (it == options.end()) {
+        return std::nullopt;
+    }
+    return it->second;
 }
 
-void set_reuse_options(int socket_fd) {
-    int reuse = 1;
-    setsockopt(socket_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-#ifdef SO_REUSEPORT
-    setsockopt(socket_fd, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse));
-#endif
+Rfc4787TestType parse_rfc4787_test_type(const std::map<std::string, std::string>& options) {
+    std::string value = find_option(options, "--test-type").value_or("all");
+    if (value == "all") return Rfc4787TestType::All;
+    if (value == "mapping") return Rfc4787TestType::Mapping;
+    if (value == "filtering") return Rfc4787TestType::Filtering;
+    if (value == "port-allocation") return Rfc4787TestType::PortAllocation;
+    if (value == "icmp") return Rfc4787TestType::Icmp;
+    if (value == "fragmentation") return Rfc4787TestType::Fragmentation;
+    if (value == "determinism") return Rfc4787TestType::Determinism;
+    if (value == "port-overloading") return Rfc4787TestType::PortOverloading;
+    throw std::runtime_error("Unsupported RFC4787 test type: " + value);
 }
+
+std::optional<IpEndpoint> parse_local_bind(const std::map<std::string, std::string>& options, int family, int socket_type) {
+    std::optional<std::string> local = find_option(options, "--local");
+    if (!local.has_value()) return std::nullopt;
+    auto [host, port] = split_host_port(*local, 0);
+    return resolve_endpoint(host, port, socket_type, family);
+}
+
+void print_row(const std::string& key, const std::string& value) {
+    std::cout << key << ": " << value << '\n';
+}
+
+std::string endpoint_or_dash(const std::optional<IpEndpoint>& endpoint) {
+    return endpoint.has_value() ? to_string(*endpoint) : "-";
+}
+
+void print_binding_if_available(BindingTestResult r) {
+    if (r != BindingTestResult::Unknown) print_row("BindingTest", to_string(r));
+}
+
+void print_mapping_if_available(MappingBehavior b) {
+    if (b != MappingBehavior::Unknown) print_row("MappingBehavior", to_string(b));
+}
+
+void print_probe_if_available(const std::string& name, ProbeStatus s) {
+    if (s != ProbeStatus::Unknown) print_row(name, to_string(s));
+}
+
+// ---- RFC4787 business logic helpers ----
 
 ProbeStatus evaluate_port_range(const std::optional<IpEndpoint>& local, const std::optional<IpEndpoint>& mapped) {
     if (!local.has_value() || !mapped.has_value()) {
@@ -314,6 +341,68 @@ ProbeStatus run_udp_out_of_order_fragment_probe(const IpEndpoint& primary_server
 
 } // namespace
 
+void Rfc4787Test::parseArgs(const std::map<std::string, std::string>& options) {
+    constexpr std::uint16_t default_port = 3478;
+    auto [stun_host, stun_port] = split_host_port(require_option(options, "--stun_server"), default_port);
+    stun_server_ = resolve_endpoint(stun_host, stun_port, SOCK_DGRAM);
+    options_.server_name = stun_host;
+
+    auto [primary_host, primary_port] = split_host_port(require_option(options, "--primary_server"), default_port);
+    auto [secondary_host, secondary_port] = split_host_port(require_option(options, "--secondary_server"), default_port);
+    primary_server_ = resolve_endpoint(primary_host, primary_port, SOCK_STREAM, stun_server_.family);
+    secondary_server_ = resolve_endpoint(secondary_host, secondary_port, SOCK_STREAM, stun_server_.family);
+
+    if (std::optional<std::string> timeout = find_option(options, "--timeout-ms"); timeout.has_value()) {
+        options_.timeout = std::chrono::milliseconds(std::stoi(*timeout));
+    }
+
+    test_type_ = parse_rfc4787_test_type(options);
+    local_bind_ = parse_local_bind(options, stun_server_.family, SOCK_DGRAM);
+}
+
+int Rfc4787Test::runTest() {
+    Rfc4787Result result = run_rfc4787_tests(options_, test_type_, stun_server_, primary_server_, secondary_server_, local_bind_);
+    print_binding_if_available(result.binding_test_result);
+    print_mapping_if_available(result.mapping_behavior);
+    if (result.filtering_behavior != FilteringBehavior::Unknown) {
+        print_row("FilteringBehavior", to_string(result.filtering_behavior));
+    }
+    print_probe_if_available("PortRangePreservation", result.port_range_preservation);
+    print_probe_if_available("PortParityPreservation", result.port_parity_preservation);
+    print_probe_if_available("IcmpErrorHandling", result.icmp_error_handling);
+    print_probe_if_available("UdpHairpinning", result.udp_hairpinning);
+    print_probe_if_available("UdpHairpinningSourceAddress", result.udp_hairpinning_source_address);
+    print_probe_if_available("OutboundFragmentation", result.outbound_fragmentation);
+    print_probe_if_available("OutboundDfFragmentationError", result.outbound_df_fragmentation_error);
+    print_probe_if_available("InboundFragmentation", result.inbound_fragmentation);
+    print_probe_if_available("OutOfOrderFragmentation", result.out_of_order_fragmentation);
+
+    // Determinism test (multi-round consistency)
+    if (test_type_ == Rfc4787TestType::Determinism || test_type_ == Rfc4787TestType::All) {
+        DeterminismCheckResult det = run_determinism_check(options_, stun_server_, local_bind_, 3);
+        print_probe_if_available("DeterminismMappingConsistent", det.mapping_consistent);
+        print_probe_if_available("DeterminismFilteringConsistent", det.filtering_consistent);
+        print_probe_if_available("DeterminismPortRangeConsistent", det.port_range_consistent);
+        print_probe_if_available("DeterminismPortParityConsistent", det.port_parity_consistent);
+    }
+
+    // Port Overloading test
+    if (test_type_ == Rfc4787TestType::PortOverloading || test_type_ == Rfc4787TestType::All) {
+        ProbeStatus overloading = run_port_overloading_test(options_, stun_server_,
+                                                             primary_server_, secondary_server_, local_bind_);
+        print_probe_if_available("PortOverloading", overloading);
+    }
+
+    print_row("PublicEnd", endpoint_or_dash(result.public_endpoint));
+    print_row("LocalEnd", endpoint_or_dash(result.local_endpoint));
+    return 0;
+}
+
+void Rfc4787Test::printHelp() const {
+    std::cout << "  nat_type_tester_cli rfc4787 --stun_server host[:port] --primary_server host[:port] --secondary_server host[:port]\n"
+              << "                               [--local host[:port]] [--test-type all|mapping|filtering|port-allocation|icmp|fragmentation|determinism|port-overloading] [--timeout-ms 3000]\n";
+}
+
 Rfc4787Result run_rfc4787_tests(const RequestOptions& options,
                                 Rfc4787TestType test_type,
                                 const IpEndpoint& stun_server,
@@ -362,7 +451,97 @@ Rfc4787Result run_rfc4787_tests(const RequestOptions& options,
             run_udp_out_of_order_fragment_probe(primary_server, local_bind, options.timeout);
     }
 
+    if (run_all || test_type == Rfc4787TestType::Determinism) {
+        DeterminismCheckResult det = run_determinism_check(options, stun_server, local_bind, 3);
+        (void)det; // Determinism results are printed by the caller (runTest / print)
+    }
+
+    if (run_all || test_type == Rfc4787TestType::PortOverloading) {
+        (void)run_port_overloading_test(options, stun_server, primary_server, secondary_server, local_bind);
+    }
+
     return result;
+}
+
+// ---- Determinism Check (RFC 4787 REQ-11) ----
+DeterminismCheckResult run_determinism_check(const RequestOptions& options,
+                                             const IpEndpoint& server,
+                                             const std::optional<IpEndpoint>& local_bind,
+                                             int rounds) {
+    DeterminismCheckResult result;
+    result.rounds = rounds;
+    if (rounds < 2) rounds = 2;
+
+    // First round as baseline
+    StunResult5389 baseline = run_rfc5780_test(options, StunTestType::Combining, server, local_bind);
+    ProbeStatus baseline_range = evaluate_port_range(baseline.local_endpoint, baseline.public_endpoint);
+    ProbeStatus baseline_parity = evaluate_port_parity(baseline.local_endpoint, baseline.public_endpoint);
+
+    result.mapping_consistent = ProbeStatus::Pass;
+    result.filtering_consistent = ProbeStatus::Pass;
+    result.port_range_consistent = ProbeStatus::Pass;
+    result.port_parity_consistent = ProbeStatus::Pass;
+
+    for (int i = 0; i < rounds - 1; ++i) {
+        StunResult5389 round = run_rfc5780_test(options, StunTestType::Combining, server, local_bind);
+        if (round.mapping_behavior != baseline.mapping_behavior) result.mapping_consistent = ProbeStatus::Fail;
+        if (round.filtering_behavior != baseline.filtering_behavior) result.filtering_consistent = ProbeStatus::Fail;
+        ProbeStatus r_range = evaluate_port_range(round.local_endpoint, round.public_endpoint);
+        if (r_range != baseline_range) result.port_range_consistent = ProbeStatus::Fail;
+        ProbeStatus r_parity = evaluate_port_parity(round.local_endpoint, round.public_endpoint);
+        if (r_parity != baseline_parity) result.port_parity_consistent = ProbeStatus::Fail;
+    }
+    return result;
+}
+
+// ---- Port Overloading Test (RFC 4787 REQ-3) ----
+ProbeStatus run_port_overloading_test(const RequestOptions& options,
+                                      const IpEndpoint& stun_server,
+                                      const IpEndpoint& primary_server,
+                                      const IpEndpoint& secondary_server,
+                                      const std::optional<IpEndpoint>& local_bind) {
+    int sock1 = socket(stun_server.family, SOCK_DGRAM, IPPROTO_UDP);
+    int sock2 = socket(stun_server.family, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock1 < 0 || sock2 < 0) {
+        if (sock1 >= 0) close(sock1);
+        if (sock2 >= 0) close(sock2);
+        return ProbeStatus::Inconclusive;
+    }
+    set_reuse_options(sock1);
+    set_reuse_options(sock2);
+    IpEndpoint bind_addr = local_bind.value_or(wildcard_endpoint(stun_server.family));
+    bind_socket(sock1, bind_addr);
+    bind_socket(sock2, bind_addr);
+
+    // Get NAT-assigned external endpoints for both sockets
+    StunMessage req = create_binding_request(0x2112A442u);
+    std::vector<std::uint8_t> payload = serialize(req);
+
+    auto do_request = [&](int fd, const IpEndpoint& target) -> std::optional<IpEndpoint> {
+        SocketAddress remote = to_sockaddr(target);
+        sendto(fd, payload.data(), payload.size(), 0,
+               reinterpret_cast<sockaddr*>(&remote.storage), remote.length);
+        if (!wait_for_readable(fd, options.timeout)) return std::nullopt;
+        std::array<std::uint8_t, 2048> buf{};
+        sockaddr_storage from{};
+        socklen_t from_len = sizeof(from);
+        ssize_t r = recvfrom(fd, buf.data(), buf.size(), 0,
+                             reinterpret_cast<sockaddr*>(&from), &from_len);
+        if (r <= 0) return std::nullopt;
+        StunMessage msg;
+        if (!parse_message(buf.data(), static_cast<std::size_t>(r), msg)) return std::nullopt;
+        return get_xor_mapped_address_attribute(msg);
+    };
+
+    auto map1 = do_request(sock1, primary_server);
+    auto map2 = do_request(sock2, secondary_server);
+    close(sock1);
+    close(sock2);
+
+    if (!map1.has_value() || !map2.has_value()) return ProbeStatus::Inconclusive;
+
+    bool same_external = (map1->port == map2->port) && same_address(*map1, *map2);
+    return same_external ? ProbeStatus::Fail : ProbeStatus::Pass;
 }
 
 } // namespace natcli

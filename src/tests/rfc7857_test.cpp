@@ -1,6 +1,6 @@
-#include "rfc7857.hpp"
-
-#include "discovery.hpp"
+#include "rfc7857_test.h"
+#include "../utils/stun_utils.h"
+#include "../utils/net_utils.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -13,7 +13,9 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <chrono>
 #include <cstring>
+#include <iostream>
 #include <random>
 #include <sstream>
 #include <stdexcept>
@@ -22,15 +24,42 @@
 
 namespace natcli {
 
+// Forward declaration for analyze_port_allocation_behavior used in anonymous namespace
 std::string analyze_port_allocation_behavior(const std::vector<std::uint16_t>& local_ports,
                                              const std::vector<std::uint16_t>& public_ports);
 
 namespace {
 
-struct SocketAddress {
-    sockaddr_storage storage{};
-    socklen_t length{};
-};
+// ---- Test wrapper helpers ----
+
+std::string require_option(const std::map<std::string, std::string>& options, const std::string& name) {
+    auto it = options.find(name);
+    if (it == options.end()) throw std::runtime_error("Missing required option: " + name);
+    return it->second;
+}
+
+std::optional<std::string> find_option(const std::map<std::string, std::string>& options, const std::string& name) {
+    auto it = options.find(name);
+    if (it == options.end()) return std::nullopt;
+    return it->second;
+}
+
+std::optional<IpEndpoint> parse_local_bind(const std::map<std::string, std::string>& options, int family, int socket_type) {
+    std::optional<std::string> local = find_option(options, "--local");
+    if (!local.has_value()) return std::nullopt;
+    auto [host, port] = split_host_port(*local, 0);
+    return resolve_endpoint(host, port, socket_type, family);
+}
+
+void print_row(const std::string& key, const std::string& value) {
+    std::cout << key << ": " << value << '\n';
+}
+
+std::string endpoint_or_dash(const std::optional<IpEndpoint>& endpoint) {
+    return endpoint.has_value() ? to_string(*endpoint) : "-";
+}
+
+// ---- RFC7857 business logic helpers ----
 
 struct PortRandomizationProbeResult {
     ProbeStatus status{ProbeStatus::Unknown};
@@ -38,103 +67,6 @@ struct PortRandomizationProbeResult {
     std::vector<std::uint16_t> local_ports;
     std::string allocation_behavior;
 };
-
-std::runtime_error system_error(const std::string& message) {
-    return std::runtime_error(message + ": " + std::strerror(errno));
-}
-
-SocketAddress to_sockaddr(const IpEndpoint& endpoint) {
-    SocketAddress result;
-    result.length = endpoint.family == AF_INET ? sizeof(sockaddr_in) : sizeof(sockaddr_in6);
-    if (endpoint.family == AF_INET) {
-        auto* address = reinterpret_cast<sockaddr_in*>(&result.storage);
-        address->sin_family = AF_INET;
-        address->sin_port = htons(endpoint.port);
-        std::memcpy(&address->sin_addr, endpoint.address.data(), 4);
-        return result;
-    }
-    auto* address = reinterpret_cast<sockaddr_in6*>(&result.storage);
-    address->sin6_family = AF_INET6;
-    address->sin6_port = htons(endpoint.port);
-    std::memcpy(&address->sin6_addr, endpoint.address.data(), 16);
-    return result;
-}
-
-IpEndpoint from_sockaddr(const sockaddr* address, socklen_t length) {
-    (void)length;
-    IpEndpoint result;
-    if (address->sa_family == AF_INET) {
-        const auto* ipv4 = reinterpret_cast<const sockaddr_in*>(address);
-        result.family = AF_INET;
-        result.address_length = 4;
-        result.port = ntohs(ipv4->sin_port);
-        std::memcpy(result.address.data(), &ipv4->sin_addr, 4);
-        return result;
-    }
-    if (address->sa_family == AF_INET6) {
-        const auto* ipv6 = reinterpret_cast<const sockaddr_in6*>(address);
-        result.family = AF_INET6;
-        result.address_length = 16;
-        result.port = ntohs(ipv6->sin6_port);
-        std::memcpy(result.address.data(), &ipv6->sin6_addr, 16);
-        return result;
-    }
-    throw std::runtime_error("Unsupported sockaddr family");
-}
-
-void set_reuse_options(int socket_fd) {
-    int reuse = 1;
-    setsockopt(socket_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-#ifdef SO_REUSEPORT
-    setsockopt(socket_fd, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse));
-#endif
-}
-
-bool wait_for_readable(int socket_fd, std::chrono::milliseconds timeout) {
-    pollfd descriptor{socket_fd, POLLIN, 0};
-    int rc = poll(&descriptor, 1, static_cast<int>(timeout.count()));
-    return rc > 0 && (descriptor.revents & POLLIN) != 0;
-}
-
-void send_all(int socket_fd, std::string_view payload) {
-    std::size_t offset = 0;
-    while (offset < payload.size()) {
-        ssize_t written = send(socket_fd, payload.data() + offset, payload.size() - offset, 0);
-        if (written <= 0) {
-            throw system_error("send failed");
-        }
-        offset += static_cast<std::size_t>(written);
-    }
-}
-
-std::string recv_line(int socket_fd, std::chrono::milliseconds timeout) {
-    std::string line;
-    std::array<char, 256> buffer{};
-    while (line.find('\n') == std::string::npos) {
-        if (!wait_for_readable(socket_fd, timeout)) {
-            throw std::runtime_error("recv timed out");
-        }
-        ssize_t received = recv(socket_fd, buffer.data(), buffer.size(), 0);
-        if (received <= 0) {
-            throw std::runtime_error("peer closed connection");
-        }
-        line.append(buffer.data(), static_cast<std::size_t>(received));
-        if (line.size() > 4096) {
-            throw std::runtime_error("protocol line too long");
-        }
-    }
-    return line.substr(0, line.find('\n'));
-}
-
-std::optional<IpEndpoint> parse_endpoint_line(const std::string& line, int family) {
-    std::istringstream stream(line);
-    std::string host;
-    std::uint16_t port = 0;
-    if (!(stream >> host >> port)) {
-        return std::nullopt;
-    }
-    return resolve_endpoint(host, port, SOCK_STREAM, family);
-}
 
 std::string join_ports(const std::vector<std::uint16_t>& ports) {
     if (ports.empty()) {
@@ -217,68 +149,6 @@ PortRandomizationProbeResult run_section9_port_randomization_probe(const IpEndpo
     result.status = classify_rfc7857_port_randomization(result.public_ports);
     result.allocation_behavior = analyze_port_allocation_behavior(result.local_ports, result.public_ports);
     return result;
-}
-
-ProbeStatus merge_probe_status(ProbeStatus left, ProbeStatus right) {
-    if (left == ProbeStatus::Fail || right == ProbeStatus::Fail) {
-        return ProbeStatus::Fail;
-    }
-    if (left == ProbeStatus::Pass && right == ProbeStatus::Pass) {
-        return ProbeStatus::Pass;
-    }
-    if (left == ProbeStatus::Unknown || right == ProbeStatus::Unknown) {
-        return ProbeStatus::Unknown;
-    }
-    return ProbeStatus::Inconclusive;
-}
-
-std::uint16_t calculate_checksum(const void* data, std::size_t len) {
-    const auto* bytes = static_cast<const std::uint8_t*>(data);
-    std::uint32_t sum = 0;
-    while (len >= 2) {
-        sum += static_cast<std::uint16_t>((static_cast<std::uint16_t>(bytes[0]) << 8) | bytes[1]);
-        bytes += 2;
-        len -= 2;
-    }
-    if (len == 1) {
-        sum += static_cast<std::uint16_t>(static_cast<std::uint16_t>(bytes[0]) << 8);
-    }
-    while (sum >> 16) {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-    return static_cast<std::uint16_t>(~sum);
-}
-
-std::uint16_t calculate_udp_checksum_ipv4(const iphdr& ip_header,
-                                          const udphdr& udp_header,
-                                          const std::uint8_t* payload,
-                                          std::size_t payload_len) {
-    std::uint32_t sum = 0;
-
-    auto add_buffer = [&](const void* data, std::size_t len) {
-        const auto* bytes = static_cast<const std::uint8_t*>(data);
-        while (len >= 2) {
-            sum += static_cast<std::uint16_t>((static_cast<std::uint16_t>(bytes[0]) << 8) | bytes[1]);
-            bytes += 2;
-            len -= 2;
-        }
-        if (len == 1) {
-            sum += static_cast<std::uint16_t>(static_cast<std::uint16_t>(bytes[0]) << 8);
-        }
-    };
-
-    add_buffer(&ip_header.saddr, 4);
-    add_buffer(&ip_header.daddr, 4);
-    std::uint16_t protocol_word = htons(IPPROTO_UDP);
-    add_buffer(&protocol_word, 2);
-    add_buffer(&udp_header.len, 2);
-    add_buffer(&udp_header, sizeof(udphdr));
-    add_buffer(payload, payload_len);
-
-    while (sum >> 16) {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-    return static_cast<std::uint16_t>(~sum);
 }
 
 std::optional<std::array<std::uint8_t, 4>> resolve_local_ipv4_for_server(const IpEndpoint& server) {
@@ -466,6 +336,8 @@ ProbeStatus classify_port_parity(const std::optional<IpEndpoint>& local,
 
 } // namespace
 
+// ---- RFC7857 classification functions ----
+
 ProbeStatus classify_rfc7857_eim_protocol_independence(const std::optional<IpEndpoint>& udp_public,
                                                        const std::optional<IpEndpoint>& tcp_public) {
     if (!udp_public.has_value() || !tcp_public.has_value()) {
@@ -511,7 +383,7 @@ std::string analyze_port_allocation_behavior(const std::vector<std::uint16_t>& l
         return "Unknown";
     }
 
-    // 1. 检查 Preserved (端口保留：公网端口 == 本地端口)
+    // 1. Check Preserved (public port == local port)
     bool is_preserved = true;
     for (std::size_t i = 0; i < public_ports.size(); ++i) {
         if (public_ports[i] != local_ports[i]) {
@@ -523,7 +395,7 @@ std::string analyze_port_allocation_behavior(const std::vector<std::uint16_t>& l
         return "Preserved (Delta = 0, Port = LocalPort)";
     }
 
-    // 2. 计算 Delta (连续公网端口之间的差值)
+    // 2. Calculate Delta (difference between consecutive public ports)
     std::size_t sequential_count = 0;
     std::uint16_t min_port = public_ports[0];
     std::uint16_t max_port = public_ports[0];
@@ -545,18 +417,64 @@ std::string analyze_port_allocation_behavior(const std::vector<std::uint16_t>& l
         }
     }
 
-    // 如果 70% 以上的分配是递增 1 或 2，判定为 Sequential
+    // If 70% or more allocations increment by 1 or 2, classify as Sequential
     if (sequential_count >= (public_ports.size() - 1) * 0.7) {
         return "Sequential (Delta = +1 or +2)";
     }
 
-    // 3. 检查 Contiguous Port Block (在一个紧凑的端口块内，比如 CGNAT 分配了 256 个端口的块)
+    // 3. Check Contiguous Port Block (within a narrow port block, e.g., CGNAT 256-port block)
     if ((max_port - min_port) < 100) {
         return "Contiguous Port Block (Narrow Range)";
     }
 
-    // 4. 其余情况视为 Random
+    // 4. Everything else is Random
     return "Random";
+}
+
+// ---- Rfc7857Test methods ----
+
+void Rfc7857Test::parseArgs(const std::map<std::string, std::string>& options) {
+    constexpr std::uint16_t default_port = 3478;
+    auto [stun_host, stun_port] = split_host_port(require_option(options, "--stun_server"), default_port);
+    stun_server_ = resolve_endpoint(stun_host, stun_port, SOCK_DGRAM);
+    options_.server_name = stun_host;
+
+    auto [primary_host, primary_port] = split_host_port(require_option(options, "--primary_server"), default_port);
+    auto [secondary_host, secondary_port] = split_host_port(require_option(options, "--secondary_server"), default_port);
+    primary_server_ = resolve_endpoint(primary_host, primary_port, SOCK_STREAM, stun_server_.family);
+    secondary_server_ = resolve_endpoint(secondary_host, secondary_port, SOCK_STREAM, stun_server_.family);
+
+    if (std::optional<std::string> timeout = find_option(options, "--timeout-ms"); timeout.has_value()) {
+        options_.timeout = std::chrono::milliseconds(std::stoi(*timeout));
+    }
+
+    local_bind_ = parse_local_bind(options, stun_server_.family, SOCK_STREAM);
+}
+
+int Rfc7857Test::runTest() {
+    Rfc7857Result result = run_rfc7857_tests(options_, stun_server_, primary_server_, secondary_server_, local_bind_);
+    print_row("UdpMappingBehavior", to_string(result.udp_mapping_behavior));
+    print_row("UdpFilteringBehavior", to_string(result.udp_filtering_behavior));
+    print_row("TcpFilteringBehavior", to_string(result.tcp_filtering_behavior));
+    print_row("EimProtocolIndependence", to_string(result.eim_protocol_independence));
+    print_row("EifProtocolIndependence", to_string(result.eif_protocol_independence));
+    print_row("PortParityPreservation", to_string(result.port_parity_preservation));
+    print_row("UdpHairpinning", to_string(result.udp_hairpinning));
+    print_row("TcpHairpinning", to_string(result.tcp_hairpinning));
+    print_row("IcmpHairpinning", to_string(result.icmp_hairpinning));
+    print_row("PortRandomization", to_string(result.section9_port_randomization));
+    print_row("PublicPorts", result.section9_public_ports.empty() ? "-" : result.section9_public_ports);
+    print_row("AllocationBehavior", result.section9_allocation_behavior.empty() ? "-" : result.section9_allocation_behavior);
+    print_row("Ipv4IdPreservation", to_string(result.section10_ipv4_id_preservation));
+    print_row("UdpPublicEnd", endpoint_or_dash(result.udp_public_endpoint));
+    print_row("TcpPublicEnd", endpoint_or_dash(result.tcp_public_endpoint));
+    print_row("LocalEnd", endpoint_or_dash(result.local_endpoint));
+    return 0;
+}
+
+void Rfc7857Test::printHelp() const {
+    std::cout << "  nat_type_tester_cli rfc7857 --stun_server host[:port] --primary_server host[:port] --secondary_server host[:port]\n"
+              << "                               [--local host[:port]] [--timeout-ms 3000]\n";
 }
 
 Rfc7857Result run_rfc7857_tests(const RequestOptions& options,
@@ -586,7 +504,7 @@ Rfc7857Result run_rfc7857_tests(const RequestOptions& options,
         classify_port_parity(result.local_endpoint, result.udp_public_endpoint, result.tcp_public_endpoint);
     result.udp_hairpinning = run_udp_hairpinning_test(options, stun_server, local_bind);
     result.tcp_hairpinning = tcp_result.tcp_hairpinning;
-    result.icmp_hairpinning = run_rfc7857_icmp_hairpinning_test(options, stun_server, primary_server, local_bind);
+    result.icmp_hairpinning = run_rfc7857_cross_protocol_icmp_error_test(options, stun_server, primary_server, local_bind);
 
     PortRandomizationProbeResult section9 = run_section9_port_randomization_probe(primary_server, primary_server.family, options.timeout);
     result.section9_port_randomization = section9.status;

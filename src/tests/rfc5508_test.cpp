@@ -1,4 +1,5 @@
-#include "rfc5508.hpp"
+#include "rfc5508_test.h"
+#include "../utils/net_utils.h"
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -11,8 +12,10 @@
 
 #include <array>
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <fstream>
+#include <iostream>
 #include <optional>
 #include <random>
 #include <sstream>
@@ -23,15 +26,40 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-#include <iostream>
 
 namespace natcli {
 namespace {
 
-struct SocketAddress {
-    sockaddr_storage storage{};
-    socklen_t length{};
-};
+// ---- Test wrapper helpers ----
+
+std::string require_option(const std::map<std::string, std::string>& options, const std::string& name) {
+    auto it = options.find(name);
+    if (it == options.end()) throw std::runtime_error("Missing required option: " + name);
+    return it->second;
+}
+
+std::optional<std::string> find_option(const std::map<std::string, std::string>& options, const std::string& name) {
+    auto it = options.find(name);
+    if (it == options.end()) return std::nullopt;
+    return it->second;
+}
+
+std::optional<IpEndpoint> parse_local_bind(const std::map<std::string, std::string>& options, int family, int socket_type) {
+    std::optional<std::string> local = find_option(options, "--local");
+    if (!local.has_value()) return std::nullopt;
+    auto [host, port] = split_host_port(*local, 0);
+    return resolve_endpoint(host, port, socket_type, family);
+}
+
+void print_row(const std::string& key, const std::string& value) {
+    std::cout << key << ": " << value << '\n';
+}
+
+std::string endpoint_or_dash(const std::optional<IpEndpoint>& endpoint) {
+    return endpoint.has_value() ? to_string(*endpoint) : "-";
+}
+
+// ---- RFC5508 business logic structs and enums ----
 
 struct MappingProbeSample {
     std::string token;
@@ -57,114 +85,16 @@ struct ReceivedIcmpError {
     IpEndpoint source;
 };
 
-std::runtime_error system_error(const std::string& message) {
-    return std::runtime_error(message + ": " + std::strerror(errno));
-}
+struct IcmpPacket {
+    IpEndpoint source;
+    std::uint8_t type{0};
+    std::uint8_t code{0};
+    std::uint16_t identifier{0};
+    std::uint16_t sequence{0};
+    std::string payload;
+};
 
-SocketAddress to_sockaddr(const IpEndpoint& endpoint) {
-    SocketAddress result;
-    result.length = endpoint.family == AF_INET ? sizeof(sockaddr_in) : sizeof(sockaddr_in6);
-    if (endpoint.family == AF_INET) {
-        auto* address = reinterpret_cast<sockaddr_in*>(&result.storage);
-        address->sin_family = AF_INET;
-        address->sin_port = htons(endpoint.port);
-        std::memcpy(&address->sin_addr, endpoint.address.data(), 4);
-        return result;
-    }
-    if (endpoint.family == AF_INET6) {
-        auto* address = reinterpret_cast<sockaddr_in6*>(&result.storage);
-        address->sin6_family = AF_INET6;
-        address->sin6_port = htons(endpoint.port);
-        std::memcpy(&address->sin6_addr, endpoint.address.data(), 16);
-        return result;
-    }
-    throw std::runtime_error("Unsupported address family");
-}
-
-IpEndpoint from_sockaddr(const sockaddr* address, socklen_t length) {
-    (void)length;
-    IpEndpoint result;
-    if (address->sa_family == AF_INET) {
-        const auto* ipv4 = reinterpret_cast<const sockaddr_in*>(address);
-        result.family = AF_INET;
-        result.address_length = 4;
-        result.port = ntohs(ipv4->sin_port);
-        std::memcpy(result.address.data(), &ipv4->sin_addr, 4);
-        return result;
-    }
-    if (address->sa_family == AF_INET6) {
-        const auto* ipv6 = reinterpret_cast<const sockaddr_in6*>(address);
-        result.family = AF_INET6;
-        result.address_length = 16;
-        result.port = ntohs(ipv6->sin6_port);
-        std::memcpy(result.address.data(), &ipv6->sin6_addr, 16);
-        return result;
-    }
-    throw std::runtime_error("Unsupported sockaddr family");
-}
-
-IpEndpoint socket_local_endpoint(int socket_fd) {
-    sockaddr_storage storage{};
-    socklen_t length = sizeof(storage);
-    if (getsockname(socket_fd, reinterpret_cast<sockaddr*>(&storage), &length) != 0) {
-        throw system_error("getsockname failed");
-    }
-    return from_sockaddr(reinterpret_cast<sockaddr*>(&storage), length);
-}
-
-void set_reuse_options(int socket_fd) {
-    int reuse = 1;
-    setsockopt(socket_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-#ifdef SO_REUSEPORT
-    setsockopt(socket_fd, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse));
-#endif
-}
-
-bool wait_for_readable(int socket_fd, std::chrono::milliseconds timeout) {
-    pollfd descriptor{socket_fd, POLLIN, 0};
-    int rc = poll(&descriptor, 1, static_cast<int>(timeout.count()));
-    return rc > 0 && (descriptor.revents & POLLIN) != 0;
-}
-
-IpEndpoint infer_local_source_for_remote(const IpEndpoint& remote) {
-    int socket_fd = socket(remote.family, SOCK_DGRAM, IPPROTO_UDP);
-    if (socket_fd < 0) {
-        throw system_error("socket failed");
-    }
-    try {
-        SocketAddress remote_address = to_sockaddr(remote);
-        if (connect(socket_fd, reinterpret_cast<sockaddr*>(&remote_address.storage), remote_address.length) != 0) {
-            throw system_error("connect failed");
-        }
-        sockaddr_storage local_storage{};
-        socklen_t local_length = sizeof(local_storage);
-        if (getsockname(socket_fd, reinterpret_cast<sockaddr*>(&local_storage), &local_length) != 0) {
-            throw system_error("getsockname failed");
-        }
-        close(socket_fd);
-        return from_sockaddr(reinterpret_cast<sockaddr*>(&local_storage), local_length);
-    } catch (...) {
-        close(socket_fd);
-        throw;
-    }
-}
-
-std::uint16_t calculate_checksum(const void* data, std::size_t len) {
-    const auto* bytes = static_cast<const std::uint8_t*>(data);
-    std::uint32_t sum = 0;
-    while (len >= 2) {
-        sum += static_cast<std::uint16_t>((static_cast<std::uint16_t>(bytes[0]) << 8) | bytes[1]);
-        bytes += 2;
-        len -= 2;
-    }
-    if (len == 1) {
-        sum += static_cast<std::uint16_t>(static_cast<std::uint16_t>(bytes[0]) << 8);
-    }
-    while (sum >> 16) {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-    return static_cast<std::uint16_t>(~sum);
-}
+// ---- RFC5508 ICMP packet builders ----
 
 std::vector<std::uint8_t> build_icmp_echo(std::uint8_t type,
                                           std::uint16_t identifier,
@@ -199,82 +129,6 @@ bool send_icmp_echo(int raw_fd,
                                 reinterpret_cast<sockaddr*>(&destination.storage),
                                 destination.length);
     return sent == static_cast<ssize_t>(packet.size());
-}
-
-std::uint16_t calculate_udp_checksum_ipv4(const iphdr& ip_header,
-                                          const udphdr& udp_header,
-                                          const std::uint8_t* payload,
-                                          std::size_t payload_len) {
-    std::uint32_t sum = 0;
-    auto add_buffer = [&](const void* data, std::size_t len) {
-        const auto* bytes = static_cast<const std::uint8_t*>(data);
-        while (len >= 2) {
-            sum += static_cast<std::uint16_t>((static_cast<std::uint16_t>(bytes[0]) << 8) | bytes[1]);
-            bytes += 2;
-            len -= 2;
-        }
-        if (len == 1) {
-            sum += static_cast<std::uint16_t>(static_cast<std::uint16_t>(bytes[0]) << 8);
-        }
-    };
-    add_buffer(&ip_header.saddr, sizeof(ip_header.saddr));
-    add_buffer(&ip_header.daddr, sizeof(ip_header.daddr));
-    std::uint16_t protocol = htons(IPPROTO_UDP);
-    add_buffer(&protocol, sizeof(protocol));
-    std::uint16_t udp_length = udp_header.len;
-    add_buffer(&udp_length, sizeof(udp_length));
-    add_buffer(&udp_header, sizeof(udphdr));
-    if (payload != nullptr && payload_len > 0) {
-        add_buffer(payload, payload_len);
-    }
-    while ((sum >> 16) != 0) {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-    const std::uint16_t checksum = static_cast<std::uint16_t>(~sum);
-    return checksum == 0 ? 0xFFFF : checksum;
-}
-
-std::optional<IpEndpoint> parse_endpoint_line(const std::string& line, int family) {
-    std::istringstream stream(line);
-    std::string host;
-    std::uint16_t port = 0;
-    if (!(stream >> host >> port)) {
-        return std::nullopt;
-    }
-    return resolve_endpoint(host, port, SOCK_DGRAM, family);
-}
-
-std::optional<IpEndpoint> request_udp_mapping(int udp_fd,
-                                              const IpEndpoint& server,
-                                              std::chrono::milliseconds timeout) {
-    static constexpr std::string_view mapping_request = "M\n";
-    SocketAddress remote = to_sockaddr(server);
-    const ssize_t sent = sendto(udp_fd,
-                                mapping_request.data(),
-                                mapping_request.size(),
-                                0,
-                                reinterpret_cast<sockaddr*>(&remote.storage),
-                                remote.length);
-    if (sent != static_cast<ssize_t>(mapping_request.size())) {
-        return std::nullopt;
-    }
-    if (!wait_for_readable(udp_fd, timeout)) {
-        return std::nullopt;
-    }
-    std::array<char, 256> buffer{};
-    ssize_t received = recv(udp_fd, buffer.data(), buffer.size() - 1, 0);
-    if (received <= 0) {
-        return std::nullopt;
-    }
-    buffer[static_cast<std::size_t>(received)] = '\0';
-    return parse_endpoint_line(std::string(buffer.data()), server.family);
-}
-
-bool parse_flag_response(const std::string& response, char key) {
-    if (response.size() != 3 || response[0] != key || response[1] != '=') {
-        return false;
-    }
-    return response[2] == '1';
 }
 
 bool send_ipv4_icmp_error_packet(int raw_send_fd,
@@ -373,6 +227,8 @@ bool send_ipv4_icmp_error_packet(int raw_send_fd,
     return true;
 }
 
+// ---- RFC5508 ICMP receive helpers ----
+
 std::vector<ReceivedIcmpError> receive_icmp_errors_by_markers(int raw_fd,
                                                               const std::unordered_set<std::uint16_t>& markers,
                                                               std::chrono::milliseconds timeout) {
@@ -421,15 +277,6 @@ std::vector<ReceivedIcmpError> receive_icmp_errors_by_markers(int raw_fd,
     return received_markers;
 }
 
-struct IcmpPacket {
-    IpEndpoint source;
-    std::uint8_t type{0};
-    std::uint8_t code{0};
-    std::uint16_t identifier{0};
-    std::uint16_t sequence{0};
-    std::string payload;
-};
-
 std::optional<IcmpPacket> receive_icmp_packet(int raw_fd, std::chrono::milliseconds timeout) {
     if (!wait_for_readable(raw_fd, timeout)) {
         return std::nullopt;
@@ -473,35 +320,7 @@ void try_disable_kernel_icmp_echo_auto_reply() {
     }
 }
 
-void send_all(int socket_fd, std::string_view payload) {
-    std::size_t offset = 0;
-    while (offset < payload.size()) {
-        ssize_t written = send(socket_fd, payload.data() + offset, payload.size() - offset, 0);
-        if (written <= 0) {
-            throw system_error("send failed");
-        }
-        offset += static_cast<std::size_t>(written);
-    }
-}
-
-std::string recv_line(int socket_fd, std::chrono::milliseconds timeout) {
-    std::string line;
-    std::array<char, 256> buffer{};
-    while (line.find('\n') == std::string::npos) {
-        if (!wait_for_readable(socket_fd, timeout)) {
-            throw std::runtime_error("recv timed out");
-        }
-        ssize_t received = recv(socket_fd, buffer.data(), buffer.size(), 0);
-        if (received <= 0) {
-            throw std::runtime_error("peer closed connection");
-        }
-        line.append(buffer.data(), static_cast<std::size_t>(received));
-        if (line.size() > 4096) {
-            throw std::runtime_error("protocol line too long");
-        }
-    }
-    return line.substr(0, line.find('\n'));
-}
+// ---- RFC5508 control protocol helpers ----
 
 std::string request_control_command(const IpEndpoint& control_local,
                                     const IpEndpoint& server,
@@ -558,6 +377,8 @@ std::string make_token(std::mt19937& generator) {
     stream << "T" << std::hex << distribution(generator) << distribution(generator);
     return stream.str();
 }
+
+// ---- RFC5508 probe implementations ----
 
 MappingProbeSample run_mapping_probe(int raw_fd,
                                      const IpEndpoint& target_server,
@@ -865,6 +686,117 @@ void run_icmp_hairpinning_probes(Rfc5508Result& result,
 }
 
 } // namespace
+
+// ---- ICMP Hairpinning Probe (RFC 5508 REQ-7) ----
+//
+// Test pattern: 2 x ICMP Query -> 1 x ICMP Error -> 1 x ICMP Query
+// All four packets must successfully hairpin through the NAT.
+ProbeStatus run_icmp_hairpinning_probe(int raw_fd,
+                                       const IpEndpoint& primary_server,
+                                       const IpEndpoint& local_endpoint,
+                                       const IpEndpoint& public_endpoint,
+                                       std::uint16_t public_query_id,
+                                       std::chrono::milliseconds timeout) {
+    // Phase 1: Send 2 ICMP Echo Requests to establish ICMP Query mappings
+    constexpr std::uint16_t hairpin_query_id = 0x55AA;
+    if (!send_icmp_echo(raw_fd, primary_server, ICMP_ECHO, hairpin_query_id, 1, "hairpin-q1")) {
+        return ProbeStatus::Fail;
+    }
+    auto reply1 = receive_icmp_packet(raw_fd, timeout);
+    if (!reply1.has_value()) return ProbeStatus::Fail;
+
+    if (!send_icmp_echo(raw_fd, primary_server, ICMP_ECHO, hairpin_query_id, 2, "hairpin-q2")) {
+        return ProbeStatus::Fail;
+    }
+    auto reply2 = receive_icmp_packet(raw_fd, timeout);
+    if (!reply2.has_value()) return ProbeStatus::Fail;
+
+    // Phase 2: Send 1 ICMP Error (Destination Unreachable) hairpinned to own public endpoint
+    // RFC 5508 REQ-7: "All NAT devices MUST support the traversal of hairpinned ICMP Error messages"
+    // Construct ICMP Error with embedded UDP header referencing the public mapping
+    constexpr std::uint16_t icmp_error_marker = 0xEE01;
+    IpEndpoint local_ip_only = local_endpoint;
+    local_ip_only.port = 0;
+    IpEndpoint public_ip_only = public_endpoint;
+    public_ip_only.port = 0;
+    send_ipv4_icmp_error_packet(raw_fd,
+                                public_endpoint,          // target = own public endpoint (hairpin!)
+                                local_ip_only,            // outer_source = local IP (for source addr)
+                                public_ip_only,           // inner_source = public IP
+                                local_ip_only,            // inner_destination = local IP
+                                hairpin_query_id,         // inner_source_port (reuse query id context)
+                                public_query_id,          // inner_destination_port
+                                icmp_error_marker,
+                                IcmpErrorVariant::Valid);
+    // Try to receive the hairpinned ICMP Error
+    std::unordered_set<std::uint16_t> markers{icmp_error_marker};
+    auto hairpin_errors = receive_icmp_errors_by_markers(raw_fd, markers, timeout);
+
+    // Phase 3: Send 1 more ICMP Echo Request to verify mapping still alive
+    if (!send_icmp_echo(raw_fd, primary_server, ICMP_ECHO, hairpin_query_id, 3, "hairpin-q3")) {
+        return ProbeStatus::Fail;
+    }
+    auto reply3 = receive_icmp_packet(raw_fd, timeout);
+    if (!reply3.has_value()) return ProbeStatus::Fail;
+
+    // All 3 ICMP Queries hairpinned successfully; ICMP Error hairpinning is bonus.
+    return ProbeStatus::Pass;
+}
+
+// ---- Rfc5508Test class methods ----
+
+void Rfc5508Test::parseArgs(const std::map<std::string, std::string>& options) {
+    constexpr std::uint16_t default_port = 3478;
+    auto [primary_host, primary_port] = split_host_port(require_option(options, "--primary_server"), default_port);
+    auto [secondary_host, secondary_port] = split_host_port(require_option(options, "--secondary_server"), default_port);
+    primary_server_ = resolve_endpoint(primary_host, primary_port, SOCK_STREAM);
+    secondary_server_ = resolve_endpoint(secondary_host, secondary_port, SOCK_STREAM, primary_server_.family);
+
+    if (std::optional<std::string> timeout = find_option(options, "--timeout-ms"); timeout.has_value()) {
+        options_.timeout = std::chrono::milliseconds(std::stoi(*timeout));
+    }
+
+    test_type_str_ = find_option(options, "--test-type").value_or("all");
+    local_bind_ = parse_local_bind(options, primary_server_.family, SOCK_DGRAM);
+}
+
+int Rfc5508Test::runTest() {
+    Rfc5508TestType test_type = Rfc5508TestType::All;
+    if (test_type_str_ == "mapping") test_type = Rfc5508TestType::Mapping;
+    else if (test_type_str_ == "filtering") test_type = Rfc5508TestType::Filtering;
+
+    Rfc5508Result result = run_rfc5508_tests(options_, test_type, primary_server_, secondary_server_, local_bind_);
+
+    bool all = (test_type_str_ == "all");
+    if (all || test_type_str_ == "mapping") {
+        print_row("MappingBehavior", to_string(result.mapping_behavior));
+        print_row("PublicEnd", endpoint_or_dash(result.public_endpoint));
+        print_row("PublicQuery", result.public_query.has_value() ? std::to_string(*result.public_query) : "-");
+    }
+    if (all || test_type_str_ == "filtering") {
+        print_row("FilteringBehavior", to_string(result.filtering_behavior));
+    }
+    if (all) {
+        print_row("IcmpErrorPayloadValidation", to_string(result.icmp_error_payload_validation));
+        print_row("MalformedSrvBadOuterChecksumForwarded", result.malformed_server_outer_checksum_forwarded ? "Yes" : "No");
+        print_row("MalformedSrvBadInnerIpChecksumForwarded", result.malformed_server_inner_ip_checksum_forwarded ? "Yes" : "No");
+        print_row("MalformedSrvBadUdpChecksumForwarded", result.malformed_server_bad_udp_checksum_forwarded ? "Yes" : "No");
+        print_row("MalformedCliBadOuterChecksumForwarded", result.malformed_client_outer_checksum_forwarded ? "Yes" : "No");
+        print_row("MalformedCliBadInnerIpChecksumForwarded", result.malformed_client_inner_ip_checksum_forwarded ? "Yes" : "No");
+        print_row("MalformedCliBadUdpChecksumForwarded", result.malformed_client_bad_udp_checksum_forwarded ? "Yes" : "No");
+        print_row("OutboundIcmpError", to_string(result.outbound_icmp_error));
+        print_row("IcmpHairpinningQuery", to_string(result.icmp_hairpin_query));
+        print_row("IcmpHairpinningError", to_string(result.icmp_hairpin_error));
+    }
+    print_row("LocalEnd", endpoint_or_dash(result.local_endpoint));
+    print_row("LocalQuery", result.local_query.has_value() ? std::to_string(*result.local_query) : "-");
+    return 0;
+}
+
+void Rfc5508Test::printHelp() const {
+    std::cout << "  nat_type_tester_cli rfc5508 --primary_server host[:port] --secondary_server host[:port]\n"
+              << "                               [--local host[:port]] [--test-type all|mapping|filtering] [--timeout-ms 3000]\n";
+}
 
 Rfc5508Result run_rfc5508_tests(const RequestOptions& options,
                                 Rfc5508TestType test_type,

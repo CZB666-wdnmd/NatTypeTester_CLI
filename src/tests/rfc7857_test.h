@@ -1,7 +1,7 @@
 #pragma once
 
-#include "rfc5382.hpp"
-#include "stun.hpp"
+#include "nat_test_base.h"
+#include "../utils/hairpin_utils.h"
 
 #include <cstdint>
 #include <optional>
@@ -40,5 +40,21 @@ Rfc7857Result run_rfc7857_tests(const RequestOptions& options,
                                 const IpEndpoint& primary_server,
                                 const IpEndpoint& secondary_server,
                                 const std::optional<IpEndpoint>& local_bind);
+
+class Rfc7857Test : public INatTest {
+public:
+    std::string_view commandName() const override { return "rfc7857"; }
+
+    void parseArgs(const std::map<std::string, std::string>& options) override;
+    int runTest() override;
+    void printHelp() const override;
+
+private:
+    RequestOptions options_;
+    IpEndpoint stun_server_{};
+    IpEndpoint primary_server_{};
+    IpEndpoint secondary_server_{};
+    std::optional<IpEndpoint> local_bind_;
+};
 
 } // namespace natcli

@@ -9,12 +9,15 @@ find_package(OpenSSL REQUIRED)
 include(CTest)
 
 add_library(nat_type_tester_cli_lib
-  stun.cpp
-  discovery.cpp
-  rfc5382.cpp
-  rfc4787.cpp
-  rfc5508.cpp
-  rfc7857.cpp
+  utils/net_utils.cpp
+  utils/stun_utils.cpp
+  tests/test_dispatcher.cpp
+  tests/rfc3489_test.cpp
+  tests/rfc5780_test.cpp
+  tests/rfc4787_test.cpp
+  tests/rfc5382_test.cpp
+  tests/rfc5508_test.cpp
+  tests/rfc7857_test.cpp
 )
 
 target_include_directories(nat_type_tester_cli_lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

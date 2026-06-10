@@ -1,4 +1,7 @@
-#include "rfc5382.hpp"
+#include "rfc5382_test.h"
+#include "../utils/hairpin_utils.h"
+#include "../utils/stun_utils.h"
+#include "../utils/net_utils.h"
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -14,16 +17,20 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <chrono>
 #include <cstring>
+#include <iostream>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <vector>
 #include <thread>
+#include <vector>
 
 namespace natcli {
 namespace {
+
+// ---- Constants ----
 
 constexpr std::string_view kUdpMappingRequest = "M\n";
 constexpr std::string_view kRfc7857UdpProbePayload = "RFC7857-UDP-PROBE\n";
@@ -31,273 +38,36 @@ constexpr char kProbeResultFlagKey = 'R';
 constexpr std::string_view kHairpinUdpPayload = "RFC-HAIRPIN-UDP\n";
 constexpr std::string_view kHairpinIcmpPayload = "RFC-HAIRPIN-ICMP\n";
 
-struct SocketAddress {
-    sockaddr_storage storage{};
-    socklen_t length{};
-};
+// ---- Test wrapper helpers ----
 
-void bind_socket(int socket_fd, const IpEndpoint& endpoint);
-
-std::runtime_error system_error(const std::string& message) {
-    return std::runtime_error(message + ": " + std::strerror(errno));
+std::string require_option(const std::map<std::string, std::string>& options, const std::string& name) {
+    auto it = options.find(name);
+    if (it == options.end()) throw std::runtime_error("Missing required option: " + name);
+    return it->second;
 }
 
-SocketAddress to_sockaddr(const IpEndpoint& endpoint) {
-    SocketAddress result;
-    result.length = endpoint.family == AF_INET ? sizeof(sockaddr_in) : sizeof(sockaddr_in6);
-    if (endpoint.family == AF_INET) {
-        auto* address = reinterpret_cast<sockaddr_in*>(&result.storage);
-        address->sin_family = AF_INET;
-        address->sin_port = htons(endpoint.port);
-        std::memcpy(&address->sin_addr, endpoint.address.data(), 4);
-        return result;
-    }
-    if (endpoint.family == AF_INET6) {
-        auto* address = reinterpret_cast<sockaddr_in6*>(&result.storage);
-        address->sin6_family = AF_INET6;
-        address->sin6_port = htons(endpoint.port);
-        std::memcpy(&address->sin6_addr, endpoint.address.data(), 16);
-        return result;
-    }
-    throw std::runtime_error("Unsupported address family");
+std::optional<std::string> find_option(const std::map<std::string, std::string>& options, const std::string& name) {
+    auto it = options.find(name);
+    if (it == options.end()) return std::nullopt;
+    return it->second;
 }
 
-IpEndpoint from_sockaddr(const sockaddr* address, socklen_t length) {
-    (void)length;
-    IpEndpoint result;
-    if (address->sa_family == AF_INET) {
-        const auto* ipv4 = reinterpret_cast<const sockaddr_in*>(address);
-        result.family = AF_INET;
-        result.address_length = 4;
-        result.port = ntohs(ipv4->sin_port);
-        std::memcpy(result.address.data(), &ipv4->sin_addr, 4);
-        return result;
-    }
-    if (address->sa_family == AF_INET6) {
-        const auto* ipv6 = reinterpret_cast<const sockaddr_in6*>(address);
-        result.family = AF_INET6;
-        result.address_length = 16;
-        result.port = ntohs(ipv6->sin6_port);
-        std::memcpy(result.address.data(), &ipv6->sin6_addr, 16);
-        return result;
-    }
-    throw std::runtime_error("Unsupported sockaddr family");
+std::optional<IpEndpoint> parse_local_bind(const std::map<std::string, std::string>& options, int family, int socket_type) {
+    std::optional<std::string> local = find_option(options, "--local");
+    if (!local.has_value()) return std::nullopt;
+    auto [host, port] = split_host_port(*local, 0);
+    return resolve_endpoint(host, port, socket_type, family);
 }
 
-IpEndpoint socket_local_endpoint(int socket_fd) {
-    sockaddr_storage storage{};
-    socklen_t length = sizeof(storage);
-    if (getsockname(socket_fd, reinterpret_cast<sockaddr*>(&storage), &length) != 0) {
-        throw system_error("getsockname failed");
-    }
-    return from_sockaddr(reinterpret_cast<sockaddr*>(&storage), length);
+void print_row(const std::string& key, const std::string& value) {
+    std::cout << key << ": " << value << '\n';
 }
 
-bool is_wildcard_endpoint_address(const IpEndpoint& endpoint) {
-    if (endpoint.family == AF_INET) {
-        constexpr std::size_t ipv4_size = 4;
-        for (std::size_t index = 0; index < ipv4_size; ++index) {
-            if (endpoint.address[index] != 0) {
-                return false;
-            }
-        }
-        return true;
-    }
-    if (endpoint.family == AF_INET6) {
-        constexpr std::size_t ipv6_size = 16;
-        for (std::size_t index = 0; index < ipv6_size; ++index) {
-            if (endpoint.address[index] != 0) {
-                return false;
-            }
-        }
-        return true;
-    }
-    return false;
+std::string endpoint_or_dash(const std::optional<IpEndpoint>& endpoint) {
+    return endpoint.has_value() ? to_string(*endpoint) : "-";
 }
 
-IpEndpoint infer_local_source_for_remote(const IpEndpoint& remote) {
-    int socket_fd = socket(remote.family, SOCK_DGRAM, IPPROTO_UDP);
-    if (socket_fd < 0) {
-        throw system_error("socket failed");
-    }
-    try {
-        SocketAddress remote_address = to_sockaddr(remote);
-        if (connect(socket_fd, reinterpret_cast<sockaddr*>(&remote_address.storage), remote_address.length) != 0) {
-            throw system_error("connect failed");
-        }
-        IpEndpoint local = socket_local_endpoint(socket_fd);
-        close(socket_fd);
-        return local;
-    } catch (...) {
-        close(socket_fd);
-        throw;
-    }
-}
-
-bool can_connect_udp_from_local_address(const IpEndpoint& local, const IpEndpoint& remote) {
-    int socket_fd = socket(remote.family, SOCK_DGRAM, IPPROTO_UDP);
-    if (socket_fd < 0) {
-        return false;
-    }
-    bool ok = false;
-    try {
-        IpEndpoint local_address_only = local;
-        local_address_only.port = 0;
-        bind_socket(socket_fd, local_address_only);
-        SocketAddress remote_address = to_sockaddr(remote);
-        ok = connect(socket_fd, reinterpret_cast<sockaddr*>(&remote_address.storage), remote_address.length) == 0;
-    } catch (...) {
-        ok = false;
-    }
-    close(socket_fd);
-    return ok;
-}
-
-IpEndpoint select_control_local_endpoint(const IpEndpoint& local, const IpEndpoint& remote) {
-    IpEndpoint selected = local;
-    if (!is_wildcard_endpoint_address(local) && can_connect_udp_from_local_address(local, remote)) {
-        return selected;
-    }
-    IpEndpoint routed_local = infer_local_source_for_remote(remote);
-    selected.address = routed_local.address;
-    selected.address_length = routed_local.address_length;
-    selected.family = routed_local.family;
-    return selected;
-}
-
-void set_reuse_options(int socket_fd) {
-    int reuse = 1;
-    setsockopt(socket_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-#ifdef SO_REUSEPORT
-    setsockopt(socket_fd, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse));
-#endif
-}
-
-void bind_socket(int socket_fd, const IpEndpoint& endpoint) {
-    SocketAddress address = to_sockaddr(endpoint);
-    if (bind(socket_fd, reinterpret_cast<sockaddr*>(&address.storage), address.length) != 0) {
-        throw system_error("bind failed");
-    }
-}
-
-void connect_with_timeout(int socket_fd, const IpEndpoint& remote, std::chrono::milliseconds timeout) {
-    SocketAddress address = to_sockaddr(remote);
-    const int flags = fcntl(socket_fd, F_GETFL, 0);
-    if (flags < 0) {
-        throw system_error("fcntl(F_GETFL) failed");
-    }
-    if (fcntl(socket_fd, F_SETFL, flags | O_NONBLOCK) != 0) {
-        throw system_error("fcntl(F_SETFL) failed");
-    }
-
-    int rc = connect(socket_fd, reinterpret_cast<sockaddr*>(&address.storage), address.length);
-    if (rc != 0 && errno != EINPROGRESS) {
-        throw system_error("connect failed");
-    }
-
-    pollfd descriptor{socket_fd, POLLOUT, 0};
-    rc = poll(&descriptor, 1, static_cast<int>(timeout.count()));
-    if (rc <= 0) {
-        throw std::runtime_error("connect timed out");
-    }
-
-    int error = 0;
-    socklen_t error_length = sizeof(error);
-    if (getsockopt(socket_fd, SOL_SOCKET, SO_ERROR, &error, &error_length) != 0) {
-        throw system_error("getsockopt(SO_ERROR) failed");
-    }
-    if (error != 0) {
-        errno = error;
-        throw system_error("connect failed");
-    }
-
-    if (fcntl(socket_fd, F_SETFL, flags) != 0) {
-        throw system_error("fcntl restore failed");
-    }
-}
-
-bool wait_for_readable(int socket_fd, std::chrono::milliseconds timeout) {
-    pollfd descriptor{socket_fd, POLLIN, 0};
-    int rc = poll(&descriptor, 1, static_cast<int>(timeout.count()));
-    return rc > 0 && (descriptor.revents & POLLIN) != 0;
-}
-
-bool wait_for_error(int socket_fd, std::chrono::milliseconds timeout) {
-    pollfd descriptor{socket_fd, 0, 0};
-    int rc = poll(&descriptor, 1, static_cast<int>(timeout.count()));
-    if (rc <= 0 || (descriptor.revents & POLLERR) == 0) {
-        return false;
-    }
-    int socket_error = 0;
-    socklen_t error_length = sizeof(socket_error);
-    return getsockopt(socket_fd, SOL_SOCKET, SO_ERROR, &socket_error, &error_length) == 0 && socket_error != 0;
-}
-
-bool disconnect_udp_socket(int socket_fd) {
-    sockaddr_storage storage{};
-    storage.ss_family = AF_UNSPEC;
-    return connect(socket_fd, reinterpret_cast<sockaddr*>(&storage), sizeof(sa_family_t)) == 0;
-}
-
-ProbeStatus merge_probe_status(ProbeStatus left, ProbeStatus right) {
-    if (left == ProbeStatus::Fail || right == ProbeStatus::Fail) {
-        return ProbeStatus::Fail;
-    }
-    if (left == ProbeStatus::Pass && right == ProbeStatus::Pass) {
-        return ProbeStatus::Pass;
-    }
-    if (left == ProbeStatus::Unknown || right == ProbeStatus::Unknown) {
-        return ProbeStatus::Unknown;
-    }
-    return ProbeStatus::Inconclusive;
-}
-
-bool same_endpoint_address(const IpEndpoint& left, const IpEndpoint& right) {
-    if (left.family != right.family || left.address_length != right.address_length) {
-        return false;
-    }
-    return std::equal(left.address.begin(), left.address.begin() + left.address_length, right.address.begin());
-}
-
-void send_all(int socket_fd, std::string_view payload) {
-    std::size_t offset = 0;
-    while (offset < payload.size()) {
-        ssize_t written = send(socket_fd, payload.data() + offset, payload.size() - offset, 0);
-        if (written <= 0) {
-            throw system_error("send failed");
-        }
-        offset += static_cast<std::size_t>(written);
-    }
-}
-
-std::string recv_line(int socket_fd, std::chrono::milliseconds timeout) {
-    std::string line;
-    std::array<char, 256> buffer{};
-    while (line.find('\n') == std::string::npos) {
-        if (!wait_for_readable(socket_fd, timeout)) {
-            throw std::runtime_error("recv timed out");
-        }
-        ssize_t received = recv(socket_fd, buffer.data(), buffer.size(), 0);
-        if (received <= 0) {
-            throw std::runtime_error("peer closed connection");
-        }
-        line.append(buffer.data(), static_cast<std::size_t>(received));
-        if (line.size() > 4096) {
-            throw std::runtime_error("protocol line too long");
-        }
-    }
-    return line.substr(0, line.find('\n'));
-}
-
-std::optional<IpEndpoint> parse_endpoint_line(const std::string& line, int family) {
-    std::istringstream stream(line);
-    std::string host;
-    std::uint16_t port = 0;
-    if (!(stream >> host >> port)) {
-        return std::nullopt;
-    }
-    return resolve_endpoint(host, port, SOCK_STREAM, family);
-}
+// ---- RFC5382 business logic helpers ----
 
 std::pair<bool, bool> parse_filter_line(const std::string& line) {
     std::istringstream stream(line);
@@ -307,11 +77,16 @@ std::pair<bool, bool> parse_filter_line(const std::string& line) {
         throw std::runtime_error("Invalid filtering response");
     }
     auto parse_flag = [](const std::string& field, const char key) -> bool {
-        constexpr std::size_t FLAG_FIELD_SIZE = 3; // "P=1" / "S=0"
+        constexpr std::size_t FLAG_FIELD_SIZE = 3;
         if (field.size() != FLAG_FIELD_SIZE || field[0] != key || field[1] != '=') {
-            throw std::runtime_error("Invalid filtering response field");
+            throw std::runtime_error(std::string("Invalid filtering response field: expected '")
+                                     + key + "=<0|1>', got: '" + field + "'");
         }
-        return field[2] == '1';
+        const char value = field[2];
+        if (value == '1') return true;
+        if (value == '0') return false;
+        throw std::runtime_error(std::string("Invalid flag value for '")
+                                 + key + "': expected '0' or '1', got: '" + value + "'");
     };
     return {parse_flag(p_field, 'P'), parse_flag(s_field, 'S')};
 }
@@ -324,26 +99,18 @@ std::pair<bool, bool> parse_syn_line(const std::string& line) {
         throw std::runtime_error("Invalid SYN probe response");
     }
     auto parse_flag = [](const std::string& field, const char key) -> bool {
-        constexpr std::size_t SYN_FLAG_FIELD_SIZE = 3; // "I=1" / "D=0"
+        constexpr std::size_t SYN_FLAG_FIELD_SIZE = 3;
         if (field.size() != SYN_FLAG_FIELD_SIZE || field[0] != key || field[1] != '=') {
-            throw std::runtime_error("Invalid SYN probe response field");
+            throw std::runtime_error(std::string("Invalid SYN probe response field: expected '")
+                                     + key + "=<0|1>', got: '" + field + "'");
         }
-        return field[2] == '1';
+        const char value = field[2];
+        if (value == '1') return true;
+        if (value == '0') return false;
+        throw std::runtime_error(std::string("Invalid SYN flag value for '")
+                                 + key + "': expected '0' or '1', got: '" + value + "'");
     };
     return {parse_flag(immediate_field, 'I'), parse_flag(delayed_field, 'D')};
-}
-
-bool parse_flag_response(const std::string& line, char key) {
-    if (line.size() != 3 || line[0] != key || line[1] != '=') {
-        throw std::runtime_error("Invalid single-flag response");
-    }
-    if (line[2] == '0') {
-        return false;
-    }
-    if (line[2] == '1') {
-        return true;
-    }
-    throw std::runtime_error("Invalid single-flag value");
 }
 
 std::optional<IpEndpoint> request_stun_udp_mapping(int socket_fd,
@@ -725,23 +492,23 @@ ProbeStatus run_server_assisted_udp_icmp_test(const IpEndpoint& primary_server,
             return std::string(buf.data());
         };
 
-        // 1. 获取基准映射
+        // 1. Get baseline mapping
         std::string baseline = exchange("M\n");
         std::optional<IpEndpoint> mapped_before = parse_endpoint_line(baseline, primary_server.family);
         if (!mapped_before.has_value()) { close(socket_fd); return ProbeStatus::Inconclusive; }
 
-        // 2. 发送 I 指令，让服务器注入 ICMP 错误包
+        // 2. Send I command to have server inject ICMP error packet
         std::string icmp_resp = exchange("I\n");
         if (icmp_resp != "I=1\n") { close(socket_fd); return ProbeStatus::Fail; }
 
-        // 3. 延时等待 NAT 处理
+        // 3. Wait for NAT processing
         std::this_thread::sleep_for(std::chrono::milliseconds(300));
 
-        // 4. 再次验证映射，测试 REQ-12
+        // 4. Re-verify mapping, testing REQ-12
         std::string after = exchange("M\n");
         if (after.empty()) {
             close(socket_fd);
-            return ProbeStatus::Fail; // 超时说明 NAT 擅自把映射删了
+            return ProbeStatus::Fail;
         }
 
         std::optional<IpEndpoint> mapped_after = parse_endpoint_line(after, primary_server.family);
@@ -770,28 +537,27 @@ ProbeStatus run_server_assisted_tcp_icmp_test(const IpEndpoint& primary_server,
         bind_socket(control, local_bind.value_or(wildcard_endpoint(primary_server.family)));
         connect_with_timeout(control, primary_server, timeout);
 
-        // 1. 获取基准映射
+        // 1. Get baseline mapping
         send_all(control, "M\n");
         std::optional<IpEndpoint> mapped_before = parse_endpoint_line(recv_line(control, timeout), primary_server.family);
         if (!mapped_before.has_value()) { close(control); return ProbeStatus::Inconclusive; }
 
-        // 2. 触发服务器发回带有 TCP 5元组的 ICMP 错误包
+        // 2. Trigger server to send ICMP error with TCP 5-tuple
         send_all(control, "I\n");
         std::string i_resp = recv_line(control, timeout);
         if (i_resp != "I=1") { close(control); return ProbeStatus::Fail; }
 
-        // 3. 延时等待 NAT 处理
+        // 3. Wait for NAT processing
         std::this_thread::sleep_for(std::chrono::milliseconds(300));
 
-        // 4. 验证 TCP 连接是否依然存活，测试 REQ-10
+        // 4. Verify TCP connection still alive, testing REQ-10
         std::optional<IpEndpoint> mapped_after;
         try {
             send_all(control, "M\n");
             mapped_after = parse_endpoint_line(recv_line(control, timeout), primary_server.family);
         } catch (...) {
-            // 如果发 M 时抛出异常 (Connection reset by peer)，说明 NAT 干掉了连接
             close(control);
-            return ProbeStatus::Fail; 
+            return ProbeStatus::Fail;
         }
 
         close(control);
@@ -815,10 +581,8 @@ std::string request_tcp_command(const IpEndpoint& local,
     }
     try {
         set_reuse_options(control);
-        
-        // 关键修正: 配置 SO_LINGER，在关闭 socket 时直接发送 RST。
-        // 这将跳过 TCP 的 TIME_WAIT 状态，释放掉五元组，
-        // 使得后续的 connect 能够成功，从而解决 EADDRNOTAVAIL 报错。
+
+        // Configure SO_LINGER to send RST on close, skipping TIME_WAIT
         linger sl{1, 0};
         setsockopt(control, SOL_SOCKET, SO_LINGER, &sl, sizeof(sl));
 
@@ -890,6 +654,7 @@ std::optional<bool> probe_tcp_mapping_allows_udp(const IpEndpoint& local,
             close(socket_fd);
             return false;
         }
+
         std::array<char, 256> buffer{};
         ssize_t received = recv(socket_fd, buffer.data(), buffer.size(), 0);
         close(socket_fd);
@@ -952,6 +717,8 @@ std::optional<bool> probe_udp_mapping_allows_tcp(const IpEndpoint& local,
 
 } // namespace
 
+// ---- RFC5382 wrapper functions (natcli scope) ----
+
 ProbeStatus run_udp_hairpinning_test(const RequestOptions& options,
                                      const IpEndpoint& stun_server,
                                      const std::optional<IpEndpoint>& local_bind) {
@@ -989,13 +756,74 @@ ProbeStatus run_tcp_icmp_error_handling_test(const RequestOptions& options,
     return run_server_assisted_tcp_icmp_test(primary_server, local_bind, options.timeout);
 }
 
-ProbeStatus run_rfc7857_icmp_hairpinning_test(const RequestOptions& options,
+ProbeStatus run_rfc7857_cross_protocol_icmp_error_test(const RequestOptions& options,
                                               const IpEndpoint& stun_server,
                                               const IpEndpoint& primary_server,
                                               const std::optional<IpEndpoint>& local_bind) {
     ProbeStatus udp_status = run_udp_icmp_error_handling_test(options, primary_server, local_bind);
     ProbeStatus tcp_status = run_tcp_icmp_error_handling_test(options, primary_server, local_bind);
     return merge_probe_status(udp_status, tcp_status);
+}
+
+// ---- Rfc5382Test class methods ----
+
+void Rfc5382Test::parseArgs(const std::map<std::string, std::string>& options) {
+    constexpr std::uint16_t default_port = 3478;
+    auto [stun_host, stun_port] = split_host_port(require_option(options, "--stun_server"), default_port);
+    stun_server_ = resolve_endpoint(stun_host, stun_port, SOCK_DGRAM);
+    options_.server_name = stun_host;
+
+    auto [primary_host, primary_port] = split_host_port(require_option(options, "--primary_server"), default_port);
+    auto [secondary_host, secondary_port] = split_host_port(require_option(options, "--secondary_server"), default_port);
+    primary_server_ = resolve_endpoint(primary_host, primary_port, SOCK_STREAM, stun_server_.family);
+    secondary_server_ = resolve_endpoint(secondary_host, secondary_port, SOCK_STREAM, stun_server_.family);
+
+    if (std::optional<std::string> timeout = find_option(options, "--timeout-ms"); timeout.has_value()) {
+        options_.timeout = std::chrono::milliseconds(std::stoi(*timeout));
+    }
+
+    test_type_str_ = find_option(options, "--test-type").value_or("all");
+    local_bind_ = parse_local_bind(options, stun_server_.family, SOCK_STREAM);
+}
+
+int Rfc5382Test::runTest() {
+    StunResult5389 mapping_result = run_rfc5780_test(options_, StunTestType::Mapping, stun_server_, local_bind_);
+    Rfc5382TcpResult server_result = run_rfc5382_tests(options_, stun_server_, primary_server_, secondary_server_, local_bind_);
+
+    const std::string& tt = test_type_str_;
+    bool all = (tt == "all");
+    bool mapping = all || (tt == "mapping");
+    bool filtering = all || (tt == "filtering");
+    bool simopen = all || (tt == "simultaneous-open");
+    bool unexpected = all || (tt == "unexpected-syn");
+    bool icmp = all || (tt == "icmp");
+
+    if (mapping) {
+        print_row("MappingBehavior", to_string(mapping_result.mapping_behavior));
+        print_row("UdpPublicEnd", endpoint_or_dash(mapping_result.public_endpoint));
+    }
+    if (filtering) {
+        print_row("FilteringBehavior", to_string(server_result.filtering_behavior));
+        print_row("TcpPublicEnd", endpoint_or_dash(server_result.tcp_public_endpoint));
+    }
+    if (simopen) {
+        print_row("TcpSimultaneousOpen", to_string(server_result.simultaneous_open));
+    }
+    if (unexpected) {
+        print_row("UnexpectedSynHandling", to_string(server_result.unexpected_syn));
+    }
+    if (icmp) {
+        print_row("IcmpErrorHandling", to_string(server_result.icmp_error_handling));
+        print_row("TcpHairpinning", to_string(server_result.tcp_hairpinning));
+        print_row("TcpHairpinningSourceAddress", to_string(server_result.tcp_hairpinning_source_address));
+    }
+    print_row("LocalEnd", endpoint_or_dash(server_result.local_endpoint));
+    return 0;
+}
+
+void Rfc5382Test::printHelp() const {
+    std::cout << "  nat_type_tester_cli rfc5382 --stun_server host[:port] --primary_server host[:port] --secondary_server host[:port]\n"
+              << "                               [--local host[:port]] [--test-type all|mapping|filtering|simultaneous-open|unexpected-syn|icmp] [--timeout-ms 3000]\n";
 }
 
 Rfc5382TcpResult run_rfc5382_tests(const RequestOptions& options,
@@ -1022,7 +850,7 @@ Rfc5382TcpResult run_rfc5382_tests(const RequestOptions& options,
         result.local_endpoint = socket_local_endpoint(listener);
         IpEndpoint control_local = select_control_local_endpoint(*result.local_endpoint, primary_server);
         result.local_endpoint = control_local;
-        
+
         result.tcp_public_endpoint =
             parse_endpoint_line(request_tcp_command(control_local, primary_server, "M\n", options.timeout), primary_server.family);
 
@@ -1056,7 +884,7 @@ Rfc5382TcpResult run_rfc5382_tests(const RequestOptions& options,
                 probe_udp_mapping_allows_tcp(*result.local_endpoint, primary_server, options.timeout);
         }
 
-        constexpr int max_drain_accepts = 4; // server sends up to primary+secondary probe connections plus retries
+        constexpr int max_drain_accepts = 4;
         for (int index = 0; index < max_drain_accepts; ++index) {
             if (!wait_for_readable(listener, std::chrono::milliseconds(100))) {
                 break;
