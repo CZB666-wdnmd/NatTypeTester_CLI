@@ -370,6 +370,7 @@ TcpHairpinningResult run_tcp_hairpin_probe(const IpEndpoint& stun_server,
     }
 }
 
+#if 0
 ProbeStatus run_udp_icmp_mapping_validation(const IpEndpoint& stun_server,
                                             const std::optional<IpEndpoint>& local_bind,
                                             std::chrono::milliseconds timeout) {
@@ -425,7 +426,6 @@ ProbeStatus run_udp_icmp_mapping_validation(const IpEndpoint& stun_server,
     }
 }
 
-#if 0
 ProbeStatus run_tcp_icmp_mapping_validation(const IpEndpoint& stun_server,
                                             const IpEndpoint& primary_server,
                                             const std::optional<IpEndpoint>& local_bind,

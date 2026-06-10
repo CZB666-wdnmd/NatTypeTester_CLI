@@ -47,6 +47,8 @@ std::string endpoint_or_dash(const std::optional<IpEndpoint>& endpoint) {
     return endpoint.has_value() ? to_string(*endpoint) : "-";
 }
 
+} // namespace
+
 // ====================================================================
 // Stun3489NatTypeDiscovery — RFC 3489 NAT type discovery protocol
 // ====================================================================
@@ -210,8 +212,6 @@ ClassicStunResult run_rfc3489_test(const RequestOptions& options,
     }
     return discovery.result;
 }
-
-} // namespace
 
 // ====================================================================
 // Rfc3489Test — CLI test wrapper
