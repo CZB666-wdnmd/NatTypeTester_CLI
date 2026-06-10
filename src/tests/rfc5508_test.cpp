@@ -51,6 +51,26 @@ std::optional<IpEndpoint> parse_local_bind(const std::map<std::string, std::stri
     return resolve_endpoint(host, port, socket_type, family);
 }
 
+std::optional<IpEndpoint> request_udp_mapping(int socket_fd, const IpEndpoint& server, std::chrono::milliseconds timeout) {
+    constexpr std::string_view kUdpMappingRequest = "M\n";
+    SocketAddress remote = to_sockaddr(server);
+    ssize_t sent = sendto(socket_fd, kUdpMappingRequest.data(), kUdpMappingRequest.size(), 0,
+                          reinterpret_cast<sockaddr*>(&remote.storage), remote.length);
+    if (sent <= 0) {
+        return std::nullopt;
+    }
+    if (!wait_for_readable(socket_fd, timeout)) {
+        return std::nullopt;
+    }
+    std::array<char, 256> buffer{};
+    ssize_t received = recv(socket_fd, buffer.data(), buffer.size() - 1, 0);
+    if (received <= 0) {
+        return std::nullopt;
+    }
+    buffer[static_cast<std::size_t>(received)] = '\0';
+    return parse_endpoint_line(std::string(buffer.data()), server.family);
+}
+
 void print_row(const std::string& key, const std::string& value) {
     std::cout << key << ": " << value << '\n';
 }
@@ -727,7 +747,8 @@ ProbeStatus run_icmp_hairpinning_probe(int raw_fd,
                                 hairpin_query_id,         // inner_source_port (reuse query id context)
                                 public_query_id,          // inner_destination_port
                                 icmp_error_marker,
-                                IcmpErrorVariant::Valid);
+                                IcmpErrorVariant::Valid,
+                                IcmpInnerProtocol::Icmp);
     // Try to receive the hairpinned ICMP Error
     std::unordered_set<std::uint16_t> markers{icmp_error_marker};
     auto hairpin_errors = receive_icmp_errors_by_markers(raw_fd, markers, timeout);

@@ -425,6 +425,7 @@ ProbeStatus run_udp_icmp_mapping_validation(const IpEndpoint& stun_server,
     }
 }
 
+#if 0
 ProbeStatus run_tcp_icmp_mapping_validation(const IpEndpoint& stun_server,
                                             const IpEndpoint& primary_server,
                                             const std::optional<IpEndpoint>& local_bind,
@@ -466,6 +467,7 @@ ProbeStatus run_tcp_icmp_mapping_validation(const IpEndpoint& stun_server,
         return ProbeStatus::Inconclusive;
     }
 }
+#endif
 
 ProbeStatus run_server_assisted_udp_icmp_test(const IpEndpoint& primary_server,
                                               const std::optional<IpEndpoint>& local_bind,
@@ -757,7 +759,7 @@ ProbeStatus run_tcp_icmp_error_handling_test(const RequestOptions& options,
 }
 
 ProbeStatus run_rfc7857_cross_protocol_icmp_error_test(const RequestOptions& options,
-                                              const IpEndpoint& stun_server,
+                                              const IpEndpoint& /*stun_server*/,
                                               const IpEndpoint& primary_server,
                                               const std::optional<IpEndpoint>& local_bind) {
     ProbeStatus udp_status = run_udp_icmp_error_handling_test(options, primary_server, local_bind);
