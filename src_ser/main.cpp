@@ -12,7 +12,6 @@
 #include <netinet/icmp6.h>
 #include <netinet/ip6.h>
 #include <ifaddrs.h>
-#include <net/if.h>
 
 #include <array>
 #include <cerrno>
@@ -53,7 +52,6 @@ struct StunNode {
     int fd = -1;
     IpEndpoint bind_ep{};
     IpEndpoint pub_ep{};
-    std::string device_name;
 };
 
 struct StunContext {
@@ -75,6 +73,13 @@ bool run_shell_command(const std::string& command) {
 void try_disable_kernel_icmp_echo_auto_reply() {
     FILE* f1 = fopen("/proc/sys/net/ipv4/icmp_echo_ignore_all", "w");
     if (f1) { fputs("1\n", f1); fclose(f1); }
+}
+
+bool is_unspecified(const IpEndpoint& ep) {
+    for (std::size_t i = 0; i < ep.address_length; ++i) {
+        if (ep.address[i] != 0) return false;
+    }
+    return true;
 }
 
 SocketAddress to_sockaddr(const IpEndpoint& endpoint) {
@@ -139,51 +144,32 @@ IpEndpoint resolve_endpoint(const std::string& host, std::uint16_t port) {
     fail("No supported address found");
 }
 
-std::string endpoint_host(const IpEndpoint& endpoint) {
-    char buffer[INET6_ADDRSTRLEN]{};
-    if (endpoint.family == AF_INET) inet_ntop(AF_INET, endpoint.address.data(), buffer, sizeof(buffer));
-    else inet_ntop(AF_INET6, endpoint.address.data(), buffer, sizeof(buffer));
-    std::string res(buffer);
-    if (endpoint.family == AF_INET6) res = "[" + res + "]";
-    return res;
-}
+// ==========================================
+// 新增: 遍历系统网卡，根据绑定的 IP 找到网卡名 (例如 eth0, eth1)
+// ==========================================
+std::optional<std::string> find_interface_by_ip(const IpEndpoint& target) {
+    if (is_unspecified(target)) return std::nullopt;
+    ifaddrs* ifaddr = nullptr;
+    if (getifaddrs(&ifaddr) == -1) return std::nullopt;
+    std::unique_ptr<ifaddrs, decltype(&freeifaddrs)> guard(ifaddr, freeifaddrs);
 
-bool is_unspecified(const IpEndpoint& ep) {
-    for (std::size_t i = 0; i < ep.address_length; ++i) {
-        if (ep.address[i] != 0) return false;
-    }
-    return true;
-}
-
-// 自动寻找 IP 对应的网络接口名称 (eth0, eth1, ens3 等)
-std::optional<std::string> get_interface_name(const IpEndpoint& endpoint) {
-    if (is_unspecified(endpoint)) return std::nullopt;
-
-    ifaddrs* ifaddr_list = nullptr;
-    if (getifaddrs(&ifaddr_list) == -1) return std::nullopt;
-
-    std::optional<std::string> result;
-    for (ifaddrs* ifa = ifaddr_list; ifa != nullptr; ifa = ifa->ifa_next) {
+    for (ifaddrs* ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
         if (ifa->ifa_addr == nullptr) continue;
+        if (ifa->ifa_addr->sa_family != target.family) continue;
 
-        if (ifa->ifa_addr->sa_family == endpoint.family) {
-            if (endpoint.family == AF_INET) {
-                auto* ipv4 = reinterpret_cast<sockaddr_in*>(ifa->ifa_addr);
-                if (std::memcmp(&ipv4->sin_addr, endpoint.address.data(), 4) == 0) {
-                    result = ifa->ifa_name;
-                    break;
-                }
-            } else if (endpoint.family == AF_INET6) {
-                auto* ipv6 = reinterpret_cast<sockaddr_in6*>(ifa->ifa_addr);
-                if (std::memcmp(&ipv6->sin6_addr, endpoint.address.data(), 16) == 0) {
-                    result = ifa->ifa_name;
-                    break;
-                }
+        if (target.family == AF_INET) {
+            auto* ipv4 = reinterpret_cast<sockaddr_in*>(ifa->ifa_addr);
+            if (std::memcmp(&ipv4->sin_addr, target.address.data(), 4) == 0) {
+                return std::string(ifa->ifa_name);
+            }
+        } else if (target.family == AF_INET6) {
+            auto* ipv6 = reinterpret_cast<sockaddr_in6*>(ifa->ifa_addr);
+            if (std::memcmp(&ipv6->sin6_addr, target.address.data(), 16) == 0) {
+                return std::string(ifa->ifa_name);
             }
         }
     }
-    freeifaddrs(ifaddr_list);
-    return result;
+    return std::nullopt;
 }
 
 void set_reuse_options(int socket_fd) {
@@ -194,27 +180,22 @@ void set_reuse_options(int socket_fd) {
 #endif
 }
 
-int create_udp_listener(StunNode& node) {
-    int socket_fd = socket(node.bind_ep.family, SOCK_DGRAM, IPPROTO_UDP);
+int create_udp_listener(const IpEndpoint& endpoint) {
+    int socket_fd = socket(endpoint.family, SOCK_DGRAM, IPPROTO_UDP);
     if (socket_fd < 0) throw system_error("socket failed");
     set_reuse_options(socket_fd);
-
-    // 核心代码：硬件网卡强绑定，绕过内核主路由表
-    auto iface = get_interface_name(node.bind_ep);
-    if (iface) {
-        node.device_name = *iface;
-        if (setsockopt(socket_fd, SOL_SOCKET, SO_BINDTODEVICE, iface->c_str(), iface->length()) != 0) {
-            std::cerr << "  [Warning] SO_BINDTODEVICE failed for " << *iface << " (Requires root privileges)\n";
-        }
-    } else {
-        node.device_name = "N/A";
-    }
-
-    SocketAddress address = to_sockaddr(node.bind_ep);
-    if (bind(socket_fd, reinterpret_cast<sockaddr*>(&address.storage), address.length) != 0) {
-        throw system_error("bind failed on UDP");
-    }
+    SocketAddress address = to_sockaddr(endpoint);
+    if (bind(socket_fd, reinterpret_cast<sockaddr*>(&address.storage), address.length) != 0) throw system_error("bind failed on UDP");
     return socket_fd;
+}
+
+std::string endpoint_host(const IpEndpoint& endpoint) {
+    char buffer[INET6_ADDRSTRLEN]{};
+    if (endpoint.family == AF_INET) inet_ntop(AF_INET, endpoint.address.data(), buffer, sizeof(buffer));
+    else inet_ntop(AF_INET6, endpoint.address.data(), buffer, sizeof(buffer));
+    std::string res(buffer);
+    if (endpoint.family == AF_INET6) res = "[" + res + "]";
+    return res;
 }
 
 void append_stun_address(std::vector<uint8_t>& out, uint16_t attr_type, const IpEndpoint& ep, const uint8_t* tx_id, bool xor_mapped) {
@@ -285,12 +266,13 @@ void handle_udp_packet(int rx_idx, const StunContext& ctx) {
                 offset = next_offset;
             }
 
-            int ip_bit = rx_idx & 2;     // 0 = IP_1, 2 = IP_2
-            int port_bit = rx_idx & 1;   // 0 = Port_1, 1 = Port_2
+            int ip_bit = rx_idx & 2;     
+            int port_bit = rx_idx & 1;   
             
             if (change_ip) ip_bit ^= 2;
             if (change_port) port_bit ^= 1;
             int reply_idx = ip_bit | port_bit;
+
             int other_idx = rx_idx ^ 3;
 
             const StunNode& reply_node = ctx.nodes[reply_idx];
@@ -303,12 +285,11 @@ void handle_udp_packet(int rx_idx, const StunContext& ctx) {
             
             bool is_rfc5389 = (tx_id[0] == 0x21 && tx_id[1] == 0x12 && tx_id[2] == 0xA4 && tx_id[3] == 0x42);
 
-            std::cout << "[STUN] " << endpoint_host(peer_endpoint) << ":" << peer_endpoint.port 
-                      << " | " << (is_rfc5389 ? "RFC5780" : "RFC3489") 
-                      << " | Rx: " << rx_node.pub_ep.port << "(IP-" << (rx_idx & 2 ? "2" : "1") << ")"
+            std::cout << "[STUN] Req from " << endpoint_host(peer_endpoint) << ":" << peer_endpoint.port 
+                      << " | " << (is_rfc5389 ? "RFC5389/5780" : "RFC3489") 
+                      << " | Rx: " << rx_node.pub_ep.port << " (IP-" << (rx_idx & 2 ? "2" : "1") << ")"
                       << " | ChgIP=" << change_ip << " ChgPort=" << change_port 
-                      << " | ReplyOut: " << endpoint_host(reply_node.pub_ep) << ":" << reply_node.pub_ep.port 
-                      << " (" << reply_node.device_name << ")\n";
+                      << " | ReplySrc: " << endpoint_host(reply_node.pub_ep) << ":" << reply_node.pub_ep.port << "\n";
 
             append_stun_address(stun_resp, 0x0001, peer_endpoint, tx_id, false); // MAPPED-ADDRESS
             append_stun_address(stun_resp, 0x0004, reply_node.pub_ep, tx_id, false);  // SOURCE-ADDRESS
@@ -326,20 +307,11 @@ void handle_udp_packet(int rx_idx, const StunContext& ctx) {
 
             ssize_t sent = sendto(reply_node.fd, stun_resp.data(), stun_resp.size(), 0, reinterpret_cast<sockaddr*>(&peer), peer_length);
             if (sent < 0) {
-                std::cerr << "  -> [ERROR] sendto failed: " << std::strerror(errno);
-                if (errno == ENETUNREACH) {
-                    std::cerr << " (No default route found on interface " << reply_node.device_name << ". You may need to add a routing rule for this device!)";
-                }
-                std::cerr << "\n";
+                std::cerr << "  [FAIL] Failed sending from " << endpoint_host(reply_node.bind_ep) << ":" << reply_node.bind_ep.port 
+                          << ". Error: " << std::strerror(errno) << " (Check if interface has a default gateway!)\n";
             }
             return;
         }
-    }
-
-    if (received >= 1 && buffer[0] == 'M') {
-        std::string payload = endpoint_line(peer_endpoint);
-        sendto(udp_fd, payload.data(), payload.size(), 0, reinterpret_cast<sockaddr*>(&peer), peer_length);
-        return;
     }
 }
 
@@ -371,15 +343,27 @@ int main(int argc, char** argv) {
 
         try_disable_kernel_icmp_echo_auto_reply();
 
-        std::cout << "STUN 4-Socket Matrix Starting (with SO_BINDTODEVICE)...\n";
+        std::cout << "STUN 4-Socket Matrix Starting...\n";
         for (int i = 0; i < 4; ++i) {
-            stun_ctx.nodes[i].fd = create_udp_listener(stun_ctx.nodes[i]);
+            stun_ctx.nodes[i].fd = create_udp_listener(stun_ctx.nodes[i].bind_ep);
+            
+            // 核心修复逻辑：基于 IP 自动发现网卡名，使用 SO_BINDTODEVICE 进行物理级强绑定
+            std::string iface_info = "unbound";
+            auto iface = find_interface_by_ip(stun_ctx.nodes[i].bind_ep);
+            if (iface) {
+                if (setsockopt(stun_ctx.nodes[i].fd, SOL_SOCKET, SO_BINDTODEVICE, iface->c_str(), iface->length()) == 0) {
+                    iface_info = *iface + " (SO_BINDTODEVICE)";
+                } else {
+                    iface_info = *iface + " (Failed to bind: " + std::string(std::strerror(errno)) + ")";
+                }
+            }
+
             std::cout << "  Node " << i << ": Bind=" << endpoint_host(stun_ctx.nodes[i].bind_ep) << ":" << stun_ctx.nodes[i].bind_ep.port 
                       << "  Public=" << endpoint_host(stun_ctx.nodes[i].pub_ep) << ":" << stun_ctx.nodes[i].pub_ep.port 
-                      << "  [Device: " << stun_ctx.nodes[i].device_name << "]\n";
+                      << "  Iface=" << iface_info << '\n';
         }
 
-        std::cout << "\n>>> Server ready. Asymmetric routing prevention active.\n";
+        std::cout << "\n>>> Server ready for Full Cone / Restricted Cone discovery tests.\n";
 
         while (true) {
             std::array<pollfd, 4> descriptors{{
