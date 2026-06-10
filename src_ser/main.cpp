@@ -34,8 +34,6 @@
 
 namespace {
 
-constexpr std::string_view kRfc7857UdpProbePayload = "RFC7857-UDP-PROBE\n";
-
 struct IpEndpoint {
     int family{};
     std::array<std::uint8_t, 16> address{};
@@ -67,10 +65,6 @@ std::runtime_error system_error(const std::string& message) {
     return std::runtime_error(message + ": " + std::strerror(errno));
 }
 
-bool run_shell_command(const std::string& command) {
-    return std::system(command.c_str()) == 0;
-}
-
 void try_disable_kernel_icmp_echo_auto_reply() {
     FILE* f1 = fopen("/proc/sys/net/ipv4/icmp_echo_ignore_all", "w");
     if (f1) { fputs("1\n", f1); fclose(f1); }
@@ -83,7 +77,6 @@ bool is_unspecified(const IpEndpoint& ep) {
     return true;
 }
 
-// 自动查询 IP 对应的物理网卡名 (例如 eth0, eth1)
 std::string get_interface_name(const IpEndpoint& endpoint) {
     if (is_unspecified(endpoint)) return "";
     ifaddrs* interfaces = nullptr;
@@ -109,10 +102,10 @@ std::string get_interface_name(const IpEndpoint& endpoint) {
     return "";
 }
 
-// 将 Socket 强行绑定到指定的物理网卡
+// 修复点2：确保网卡名字带上末尾的 \0 终止符，防止内核截断报错
 void bind_socket_to_device(int fd, const std::string& iface) {
     if (!iface.empty()) {
-        setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, iface.c_str(), iface.length());
+        setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, iface.c_str(), iface.length() + 1);
     }
 }
 
@@ -158,13 +151,15 @@ IpEndpoint from_sockaddr(const sockaddr* address, socklen_t length) {
     fail("Unsupported sockaddr family");
 }
 
+// 修复点1：getaddrinfo 第二个参数改为具体的 port 字符串，防止 Unrecognized service 异常
 IpEndpoint resolve_endpoint(const std::string& host, std::uint16_t port) {
     addrinfo hints{};
     hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_protocol = IPPROTO_UDP;
+    hints.ai_socktype = SOCK_DGRAM; // 明确声明使用 UDP 协议类型
     addrinfo* result = nullptr;
-    int rc = getaddrinfo(host.c_str(), nullptr, &hints, &result);
+    
+    std::string port_str = std::to_string(port);
+    int rc = getaddrinfo(host.c_str(), port_str.c_str(), &hints, &result);
     if (rc != 0) fail(std::string("getaddrinfo failed: ") + gai_strerror(rc));
 
     std::unique_ptr<addrinfo, decltype(&freeaddrinfo)> guard(result, freeaddrinfo);
@@ -191,7 +186,7 @@ int create_udp_listener(const IpEndpoint& endpoint, const std::string& iface) {
     if (socket_fd < 0) throw system_error("socket failed");
     
     set_reuse_options(socket_fd);
-    bind_socket_to_device(socket_fd, iface); // 强行绑定物理网卡
+    bind_socket_to_device(socket_fd, iface); 
 
     SocketAddress address = to_sockaddr(endpoint);
     if (bind(socket_fd, reinterpret_cast<sockaddr*>(&address.storage), address.length) != 0) {
@@ -321,7 +316,6 @@ void handle_udp_packet(int rx_idx, const StunContext& ctx) {
                 std::cerr << "  [FAIL] Linux failed to send packet from " 
                           << endpoint_host(reply_node.bind_ep) << ":" << reply_node.bind_ep.port 
                           << ". Error: " << std::strerror(errno);
-                // 关键提示：如果你绑死了硬件但路由表里没默认网关，就会报 ENETUNREACH
                 if (errno == ENETUNREACH) {
                     std::cerr << " -> [HINT] Interface " << reply_node.iface_name << " lacks a default gateway route!\n";
                 } else {
