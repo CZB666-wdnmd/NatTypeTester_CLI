@@ -287,7 +287,7 @@ void append_stun_address(std::vector<uint8_t>& out, uint16_t attr_type, const Ip
     } else {
         for (int i = 0; i < 16; ++i) {
             uint8_t val = ep.address[i];
-            if (xor_mapped && tx_id) val ^= tx_id[i]; // IPv6 异或所有 16 字节 (Magic Cookie + TX_ID)
+            if (xor_mapped && tx_id) val ^= tx_id[i]; // IPv6 异或所有 16 字节
             out.push_back(val);
         }
     }
@@ -302,7 +302,7 @@ void handle_udp_packet(int udp_fd, const IpEndpoint& server_public_ep,
 
     IpEndpoint peer_endpoint = from_sockaddr(reinterpret_cast<sockaddr*>(&peer), peer_length);
 
-    // 1. STUN Binding Request 分析 (RFC 3489 / RFC 5389)
+    // 1. STUN Binding Request 分析 (RFC 3489 / RFC 5389 / RFC 5780)
     if (received >= 20 && (buffer[0] & 0xC0) == 0) {
         uint16_t msg_type = static_cast<uint16_t>((static_cast<uint8_t>(buffer[0]) << 8) | static_cast<uint8_t>(buffer[1]));
         uint16_t msg_length = static_cast<uint16_t>((static_cast<uint8_t>(buffer[2]) << 8) | static_cast<uint8_t>(buffer[3]));
@@ -317,11 +317,11 @@ void handle_udp_packet(int udp_fd, const IpEndpoint& server_public_ep,
                 uint16_t attr_len = static_cast<uint16_t>((static_cast<uint8_t>(buffer[offset + 2]) << 8) | static_cast<uint8_t>(buffer[offset + 3]));
                 
                 size_t next_offset = offset + 4 + ((attr_len + 3) & ~3);
-                if (next_offset > static_cast<size_t>(received) || next_offset > 20U + msg_length) break; // 防止越界
+                if (next_offset > static_cast<size_t>(received) || next_offset > 20U + msg_length) break;
 
                 if (attr_type == 0x0003 && attr_len == 4) { // CHANGE-REQUEST
                     uint32_t change_flags = 0;
-                    std::memcpy(&change_flags, buffer.data() + offset + 4, 4); // 内存对齐安全读取
+                    std::memcpy(&change_flags, buffer.data() + offset + 4, 4); 
                     change_flags = ntohl(change_flags);
                     change_ip = (change_flags & 0x0004); // A 位
                     change_port = (change_flags & 0x0002); // B 位
@@ -338,24 +338,29 @@ void handle_udp_packet(int udp_fd, const IpEndpoint& server_public_ep,
                 reply_source = alt_public_ep;
             }
 
-            // 构建 Binding Response
             std::vector<uint8_t> stun_resp(20, 0);
             stun_resp[0] = 0x01; stun_resp[1] = 0x01; // Success Binding Response
-            std::memcpy(&stun_resp[4], buffer.data() + 4, 16); // 复制请求带来的原始 16 字节 ID
+            std::memcpy(&stun_resp[4], buffer.data() + 4, 16); 
 
-            // 修复点 1：使用恒定的请求 buffer 提取 tx_id，防止由于 stun_resp.push_back 引发的悬垂指针异常
             const uint8_t* tx_id = reinterpret_cast<const uint8_t*>(buffer.data() + 4); 
+            
+            // 防御性解析 Magic Cookie，安全判断是否支持 RFC 5389
+            bool is_rfc5389 = (tx_id[0] == 0x21 && tx_id[1] == 0x12 && tx_id[2] == 0xA4 && tx_id[3] == 0x42);
 
-            // 修复点 2：探测客户端是老旧 3489 还是新 5389。如果不识别老版本就加上 0x0020 会导致客户端直接丢包。
-            bool is_rfc5389 = false;
-            uint32_t magic_cookie = 0;
-            std::memcpy(&magic_cookie, tx_id, 4);
-            if (ntohl(magic_cookie) == 0x2112A442) is_rfc5389 = true;
+            std::cout << "[STUN] Req from " << endpoint_host(peer_endpoint) << ":" << peer_endpoint.port 
+                      << " | Type: " << (is_rfc5389 ? "RFC5389/5780" : "RFC3489") 
+                      << " | ChgIP=" << change_ip << " ChgPort=" << change_port 
+                      << " | ReplySrc: " << endpoint_host(reply_source) << ":" << reply_source.port << "\n";
 
+            // 无论是 3489 还是 5780，我们都提供最全面的 Attributes 供其解析
             append_stun_address(stun_resp, 0x0001, peer_endpoint, tx_id, false); // MAPPED-ADDRESS
             append_stun_address(stun_resp, 0x0004, reply_source, tx_id, false);  // SOURCE-ADDRESS
             append_stun_address(stun_resp, 0x0005, alt_public_ep, tx_id, false); // CHANGED-ADDRESS
             
+            // RFC 5780 (NAT Behavior Discovery) 所必需的扩展字段（由于 > 0x7FFF，老旧客户端会自动忽略它们而不报错）
+            append_stun_address(stun_resp, 0x802b, reply_source, tx_id, false);  // RESPONSE-ORIGIN
+            append_stun_address(stun_resp, 0x802c, alt_public_ep, tx_id, false); // OTHER-ADDRESS
+
             if (is_rfc5389) {
                 append_stun_address(stun_resp, 0x0020, peer_endpoint, tx_id, true);  // XOR-MAPPED-ADDRESS
             }
@@ -369,7 +374,6 @@ void handle_udp_packet(int udp_fd, const IpEndpoint& server_public_ep,
         }
     }
 
-    // 2. 传统探针逻辑保持不变...
     if (received >= 1 && buffer[0] == 'M') {
         std::string payload = endpoint_line(peer_endpoint);
         sendto(udp_fd, payload.data(), payload.size(), 0, reinterpret_cast<sockaddr*>(&peer), peer_length);
@@ -390,7 +394,6 @@ int main(int argc, char** argv) {
             else if (token == "--primary-public" && index + 1 < argc) primary_public_arg = argv[++index];
             else if (token == "--secondary" && index + 1 < argc) secondary_arg = argv[++index];
             else if (token == "--secondary-public" && index + 1 < argc) secondary_public_arg = argv[++index];
-            // ... (其它参数省略，照旧即可)
         }
 
         if (!primary_arg || !secondary_arg) fail("Both --primary and --secondary are required.");
@@ -423,22 +426,17 @@ int main(int argc, char** argv) {
                   << "  Primary: Bind=" << endpoint_host(primary_bind) << ":" << primary_bind.port 
                   << "  Public=" << endpoint_host(primary_public) << ":" << primary_public.port << '\n'
                   << "Secondary: Bind=" << endpoint_host(secondary_bind) << ":" << secondary_bind.port 
-                  << "  Public=" << endpoint_host(secondary_public) << ":" << secondary_public.port << '\n';
+                  << "  Public=" << endpoint_host(secondary_public) << ":" << secondary_public.port << "\n\n";
 
-        // 警告：0.0.0.0 对于 STUN 而言会导致 UnsupportedServer
-        if (is_unspecified(primary_public) || is_unspecified(secondary_public)) {
-            std::cerr << "\n[WARNING] You have bound to an unspecified address (0.0.0.0 or ::) WITHOUT providing a specific "
-                      << "--primary-public / --secondary-public IP address.\n"
-                      << "Standard STUN clients (like pystun) will receive '0.0.0.0' as the server's CHANGED-ADDRESS, "
-                      << "which causes them to immediately abort with 'UnsupportedServer'!\n"
-                      << "Solution: Explicitly pass your server's true internet IP, e.g.:\n"
-                      << "  --primary 0.0.0.0:3478 --primary-public 8.8.8.8:3478\n\n";
-        }
-        
-        if (endpoint_host(primary_public) == endpoint_host(secondary_public)) {
-            std::cerr << "[WARNING] Your Primary and Secondary public IP addresses are identical.\n"
-                      << "Strict Full Cone NAT testing requires TWO completely different public IP addresses.\n"
-                      << "Many STUN clients will report 'UnsupportedServer' if the IP addresses do not differ.\n\n";
+        if (primary_public.port == secondary_public.port) {
+            std::cerr << "=================================================================================\n"
+                      << "[FATAL WARNING] Primary and Secondary Public Ports are IDENTICAL (" << primary_public.port << ")\n"
+                      << "Standard STUN clients (like NATTypeTester) strictly check that the alternate \n"
+                      << "port differs from the primary. If they are the same, the STUN client will \n"
+                      << "instantly reject the server with 'UnsupportedServer'!\n"
+                      << "HOW TO FIX: Start the server using a DIFFERENT port for the secondary server:\n"
+                      << "e.g., --secondary 8.163.60.58:3479\n"
+                      << "=================================================================================\n\n";
         }
 
         while (true) {
