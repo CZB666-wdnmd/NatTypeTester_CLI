@@ -95,11 +95,57 @@ ProbeStatus evaluate_port_range(const std::optional<IpEndpoint>& local, const st
     return local_well_known == mapped_well_known ? ProbeStatus::Pass : ProbeStatus::Fail;
 }
 
-ProbeStatus evaluate_port_parity(const std::optional<IpEndpoint>& local, const std::optional<IpEndpoint>& mapped) {
-    if (!local.has_value() || !mapped.has_value()) {
+// ==== 替换：全新的10次严格奇偶性测试函数 ====
+ProbeStatus run_port_parity_test(const RequestOptions& options,
+                                 const IpEndpoint& stun_server,
+                                 const std::optional<IpEndpoint>& local_bind) {
+    int even_tested = 0;
+    int odd_tested = 0;
+    int parity_preserved_count = 0;
+
+    IpEndpoint base_bind = local_bind.value_or(wildcard_endpoint(stun_server.family));
+    bool use_sequential = (base_bind.port != 0);
+
+    // 如果是随机端口(0)给它最多尝试50次，如果是固定基准端口顺序分配最多尝试20次
+    int max_attempts = use_sequential ? 20 : 50;
+    uint16_t current_port = base_bind.port;
+
+    for (int i = 0; i < max_attempts && (even_tested < 5 || odd_tested < 5); ++i) {
+        IpEndpoint bind_ep = base_bind;
+        if (use_sequential) {
+            bind_ep.port = current_port++;
+        } else {
+            bind_ep.port = 0; // 0代表由OS随机分配临时端口
+        }
+
+        // 发起独立的 Binding 测试来探测映射后的公网端口
+        StunResult5389 res = run_rfc5780_test(options, StunTestType::Binding, stun_server, bind_ep);
+        if (res.binding_test_result != BindingTestResult::Success || 
+            !res.local_endpoint.has_value() || 
+            !res.public_endpoint.has_value()) {
+            continue;
+        }
+
+        uint16_t l_port = res.local_endpoint->port;
+        uint16_t p_port = res.public_endpoint->port;
+        bool is_even = (l_port % 2 == 0);
+
+        if (is_even && even_tested < 5) {
+            even_tested++;
+            if (p_port % 2 == 0) parity_preserved_count++;
+        } else if (!is_even && odd_tested < 5) {
+            odd_tested++;
+            if (p_port % 2 != 0) parity_preserved_count++;
+        }
+    }
+
+    // 如果所在的系统非常奇葩，无法分配出5个偶数/奇数端口
+    if (even_tested < 5 || odd_tested < 5) {
         return ProbeStatus::Inconclusive;
     }
-    return (local->port % 2) == (mapped->port % 2) ? ProbeStatus::Pass : ProbeStatus::Fail;
+
+    // 只有 10 次的奇偶性全部分配对应（偶对应偶，奇对应奇），才算严格 Pass
+    return (parity_preserved_count == 10) ? ProbeStatus::Pass : ProbeStatus::Fail;
 }
 
 ProbeStatus run_udp_echo_probe(const IpEndpoint& target,
@@ -446,7 +492,7 @@ Rfc4787Result run_rfc4787_tests(const RequestOptions& options,
 
     if (run_all || test_type == Rfc4787TestType::PortAllocation) {
         result.port_range_preservation = evaluate_port_range(result.local_endpoint, result.public_endpoint);
-        result.port_parity_preservation = evaluate_port_parity(result.local_endpoint, result.public_endpoint);
+        result.port_parity_preservation = run_port_parity_test(options, stun_server, local_bind);
     }
 
     if (run_all || test_type == Rfc4787TestType::Icmp) {
@@ -489,12 +535,13 @@ DeterminismCheckResult run_determinism_check(const RequestOptions& options,
     // First round as baseline
     StunResult5389 baseline = run_rfc5780_test(options, StunTestType::Combining, server, local_bind);
     ProbeStatus baseline_range = evaluate_port_range(baseline.local_endpoint, baseline.public_endpoint);
-    ProbeStatus baseline_parity = evaluate_port_parity(baseline.local_endpoint, baseline.public_endpoint);
 
     result.mapping_consistent = ProbeStatus::Pass;
     result.filtering_consistent = ProbeStatus::Pass;
     result.port_range_consistent = ProbeStatus::Pass;
-    result.port_parity_consistent = ProbeStatus::Pass;
+    
+    // 我们赋予一致性检测同样的严格标准，直接运行10轮测试，结果与 PortParityPreservation 统一
+    result.port_parity_consistent = run_port_parity_test(options, server, local_bind);
 
     for (int i = 0; i < rounds - 1; ++i) {
         StunResult5389 round = run_rfc5780_test(options, StunTestType::Combining, server, local_bind);
@@ -502,8 +549,6 @@ DeterminismCheckResult run_determinism_check(const RequestOptions& options,
         if (round.filtering_behavior != baseline.filtering_behavior) result.filtering_consistent = ProbeStatus::Fail;
         ProbeStatus r_range = evaluate_port_range(round.local_endpoint, round.public_endpoint);
         if (r_range != baseline_range) result.port_range_consistent = ProbeStatus::Fail;
-        ProbeStatus r_parity = evaluate_port_parity(round.local_endpoint, round.public_endpoint);
-        if (r_parity != baseline_parity) result.port_parity_consistent = ProbeStatus::Fail;
     }
     return result;
 }
