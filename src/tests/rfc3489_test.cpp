@@ -219,6 +219,8 @@ ClassicStunResult run_rfc3489_test(const RequestOptions& options,
 
 void Rfc3489Test::parseArgs(const std::map<std::string, std::string>& options) {
     constexpr std::uint16_t default_port = 3478;
+    json_mode_ = options.contains("--json");
+
     auto [host, port] = split_host_port(require_option(options, "--stun_server"), default_port);
     stun_host_ = host;
     stun_server_ = resolve_endpoint(host, port, SOCK_DGRAM);
@@ -234,9 +236,18 @@ void Rfc3489Test::parseArgs(const std::map<std::string, std::string>& options) {
 
 int Rfc3489Test::runTest() {
     ClassicStunResult result = run_rfc3489_test(options_, stun_server_, local_bind_);
-    print_row("NatType", to_string(result.nat_type));
-    print_row("PublicEnd", endpoint_or_dash(result.public_endpoint));
-    print_row("LocalEnd", endpoint_or_dash(result.local_endpoint));
+    if (json_mode_) {
+        std::cout << "{"
+                  << "\"rfc\":\"rfc3489\","
+                  << json_kv_result("NatType", to_string(result.nat_type)) << ","
+                  << json_kv_str("PublicEnd", endpoint_or_dash(result.public_endpoint)) << ","
+                  << json_kv_str("LocalEnd", endpoint_or_dash(result.local_endpoint))
+                  << "}\n";
+    } else {
+        print_row("NatType", to_string(result.nat_type));
+        print_row("PublicEnd", endpoint_or_dash(result.public_endpoint));
+        print_row("LocalEnd", endpoint_or_dash(result.local_endpoint));
+    }
     return 0;
 }
 

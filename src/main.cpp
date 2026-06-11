@@ -90,7 +90,7 @@ bool command_needs_icmp_notrack(const std::string& command) {
     return command == "rfc4787" || command == "rfc5382" || command == "rfc5508" || command == "rfc7857";
 }
 
-void ensure_icmp_conntrack_bypass_if_needed(const std::string& command) {
+void ensure_icmp_conntrack_bypass_if_needed(const std::string& command, bool use_stderr = false) {
     if (!command_needs_icmp_notrack(command)) {
         return;
     }
@@ -99,7 +99,11 @@ void ensure_icmp_conntrack_bypass_if_needed(const std::string& command) {
         configured = ensure_nftables_icmp_notrack();
     }
     if (configured) {
-        std::cout << "Note: ICMP conntrack bypass (notrack) is active for raw ICMP probes.\n";
+        if (use_stderr) {
+            std::cerr << "Note: ICMP conntrack bypass (notrack) is active for raw ICMP probes.\n";
+        } else {
+            std::cout << "Note: ICMP conntrack bypass (notrack) is active for raw ICMP probes.\n";
+        }
         return;
     }
     if (geteuid() != 0) {
@@ -126,6 +130,11 @@ ParsedArguments parse_arguments(int argc, char** argv) {
         std::string token = argv[index];
         if (token == "--help" || token == "-h") {
             result.options[token] = "true";
+            continue;
+        }
+        // --json is a standalone flag (no value)
+        if (token == "--json") {
+            result.options[token] = "1";
             continue;
         }
         if (!token.starts_with("--")) {
@@ -170,7 +179,8 @@ int main(int argc, char** argv) {
             fail("Unknown subcommand: " + args.command);
         }
 
-        ensure_icmp_conntrack_bypass_if_needed(args.command);
+        bool json_mode = args.options.contains("--json");
+        ensure_icmp_conntrack_bypass_if_needed(args.command, json_mode);
 
         int result = dispatcher.dispatch(args.command, args.options);
         if (result < 0) {

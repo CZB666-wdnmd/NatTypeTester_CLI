@@ -435,6 +435,8 @@ std::string analyze_port_allocation_behavior(const std::vector<std::uint16_t>& l
 
 void Rfc7857Test::parseArgs(const std::map<std::string, std::string>& options) {
     constexpr std::uint16_t default_port = 3478;
+    json_mode_ = options.contains("--json");
+
     auto [stun_host, stun_port] = split_host_port(require_option(options, "--stun_server"), default_port);
     stun_server_ = resolve_endpoint(stun_host, stun_port, SOCK_DGRAM);
     options_.server_name = stun_host;
@@ -466,22 +468,53 @@ void Rfc7857Test::parseArgs(const std::map<std::string, std::string>& options) {
 
 int Rfc7857Test::runTest() {
     Rfc7857Result result = run_rfc7857_tests(options_, stun_server_, primary_server_, secondary_server_, local_bind_);
-    print_row("UdpMappingBehavior", to_string(result.udp_mapping_behavior));
-    print_row("UdpFilteringBehavior", to_string(result.udp_filtering_behavior));
-    print_row("TcpFilteringBehavior", to_string(result.tcp_filtering_behavior));
-    print_row("EimProtocolIndependence", to_string(result.eim_protocol_independence));
-    print_row("EifProtocolIndependence", to_string(result.eif_protocol_independence));
-    print_row("PortParityPreservation", to_string(result.port_parity_preservation));
-    print_row("UdpHairpinning", to_string(result.udp_hairpinning));
-    print_row("TcpHairpinning", to_string(result.tcp_hairpinning));
-    print_row("IcmpHairpinning", to_string(result.icmp_hairpinning));
-    print_row("PortRandomization", to_string(result.section9_port_randomization));
-    print_row("PublicPorts", result.section9_public_ports.empty() ? "-" : result.section9_public_ports);
-    print_row("AllocationBehavior", result.section9_allocation_behavior.empty() ? "-" : result.section9_allocation_behavior);
-    print_row("Ipv4IdPreservation", to_string(result.section10_ipv4_id_preservation));
-    print_row("UdpPublicEnd", endpoint_or_dash(result.udp_public_endpoint));
-    print_row("TcpPublicEnd", endpoint_or_dash(result.tcp_public_endpoint));
-    print_row("LocalEnd", endpoint_or_dash(result.local_endpoint));
+
+    if (json_mode_) {
+        std::ostringstream json;
+        json << "{\"rfc\":\"rfc7857\"";
+        auto add = [&](const std::string& key, const std::string& val) {
+            json << "," << json_kv_result(key, val);
+        };
+        auto add_str = [&](const std::string& key, const std::string& val) {
+            json << "," << json_kv_str(key, val);
+        };
+
+        add("UdpMappingBehavior", to_string(result.udp_mapping_behavior));
+        add("UdpFilteringBehavior", to_string(result.udp_filtering_behavior));
+        add("TcpFilteringBehavior", to_string(result.tcp_filtering_behavior));
+        add("EimProtocolIndependence", to_string(result.eim_protocol_independence));
+        add("EifProtocolIndependence", to_string(result.eif_protocol_independence));
+        add("PortParityPreservation", to_string(result.port_parity_preservation));
+        add("UdpHairpinning", to_string(result.udp_hairpinning));
+        add("TcpHairpinning", to_string(result.tcp_hairpinning));
+        add("IcmpHairpinning", to_string(result.icmp_hairpinning));
+        add("PortRandomization", to_string(result.section9_port_randomization));
+        add_str("PublicPorts", result.section9_public_ports.empty() ? "-" : result.section9_public_ports);
+        add_str("AllocationBehavior", result.section9_allocation_behavior.empty() ? "-" : result.section9_allocation_behavior);
+        add("Ipv4IdPreservation", to_string(result.section10_ipv4_id_preservation));
+        add_str("UdpPublicEnd", endpoint_or_dash(result.udp_public_endpoint));
+        add_str("TcpPublicEnd", endpoint_or_dash(result.tcp_public_endpoint));
+        add_str("LocalEnd", endpoint_or_dash(result.local_endpoint));
+        json << "}\n";
+        std::cout << json.str();
+    } else {
+        print_row("UdpMappingBehavior", to_string(result.udp_mapping_behavior));
+        print_row("UdpFilteringBehavior", to_string(result.udp_filtering_behavior));
+        print_row("TcpFilteringBehavior", to_string(result.tcp_filtering_behavior));
+        print_row("EimProtocolIndependence", to_string(result.eim_protocol_independence));
+        print_row("EifProtocolIndependence", to_string(result.eif_protocol_independence));
+        print_row("PortParityPreservation", to_string(result.port_parity_preservation));
+        print_row("UdpHairpinning", to_string(result.udp_hairpinning));
+        print_row("TcpHairpinning", to_string(result.tcp_hairpinning));
+        print_row("IcmpHairpinning", to_string(result.icmp_hairpinning));
+        print_row("PortRandomization", to_string(result.section9_port_randomization));
+        print_row("PublicPorts", result.section9_public_ports.empty() ? "-" : result.section9_public_ports);
+        print_row("AllocationBehavior", result.section9_allocation_behavior.empty() ? "-" : result.section9_allocation_behavior);
+        print_row("Ipv4IdPreservation", to_string(result.section10_ipv4_id_preservation));
+        print_row("UdpPublicEnd", endpoint_or_dash(result.udp_public_endpoint));
+        print_row("TcpPublicEnd", endpoint_or_dash(result.tcp_public_endpoint));
+        print_row("LocalEnd", endpoint_or_dash(result.local_endpoint));
+    }
     return 0;
 }
 

@@ -771,6 +771,8 @@ ProbeStatus run_rfc7857_cross_protocol_icmp_error_test(const RequestOptions& opt
 
 void Rfc5382Test::parseArgs(const std::map<std::string, std::string>& options) {
     constexpr std::uint16_t default_port = 3478;
+    json_mode_ = options.contains("--json");
+
     auto [stun_host, stun_port] = split_host_port(require_option(options, "--stun_server"), default_port);
     stun_server_ = resolve_endpoint(stun_host, stun_port, SOCK_DGRAM);
     options_.server_name = stun_host;
@@ -813,26 +815,60 @@ int Rfc5382Test::runTest() {
     bool unexpected = all || (tt == "unexpected-syn");
     bool icmp = all || (tt == "icmp");
 
-    if (mapping) {
-        print_row("MappingBehavior", to_string(mapping_result.mapping_behavior));
-        print_row("UdpPublicEnd", endpoint_or_dash(mapping_result.public_endpoint));
+    if (json_mode_) {
+        std::ostringstream json;
+        json << "{\"rfc\":\"rfc5382\"";
+        auto add = [&](const std::string& key, const std::string& val) {
+            json << "," << json_kv_result(key, val);
+        };
+        auto add_str = [&](const std::string& key, const std::string& val) {
+            json << "," << json_kv_str(key, val);
+        };
+
+        if (mapping) {
+            add("MappingBehavior", to_string(mapping_result.mapping_behavior));
+            add_str("UdpPublicEnd", endpoint_or_dash(mapping_result.public_endpoint));
+        }
+        if (filtering) {
+            add("FilteringBehavior", to_string(server_result.filtering_behavior));
+            add_str("TcpPublicEnd", endpoint_or_dash(server_result.tcp_public_endpoint));
+        }
+        if (simopen) {
+            add("TcpSimultaneousOpen", to_string(server_result.simultaneous_open));
+        }
+        if (unexpected) {
+            add("UnexpectedSynHandling", to_string(server_result.unexpected_syn));
+        }
+        if (icmp) {
+            add("IcmpErrorHandling", to_string(server_result.icmp_error_handling));
+            add("TcpHairpinning", to_string(server_result.tcp_hairpinning));
+            add("TcpHairpinningSourceAddress", to_string(server_result.tcp_hairpinning_source_address));
+        }
+        add_str("LocalEnd", endpoint_or_dash(server_result.local_endpoint));
+        json << "}\n";
+        std::cout << json.str();
+    } else {
+        if (mapping) {
+            print_row("MappingBehavior", to_string(mapping_result.mapping_behavior));
+            print_row("UdpPublicEnd", endpoint_or_dash(mapping_result.public_endpoint));
+        }
+        if (filtering) {
+            print_row("FilteringBehavior", to_string(server_result.filtering_behavior));
+            print_row("TcpPublicEnd", endpoint_or_dash(server_result.tcp_public_endpoint));
+        }
+        if (simopen) {
+            print_row("TcpSimultaneousOpen", to_string(server_result.simultaneous_open));
+        }
+        if (unexpected) {
+            print_row("UnexpectedSynHandling", to_string(server_result.unexpected_syn));
+        }
+        if (icmp) {
+            print_row("IcmpErrorHandling", to_string(server_result.icmp_error_handling));
+            print_row("TcpHairpinning", to_string(server_result.tcp_hairpinning));
+            print_row("TcpHairpinningSourceAddress", to_string(server_result.tcp_hairpinning_source_address));
+        }
+        print_row("LocalEnd", endpoint_or_dash(server_result.local_endpoint));
     }
-    if (filtering) {
-        print_row("FilteringBehavior", to_string(server_result.filtering_behavior));
-        print_row("TcpPublicEnd", endpoint_or_dash(server_result.tcp_public_endpoint));
-    }
-    if (simopen) {
-        print_row("TcpSimultaneousOpen", to_string(server_result.simultaneous_open));
-    }
-    if (unexpected) {
-        print_row("UnexpectedSynHandling", to_string(server_result.unexpected_syn));
-    }
-    if (icmp) {
-        print_row("IcmpErrorHandling", to_string(server_result.icmp_error_handling));
-        print_row("TcpHairpinning", to_string(server_result.tcp_hairpinning));
-        print_row("TcpHairpinningSourceAddress", to_string(server_result.tcp_hairpinning_source_address));
-    }
-    print_row("LocalEnd", endpoint_or_dash(server_result.local_endpoint));
     return 0;
 }
 

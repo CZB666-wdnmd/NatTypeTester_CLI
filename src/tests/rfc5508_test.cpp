@@ -824,6 +824,8 @@ ProbeStatus run_icmp_hairpinning_probe(int raw_fd,
 
 void Rfc5508Test::parseArgs(const std::map<std::string, std::string>& options) {
     constexpr std::uint16_t default_port = 3478;
+    json_mode_ = options.contains("--json");
+
 
     std::optional<std::string> primary_opt = find_option(options, "--primary_server");
     std::optional<std::string> secondary_opt = find_option(options, "--secondary_server");
@@ -873,28 +875,65 @@ int Rfc5508Test::runTest() {
     Rfc5508Result result = run_rfc5508_tests(options_, test_type, primary_server_, secondary_server_, local_bind_);
 
     bool all = (test_type_str_ == "all");
-    if (all || test_type_str_ == "mapping") {
-        print_row("MappingBehavior", to_string(result.mapping_behavior));
-        print_row("PublicEnd", endpoint_or_dash(result.public_endpoint));
-        print_row("PublicQuery", result.public_query.has_value() ? std::to_string(*result.public_query) : "-");
+
+    if (json_mode_) {
+        std::ostringstream json;
+        json << "{\"rfc\":\"rfc5508\"";
+        auto add = [&](const std::string& key, const std::string& val) {
+            json << "," << json_kv_result(key, val);
+        };
+        auto add_str = [&](const std::string& key, const std::string& val) {
+            json << "," << json_kv_str(key, val);
+        };
+
+        if (all || test_type_str_ == "mapping") {
+            add("MappingBehavior", to_string(result.mapping_behavior));
+            add_str("PublicEnd", endpoint_or_dash(result.public_endpoint));
+            json << "," << json_kv_str("PublicQuery", result.public_query.has_value() ? std::to_string(*result.public_query) : "-");
+        }
+        if (all || test_type_str_ == "filtering") {
+            add("FilteringBehavior", to_string(result.filtering_behavior));
+        }
+        if (all) {
+            add("IcmpErrorPayloadValidation", to_string(result.icmp_error_payload_validation));
+            json << "," << json_kv("MalformedSrvBadOuterChecksumForwarded", json_bool(result.malformed_server_outer_checksum_forwarded));
+            json << "," << json_kv("MalformedSrvBadInnerIpChecksumForwarded", json_bool(result.malformed_server_inner_ip_checksum_forwarded));
+            json << "," << json_kv("MalformedSrvBadUdpChecksumForwarded", json_bool(result.malformed_server_bad_udp_checksum_forwarded));
+            json << "," << json_kv("MalformedCliBadOuterChecksumForwarded", json_bool(result.malformed_client_outer_checksum_forwarded));
+            json << "," << json_kv("MalformedCliBadInnerIpChecksumForwarded", json_bool(result.malformed_client_inner_ip_checksum_forwarded));
+            json << "," << json_kv("MalformedCliBadUdpChecksumForwarded", json_bool(result.malformed_client_bad_udp_checksum_forwarded));
+            add("OutboundIcmpError", to_string(result.outbound_icmp_error));
+            add("IcmpHairpinningQuery", to_string(result.icmp_hairpin_query));
+            add("IcmpHairpinningError", to_string(result.icmp_hairpin_error));
+        }
+        add_str("LocalEnd", endpoint_or_dash(result.local_endpoint));
+        json << "," << json_kv_str("LocalQuery", result.local_query.has_value() ? std::to_string(*result.local_query) : "-");
+        json << "}\n";
+        std::cout << json.str();
+    } else {
+        if (all || test_type_str_ == "mapping") {
+            print_row("MappingBehavior", to_string(result.mapping_behavior));
+            print_row("PublicEnd", endpoint_or_dash(result.public_endpoint));
+            print_row("PublicQuery", result.public_query.has_value() ? std::to_string(*result.public_query) : "-");
+        }
+        if (all || test_type_str_ == "filtering") {
+            print_row("FilteringBehavior", to_string(result.filtering_behavior));
+        }
+        if (all) {
+            print_row("IcmpErrorPayloadValidation", to_string(result.icmp_error_payload_validation));
+            print_row("MalformedSrvBadOuterChecksumForwarded", result.malformed_server_outer_checksum_forwarded ? "Yes" : "No");
+            print_row("MalformedSrvBadInnerIpChecksumForwarded", result.malformed_server_inner_ip_checksum_forwarded ? "Yes" : "No");
+            print_row("MalformedSrvBadUdpChecksumForwarded", result.malformed_server_bad_udp_checksum_forwarded ? "Yes" : "No");
+            print_row("MalformedCliBadOuterChecksumForwarded", result.malformed_client_outer_checksum_forwarded ? "Yes" : "No");
+            print_row("MalformedCliBadInnerIpChecksumForwarded", result.malformed_client_inner_ip_checksum_forwarded ? "Yes" : "No");
+            print_row("MalformedCliBadUdpChecksumForwarded", result.malformed_client_bad_udp_checksum_forwarded ? "Yes" : "No");
+            print_row("OutboundIcmpError", to_string(result.outbound_icmp_error));
+            print_row("IcmpHairpinningQuery", to_string(result.icmp_hairpin_query));
+            print_row("IcmpHairpinningError", to_string(result.icmp_hairpin_error));
+        }
+        print_row("LocalEnd", endpoint_or_dash(result.local_endpoint));
+        print_row("LocalQuery", result.local_query.has_value() ? std::to_string(*result.local_query) : "-");
     }
-    if (all || test_type_str_ == "filtering") {
-        print_row("FilteringBehavior", to_string(result.filtering_behavior));
-    }
-    if (all) {
-        print_row("IcmpErrorPayloadValidation", to_string(result.icmp_error_payload_validation));
-        print_row("MalformedSrvBadOuterChecksumForwarded", result.malformed_server_outer_checksum_forwarded ? "Yes" : "No");
-        print_row("MalformedSrvBadInnerIpChecksumForwarded", result.malformed_server_inner_ip_checksum_forwarded ? "Yes" : "No");
-        print_row("MalformedSrvBadUdpChecksumForwarded", result.malformed_server_bad_udp_checksum_forwarded ? "Yes" : "No");
-        print_row("MalformedCliBadOuterChecksumForwarded", result.malformed_client_outer_checksum_forwarded ? "Yes" : "No");
-        print_row("MalformedCliBadInnerIpChecksumForwarded", result.malformed_client_inner_ip_checksum_forwarded ? "Yes" : "No");
-        print_row("MalformedCliBadUdpChecksumForwarded", result.malformed_client_bad_udp_checksum_forwarded ? "Yes" : "No");
-        print_row("OutboundIcmpError", to_string(result.outbound_icmp_error));
-        print_row("IcmpHairpinningQuery", to_string(result.icmp_hairpin_query));
-        print_row("IcmpHairpinningError", to_string(result.icmp_hairpin_error));
-    }
-    print_row("LocalEnd", endpoint_or_dash(result.local_endpoint));
-    print_row("LocalQuery", result.local_query.has_value() ? std::to_string(*result.local_query) : "-");
     return 0;
 }
 

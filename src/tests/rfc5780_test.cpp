@@ -340,6 +340,8 @@ StunResult5389 run_rfc5780_test(const RequestOptions& options,
 
 void Rfc5780Test::parseArgs(const std::map<std::string, std::string>& options) {
     constexpr std::uint16_t default_port = 3478;
+    json_mode_ = options.contains("--json");
+
     auto [host, port] = split_host_port(require_option(options, "--stun_server"), default_port);
     stun_host_ = host;
     stun_server_ = resolve_endpoint(host, port, SOCK_DGRAM);
@@ -359,19 +361,42 @@ void Rfc5780Test::parseArgs(const std::map<std::string, std::string>& options) {
 int Rfc5780Test::runTest() {
     StunResult5389 result = run_rfc5780_test(options_, test_type_, stun_server_, local_bind_);
 
-    if (test_type_ == StunTestType::Combining || test_type_ == StunTestType::Binding) {
-        print_row("BindingTest", to_string(result.binding_test_result));
+    if (json_mode_) {
+        bool binding = (test_type_ == StunTestType::Combining || test_type_ == StunTestType::Binding);
+        bool mapping = (test_type_ == StunTestType::Combining || test_type_ == StunTestType::Mapping);
+        bool filtering = (test_type_ == StunTestType::Filtering ||
+                         (test_type_ == StunTestType::Combining && options_.transport == TransportType::Udp));
+
+        std::cout << "{";
+        std::cout << "\"rfc\":\"rfc5780\"";
+        if (binding) {
+            std::cout << "," << json_kv_result("BindingTest", to_string(result.binding_test_result));
+        }
+        if (mapping) {
+            std::cout << "," << json_kv_result("MappingBehavior", to_string(result.mapping_behavior));
+        }
+        if (filtering) {
+            std::cout << "," << json_kv_result("FilteringBehavior", to_string(result.filtering_behavior));
+        }
+        std::cout << "," << json_kv_str("PublicEnd", endpoint_or_dash(result.public_endpoint));
+        std::cout << "," << json_kv_str("LocalEnd", endpoint_or_dash(result.local_endpoint));
+        std::cout << "," << json_kv_str("OtherEnd", endpoint_or_dash(result.other_endpoint));
+        std::cout << "}\n";
+    } else {
+        if (test_type_ == StunTestType::Combining || test_type_ == StunTestType::Binding) {
+            print_row("BindingTest", to_string(result.binding_test_result));
+        }
+        if (test_type_ == StunTestType::Combining || test_type_ == StunTestType::Mapping) {
+            print_row("MappingBehavior", to_string(result.mapping_behavior));
+        }
+        if (test_type_ == StunTestType::Filtering ||
+            (test_type_ == StunTestType::Combining && options_.transport == TransportType::Udp)) {
+            print_row("FilteringBehavior", to_string(result.filtering_behavior));
+        }
+        print_row("PublicEnd", endpoint_or_dash(result.public_endpoint));
+        print_row("LocalEnd", endpoint_or_dash(result.local_endpoint));
+        print_row("OtherEnd", endpoint_or_dash(result.other_endpoint));
     }
-    if (test_type_ == StunTestType::Combining || test_type_ == StunTestType::Mapping) {
-        print_row("MappingBehavior", to_string(result.mapping_behavior));
-    }
-    if (test_type_ == StunTestType::Filtering ||
-        (test_type_ == StunTestType::Combining && options_.transport == TransportType::Udp)) {
-        print_row("FilteringBehavior", to_string(result.filtering_behavior));
-    }
-    print_row("PublicEnd", endpoint_or_dash(result.public_endpoint));
-    print_row("LocalEnd", endpoint_or_dash(result.local_endpoint));
-    print_row("OtherEnd", endpoint_or_dash(result.other_endpoint));
     return 0;
 }
 

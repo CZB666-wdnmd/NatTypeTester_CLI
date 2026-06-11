@@ -389,6 +389,8 @@ ProbeStatus run_udp_out_of_order_fragment_probe(const IpEndpoint& primary_server
 
 void Rfc4787Test::parseArgs(const std::map<std::string, std::string>& options) {
     constexpr std::uint16_t default_port = 3478;
+    json_mode_ = options.contains("--json");
+
     auto [stun_host, stun_port] = split_host_port(require_option(options, "--stun_server"), default_port);
     stun_server_ = resolve_endpoint(stun_host, stun_port, SOCK_DGRAM);
     options_.server_name = stun_host;
@@ -421,39 +423,84 @@ void Rfc4787Test::parseArgs(const std::map<std::string, std::string>& options) {
 
 int Rfc4787Test::runTest() {
     Rfc4787Result result = run_rfc4787_tests(options_, test_type_, stun_server_, primary_server_, secondary_server_, local_bind_);
-    print_binding_if_available(result.binding_test_result);
-    print_mapping_if_available(result.mapping_behavior);
-    if (result.filtering_behavior != FilteringBehavior::Unknown) {
-        print_row("FilteringBehavior", to_string(result.filtering_behavior));
-    }
-    print_probe_if_available("PortRangePreservation", result.port_range_preservation);
-    print_probe_if_available("PortParityPreservation", result.port_parity_preservation);
-    print_probe_if_available("IcmpErrorHandling", result.icmp_error_handling);
-    print_probe_if_available("UdpHairpinning", result.udp_hairpinning);
-    print_probe_if_available("UdpHairpinningSourceAddress", result.udp_hairpinning_source_address);
-    print_probe_if_available("OutboundFragmentation", result.outbound_fragmentation);
-    print_probe_if_available("OutboundDfFragmentationError", result.outbound_df_fragmentation_error);
-    print_probe_if_available("InboundFragmentation", result.inbound_fragmentation);
-    print_probe_if_available("OutOfOrderFragmentation", result.out_of_order_fragmentation);
 
-    // Determinism test (multi-round consistency)
-    if (test_type_ == Rfc4787TestType::Determinism || test_type_ == Rfc4787TestType::All) {
-        DeterminismCheckResult det = run_determinism_check(options_, stun_server_, local_bind_, 3);
-        print_probe_if_available("DeterminismMappingConsistent", det.mapping_consistent);
-        print_probe_if_available("DeterminismFilteringConsistent", det.filtering_consistent);
-        print_probe_if_available("DeterminismPortRangeConsistent", det.port_range_consistent);
-        print_probe_if_available("DeterminismPortParityConsistent", det.port_parity_consistent);
-    }
+    if (json_mode_) {
+        std::ostringstream json;
+        json << "{\"rfc\":\"rfc4787\"";
+        auto add = [&](const std::string& key, const std::string& val) {
+            json << "," << json_kv_result(key, val);
+        };
+        auto add_str = [&](const std::string& key, const std::string& val) {
+            json << "," << json_kv_str(key, val);
+        };
 
-    // Port Overloading test
-    if (test_type_ == Rfc4787TestType::PortOverloading || test_type_ == Rfc4787TestType::All) {
-        ProbeStatus overloading = run_port_overloading_test(options_, stun_server_,
-                                                             primary_server_, secondary_server_, local_bind_);
-        print_probe_if_available("PortOverloading", overloading);
-    }
+        if (result.binding_test_result != BindingTestResult::Unknown)
+            add("BindingTest", to_string(result.binding_test_result));
+        if (result.mapping_behavior != MappingBehavior::Unknown)
+            add("MappingBehavior", to_string(result.mapping_behavior));
+        if (result.filtering_behavior != FilteringBehavior::Unknown)
+            add("FilteringBehavior", to_string(result.filtering_behavior));
+        add("PortRangePreservation", to_string(result.port_range_preservation));
+        add("PortParityPreservation", to_string(result.port_parity_preservation));
+        add("IcmpErrorHandling", to_string(result.icmp_error_handling));
+        add("UdpHairpinning", to_string(result.udp_hairpinning));
+        add("UdpHairpinningSourceAddress", to_string(result.udp_hairpinning_source_address));
+        add("OutboundFragmentation", to_string(result.outbound_fragmentation));
+        add("OutboundDfFragmentationError", to_string(result.outbound_df_fragmentation_error));
+        add("InboundFragmentation", to_string(result.inbound_fragmentation));
+        add("OutOfOrderFragmentation", to_string(result.out_of_order_fragmentation));
 
-    print_row("PublicEnd", endpoint_or_dash(result.public_endpoint));
-    print_row("LocalEnd", endpoint_or_dash(result.local_endpoint));
+        if (test_type_ == Rfc4787TestType::Determinism || test_type_ == Rfc4787TestType::All) {
+            DeterminismCheckResult det = run_determinism_check(options_, stun_server_, local_bind_, 3);
+            add("DeterminismMappingConsistent", to_string(det.mapping_consistent));
+            add("DeterminismFilteringConsistent", to_string(det.filtering_consistent));
+            add("DeterminismPortRangeConsistent", to_string(det.port_range_consistent));
+            add("DeterminismPortParityConsistent", to_string(det.port_parity_consistent));
+        }
+
+        if (test_type_ == Rfc4787TestType::PortOverloading || test_type_ == Rfc4787TestType::All) {
+            ProbeStatus overloading = run_port_overloading_test(options_, stun_server_,
+                                                                 primary_server_, secondary_server_, local_bind_);
+            add("PortOverloading", to_string(overloading));
+        }
+
+        add_str("PublicEnd", endpoint_or_dash(result.public_endpoint));
+        add_str("LocalEnd", endpoint_or_dash(result.local_endpoint));
+        json << "}\n";
+        std::cout << json.str();
+    } else {
+        print_binding_if_available(result.binding_test_result);
+        print_mapping_if_available(result.mapping_behavior);
+        if (result.filtering_behavior != FilteringBehavior::Unknown) {
+            print_row("FilteringBehavior", to_string(result.filtering_behavior));
+        }
+        print_probe_if_available("PortRangePreservation", result.port_range_preservation);
+        print_probe_if_available("PortParityPreservation", result.port_parity_preservation);
+        print_probe_if_available("IcmpErrorHandling", result.icmp_error_handling);
+        print_probe_if_available("UdpHairpinning", result.udp_hairpinning);
+        print_probe_if_available("UdpHairpinningSourceAddress", result.udp_hairpinning_source_address);
+        print_probe_if_available("OutboundFragmentation", result.outbound_fragmentation);
+        print_probe_if_available("OutboundDfFragmentationError", result.outbound_df_fragmentation_error);
+        print_probe_if_available("InboundFragmentation", result.inbound_fragmentation);
+        print_probe_if_available("OutOfOrderFragmentation", result.out_of_order_fragmentation);
+
+        if (test_type_ == Rfc4787TestType::Determinism || test_type_ == Rfc4787TestType::All) {
+            DeterminismCheckResult det = run_determinism_check(options_, stun_server_, local_bind_, 3);
+            print_probe_if_available("DeterminismMappingConsistent", det.mapping_consistent);
+            print_probe_if_available("DeterminismFilteringConsistent", det.filtering_consistent);
+            print_probe_if_available("DeterminismPortRangeConsistent", det.port_range_consistent);
+            print_probe_if_available("DeterminismPortParityConsistent", det.port_parity_consistent);
+        }
+
+        if (test_type_ == Rfc4787TestType::PortOverloading || test_type_ == Rfc4787TestType::All) {
+            ProbeStatus overloading = run_port_overloading_test(options_, stun_server_,
+                                                                 primary_server_, secondary_server_, local_bind_);
+            print_probe_if_available("PortOverloading", overloading);
+        }
+
+        print_row("PublicEnd", endpoint_or_dash(result.public_endpoint));
+        print_row("LocalEnd", endpoint_or_dash(result.local_endpoint));
+    }
     return 0;
 }
 
