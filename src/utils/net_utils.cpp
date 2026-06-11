@@ -297,12 +297,14 @@ std::uint16_t calculate_checksum(const void* data, std::size_t len) {
     const auto* bytes = static_cast<const std::uint8_t*>(data);
     std::uint32_t sum = 0;
     while (len >= 2) {
-        sum += static_cast<std::uint16_t>((static_cast<std::uint16_t>(bytes[0]) << 8) | bytes[1]);
+        std::uint16_t word;
+        std::memcpy(&word, bytes, 2);
+        sum += word;
         bytes += 2;
         len -= 2;
     }
     if (len == 1) {
-        sum += static_cast<std::uint16_t>(static_cast<std::uint16_t>(bytes[0]) << 8);
+        sum += bytes[0];
     }
     while (sum >> 16) {
         sum = (sum & 0xFFFF) + (sum >> 16);
@@ -318,12 +320,14 @@ std::uint16_t calculate_udp_checksum_ipv4(const iphdr& ip_header,
     auto add_buffer = [&](const void* data, std::size_t len) {
         const auto* bytes = static_cast<const std::uint8_t*>(data);
         while (len >= 2) {
-            sum += static_cast<std::uint16_t>((static_cast<std::uint16_t>(bytes[0]) << 8) | bytes[1]);
+            std::uint16_t word;
+            std::memcpy(&word, bytes, 2);
+            sum += word;
             bytes += 2;
             len -= 2;
         }
         if (len == 1) {
-            sum += static_cast<std::uint16_t>(static_cast<std::uint16_t>(bytes[0]) << 8);
+            sum += bytes[0];
         }
     };
     add_buffer(&ip_header.saddr, sizeof(ip_header.saddr));
