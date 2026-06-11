@@ -220,6 +220,18 @@ IpEndpoint from_sockaddr(const sockaddr* address, socklen_t length) {
     fail("Unsupported sockaddr family");
 }
 
+std::pair<std::string, std::uint16_t> split_host_port(std::string_view input, std::uint16_t default_port) {
+    if (input.empty()) fail("Endpoint cannot be empty");
+    if (input.front() == '[') {
+        std::size_t end = input.find(']');
+        if (end == std::string_view::npos || end + 1 >= input.size() || input[end + 1] != ':') fail("Invalid IPv6 endpoint syntax");
+        return {std::string(input.substr(1, end - 1)), static_cast<std::uint16_t>(std::stoul(std::string(input.substr(end + 2))))};
+    }
+    std::size_t last_colon = input.rfind(':');
+    if (last_colon == std::string_view::npos || input.find(':') != last_colon) return {std::string(input), default_port};
+    return {std::string(input.substr(0, last_colon)), static_cast<std::uint16_t>(std::stoul(std::string(input.substr(last_colon + 1))))};
+}
+
 IpEndpoint resolve_endpoint(const std::string& host, std::uint16_t port) {
     addrinfo hints{};
     hints.ai_family = AF_UNSPEC;
