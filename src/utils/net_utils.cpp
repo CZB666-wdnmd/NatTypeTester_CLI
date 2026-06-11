@@ -9,6 +9,7 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+#include <array>
 #include <cerrno>
 #include <cstring>
 #include <sstream>
@@ -359,6 +360,124 @@ bool parse_flag_response(const std::string& response, char key) {
         return false;
     }
     return response[2] == '1';
+}
+
+// ---- Custom server topology discovery (C command) ----
+
+CustomServerConfig discover_custom_servers(const IpEndpoint& stun_server,
+                                           int family,
+                                           std::chrono::milliseconds timeout,
+                                           int max_retries) {
+    constexpr char kCommand = 'C';
+
+    int socket_fd = socket(stun_server.family, SOCK_DGRAM, IPPROTO_UDP);
+    if (socket_fd < 0) {
+        throw system_error("discover_custom_servers: socket creation failed");
+    }
+
+    // RAII guard for the socket
+    struct SocketGuard {
+        int fd;
+        ~SocketGuard() { if (fd >= 0) close(fd); }
+    } guard{socket_fd};
+
+    set_socket_timeouts(socket_fd, timeout);
+
+    SocketAddress remote = to_sockaddr(stun_server);
+
+    for (int attempt = 0; attempt < max_retries; ++attempt) {
+        // Send "C" command
+        ssize_t sent = sendto(socket_fd, &kCommand, 1, 0,
+                              reinterpret_cast<sockaddr*>(&remote.storage),
+                              remote.length);
+        if (sent != 1) {
+            continue;  // send failed, retry
+        }
+
+        // Wait for response with timeout
+        if (!wait_for_readable(socket_fd, timeout)) {
+            continue;  // timeout, retry
+        }
+
+        // Receive response
+        std::array<char, 512> buffer{};
+        ssize_t received = recv(socket_fd, buffer.data(), buffer.size() - 1, 0);
+        if (received <= 0) {
+            continue;  // recv failed, retry
+        }
+
+        std::string response(buffer.data(), static_cast<std::size_t>(received));
+
+        // Trim trailing whitespace / newlines
+        while (!response.empty() && (response.back() == '\n' || response.back() == '\r')) {
+            response.pop_back();
+        }
+
+        // Parse PRIMARY and SECONDARY lines
+        // Expected format: "PRIMARY host port\nSECONDARY host port\n"
+        std::string primary_line;
+        std::string secondary_line;
+
+        std::size_t pos = 0;
+        std::size_t nl = response.find('\n', pos);
+        if (nl != std::string::npos) {
+            primary_line = response.substr(pos, nl - pos);
+            pos = nl + 1;
+            // Handle \r\n
+            if (!primary_line.empty() && primary_line.back() == '\r') {
+                primary_line.pop_back();
+            }
+        } else {
+            primary_line = response;
+        }
+
+        if (pos < response.size()) {
+            std::size_t nl2 = response.find('\n', pos);
+            if (nl2 != std::string::npos) {
+                secondary_line = response.substr(pos, nl2 - pos);
+                if (!secondary_line.empty() && secondary_line.back() == '\r') {
+                    secondary_line.pop_back();
+                }
+            } else {
+                secondary_line = response.substr(pos);
+            }
+        }
+
+        // Parse PRIMARY line: "PRIMARY host port"
+        const std::string primary_prefix = "PRIMARY ";
+        if (primary_line.size() <= primary_prefix.size() ||
+            primary_line.substr(0, primary_prefix.size()) != primary_prefix) {
+            continue;  // malformed, retry
+        }
+        std::string primary_host_port = primary_line.substr(primary_prefix.size());
+
+        // Parse SECONDARY line: "SECONDARY host port"
+        const std::string secondary_prefix = "SECONDARY ";
+        if (secondary_line.size() <= secondary_prefix.size() ||
+            secondary_line.substr(0, secondary_prefix.size()) != secondary_prefix) {
+            continue;  // malformed, retry
+        }
+        std::string secondary_host_port = secondary_line.substr(secondary_prefix.size());
+
+        // Parse host and port from each line
+        std::optional<IpEndpoint> primary_ep = parse_endpoint_line(primary_host_port, family);
+        std::optional<IpEndpoint> secondary_ep = parse_endpoint_line(secondary_host_port, family);
+
+        if (!primary_ep.has_value() || !secondary_ep.has_value()) {
+            continue;  // parse failed, retry
+        }
+
+        // Success
+        CustomServerConfig config;
+        config.primary = *primary_ep;
+        config.secondary = *secondary_ep;
+        return config;
+    }
+
+    // All retries exhausted
+    throw std::runtime_error(
+        "错误：无法从 STUN 服务器动态获取自定义服务端配置。"
+        "请检查服务器状态，或尝试使用 --primary_server 和 --secondary_server 手动指定配置。");
 }
 
 } // namespace natcli

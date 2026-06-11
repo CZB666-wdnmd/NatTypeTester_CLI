@@ -775,10 +775,23 @@ void Rfc5382Test::parseArgs(const std::map<std::string, std::string>& options) {
     stun_server_ = resolve_endpoint(stun_host, stun_port, SOCK_DGRAM);
     options_.server_name = stun_host;
 
-    auto [primary_host, primary_port] = split_host_port(require_option(options, "--primary_server"), default_port);
-    auto [secondary_host, secondary_port] = split_host_port(require_option(options, "--secondary_server"), default_port);
-    primary_server_ = resolve_endpoint(primary_host, primary_port, SOCK_STREAM, stun_server_.family);
-    secondary_server_ = resolve_endpoint(secondary_host, secondary_port, SOCK_STREAM, stun_server_.family);
+    std::optional<std::string> primary_opt = find_option(options, "--primary_server");
+    std::optional<std::string> secondary_opt = find_option(options, "--secondary_server");
+
+    if (primary_opt.has_value() && secondary_opt.has_value()) {
+        // Both manually specified -- use user-provided configuration
+        auto [primary_host, primary_port] = split_host_port(*primary_opt, default_port);
+        auto [secondary_host, secondary_port] = split_host_port(*secondary_opt, default_port);
+        primary_server_ = resolve_endpoint(primary_host, primary_port, SOCK_STREAM, stun_server_.family);
+        secondary_server_ = resolve_endpoint(secondary_host, secondary_port, SOCK_STREAM, stun_server_.family);
+    } else if (!primary_opt.has_value() && !secondary_opt.has_value()) {
+        // Neither specified -- dynamically discover from STUN server via "C" command
+        CustomServerConfig config = discover_custom_servers(stun_server_, stun_server_.family);
+        primary_server_ = config.primary;
+        secondary_server_ = config.secondary;
+    } else {
+        throw std::runtime_error("错误：--primary_server 和 --secondary_server 必须同时指定或同时省略。");
+    }
 
     if (std::optional<std::string> timeout = find_option(options, "--timeout-ms"); timeout.has_value()) {
         options_.timeout = std::chrono::milliseconds(std::stoi(*timeout));
@@ -824,8 +837,9 @@ int Rfc5382Test::runTest() {
 }
 
 void Rfc5382Test::printHelp() const {
-    std::cout << "  nat_type_tester_cli rfc5382 --stun_server host[:port] --primary_server host[:port] --secondary_server host[:port]\n"
-              << "                               [--local host[:port]] [--test-type all|mapping|filtering|simultaneous-open|unexpected-syn|icmp] [--timeout-ms 3000]\n";
+    std::cout << "  nat_type_tester_cli rfc5382 --stun_server host[:port] [--primary_server host[:port]] [--secondary_server host[:port]]\n"
+              << "                               [--local host[:port]] [--test-type all|mapping|filtering|simultaneous-open|unexpected-syn|icmp] [--timeout-ms 3000]\n"
+              << "                               (If --primary_server and --secondary_server are omitted, they will be auto-discovered from the STUN server via \"C\" command.)\n";
 }
 
 Rfc5382TcpResult run_rfc5382_tests(const RequestOptions& options,

@@ -71,4 +71,19 @@ std::uint16_t calculate_udp_checksum_ipv4(const iphdr& ip_header,
 std::optional<IpEndpoint> parse_endpoint_line(const std::string& line, int family);
 bool parse_flag_response(const std::string& response, char key);
 
+// ---- Custom server topology discovery (C command) ----
+
+struct CustomServerConfig {
+    IpEndpoint primary;
+    IpEndpoint secondary;
+};
+
+/// Discover custom server topology by sending "C" command to the STUN server.
+/// Returns the parsed PRIMARY and SECONDARY endpoints.
+/// Throws std::runtime_error on timeout or malformed response.
+CustomServerConfig discover_custom_servers(const IpEndpoint& stun_server,
+                                           int family,
+                                           std::chrono::milliseconds timeout = std::chrono::milliseconds(2000),
+                                           int max_retries = 3);
+
 } // namespace natcli

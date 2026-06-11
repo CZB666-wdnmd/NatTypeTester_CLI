@@ -55,6 +55,7 @@ public:
 
 private:
     RequestOptions options_;
+    IpEndpoint stun_server_{};
     IpEndpoint primary_server_{};
     IpEndpoint secondary_server_{};
     std::string test_type_str_{"all"};

@@ -768,17 +768,45 @@ ProbeStatus run_icmp_hairpinning_probe(int raw_fd,
 
 void Rfc5508Test::parseArgs(const std::map<std::string, std::string>& options) {
     constexpr std::uint16_t default_port = 3478;
-    auto [primary_host, primary_port] = split_host_port(require_option(options, "--primary_server"), default_port);
-    auto [secondary_host, secondary_port] = split_host_port(require_option(options, "--secondary_server"), default_port);
-    primary_server_ = resolve_endpoint(primary_host, primary_port, SOCK_STREAM);
-    secondary_server_ = resolve_endpoint(secondary_host, secondary_port, SOCK_STREAM, primary_server_.family);
+
+    std::optional<std::string> primary_opt = find_option(options, "--primary_server");
+    std::optional<std::string> secondary_opt = find_option(options, "--secondary_server");
+
+    int family = AF_INET;  // default family, used for local_bind resolution
+
+    if (primary_opt.has_value() && secondary_opt.has_value()) {
+        // Both manually specified -- use user-provided configuration
+        auto [primary_host, primary_port] = split_host_port(*primary_opt, default_port);
+        auto [secondary_host, secondary_port] = split_host_port(*secondary_opt, default_port);
+        primary_server_ = resolve_endpoint(primary_host, primary_port, SOCK_STREAM);
+        secondary_server_ = resolve_endpoint(secondary_host, secondary_port, SOCK_STREAM, primary_server_.family);
+        family = primary_server_.family;
+    } else if (!primary_opt.has_value() && !secondary_opt.has_value()) {
+        // Neither specified -- need STUN server for dynamic discovery
+        std::optional<std::string> stun_opt = find_option(options, "--stun_server");
+        if (!stun_opt.has_value()) {
+            throw std::runtime_error(
+                "错误：未指定 --primary_server 和 --secondary_server 时，必须提供 --stun_server 用于动态获取配置。");
+        }
+        auto [stun_host, stun_port] = split_host_port(*stun_opt, default_port);
+        stun_server_ = resolve_endpoint(stun_host, stun_port, SOCK_DGRAM);
+        options_.server_name = stun_host;
+        family = stun_server_.family;
+
+        // Dynamically discover from STUN server via "C" command
+        CustomServerConfig config = discover_custom_servers(stun_server_, stun_server_.family);
+        primary_server_ = config.primary;
+        secondary_server_ = config.secondary;
+    } else {
+        throw std::runtime_error("错误：--primary_server 和 --secondary_server 必须同时指定或同时省略。");
+    }
 
     if (std::optional<std::string> timeout = find_option(options, "--timeout-ms"); timeout.has_value()) {
         options_.timeout = std::chrono::milliseconds(std::stoi(*timeout));
     }
 
     test_type_str_ = find_option(options, "--test-type").value_or("all");
-    local_bind_ = parse_local_bind(options, primary_server_.family, SOCK_DGRAM);
+    local_bind_ = parse_local_bind(options, family, SOCK_DGRAM);
 }
 
 int Rfc5508Test::runTest() {
@@ -815,8 +843,9 @@ int Rfc5508Test::runTest() {
 }
 
 void Rfc5508Test::printHelp() const {
-    std::cout << "  nat_type_tester_cli rfc5508 --primary_server host[:port] --secondary_server host[:port]\n"
-              << "                               [--local host[:port]] [--test-type all|mapping|filtering] [--timeout-ms 3000]\n";
+    std::cout << "  nat_type_tester_cli rfc5508 [--stun_server host[:port]] [--primary_server host[:port]] [--secondary_server host[:port]]\n"
+              << "                               [--local host[:port]] [--test-type all|mapping|filtering] [--timeout-ms 3000]\n"
+              << "                               (If --primary_server and --secondary_server are omitted, --stun_server is required for auto-discovery via \"C\" command.)\n";
 }
 
 Rfc5508Result run_rfc5508_tests(const RequestOptions& options,
