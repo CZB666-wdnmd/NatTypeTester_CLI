@@ -210,7 +210,7 @@ bool send_udp_packet_with_ipv4_id(const IpEndpoint& server,
         ip_header->tos = 0;
         ip_header->tot_len = htons(static_cast<std::uint16_t>(packet.size()));
         ip_header->id = htons(ip_id);
-        ip_header->frag_off = 0;
+        ip_header->frag_off = htons(0x4000);
         ip_header->ttl = 64;
         ip_header->protocol = IPPROTO_UDP;
         std::memcpy(&ip_header->saddr, source_ip.data(), 4);
