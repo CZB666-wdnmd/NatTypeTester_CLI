@@ -140,6 +140,81 @@ void ensure_icmp_conntrack_bypass() {
     else std::cerr << "Warning: Failed to configure ICMP notrack rules via iptables/nft.\n";
 }
 
+// ================= Fragment Conntrack Bypass =================
+// Required for RFC 4787 OutOfOrderFragmentation test.
+// IP fragments sent via raw socket (IP_HDRINCL) are classified as INVALID
+// by conntrack because non-first fragments lack L4 headers, causing them
+// to be dropped by the default "ct state invalid drop" firewall rule.
+// We bypass conntrack for all IP fragments so they reach the kernel's
+// IP fragment reassembly layer intact.
+//
+// For iptables: -f matches all IP fragments (MF=1 or frag_off != 0).
+// For nftables: a dedicated table is used for trivial cleanup on exit.
+
+static bool s_fragment_rules_added = false;
+
+bool ensure_iptables_fragment_notrack() {
+    if (!command_exists("iptables")) return false;
+    bool ok = true;
+    if (!run_shell_command("iptables -t raw -C OUTPUT -f -j CT --notrack >/dev/null 2>&1")) {
+        if (!run_shell_command("iptables -t raw -I OUTPUT -f -j CT --notrack >/dev/null 2>&1")) ok = false;
+    }
+    if (!run_shell_command("iptables -t raw -C PREROUTING -f -j CT --notrack >/dev/null 2>&1")) {
+        if (!run_shell_command("iptables -t raw -I PREROUTING -f -j CT --notrack >/dev/null 2>&1")) ok = false;
+    }
+    return ok;
+}
+
+bool ensure_nftables_fragment_notrack() {
+    if (!command_exists("nft")) return false;
+    bool ok = true;
+    // Use a dedicated table so cleanup is a single "nft delete table" call
+    if (!run_shell_command("nft list table ip nat_type_tester_frag >/dev/null 2>&1") &&
+        !run_shell_command("nft add table ip nat_type_tester_frag >/dev/null 2>&1")) ok = false;
+    if (!run_shell_command("nft list chain ip nat_type_tester_frag prerouting >/dev/null 2>&1") &&
+        !run_shell_command("nft add chain ip nat_type_tester_frag prerouting '{ type filter hook prerouting priority raw; }' >/dev/null 2>&1")) ok = false;
+    if (!run_shell_command("nft list chain ip nat_type_tester_frag output >/dev/null 2>&1") &&
+        !run_shell_command("nft add chain ip nat_type_tester_frag output '{ type filter hook output priority raw; }' >/dev/null 2>&1")) ok = false;
+    
+    // ip frag-off & 0x3fff != 0 matches any IP fragment (MF=1 or offset != 0)
+    if (!run_shell_command("nft list chain ip nat_type_tester_frag output 2>/dev/null | grep -Eq 'ip frag-off .* notrack'")) {
+        if (!run_shell_command("nft add rule ip nat_type_tester_frag output ip frag-off '&' 0x3fff != 0 notrack >/dev/null 2>&1")) ok = false;
+    }
+    if (!run_shell_command("nft list chain ip nat_type_tester_frag prerouting 2>/dev/null | grep -Eq 'ip frag-off .* notrack'")) {
+        if (!run_shell_command("nft add rule ip nat_type_tester_frag prerouting ip frag-off '&' 0x3fff != 0 notrack >/dev/null 2>&1")) ok = false;
+    }
+    return ok;
+}
+
+void cleanup_fragment_conntrack_bypass() {
+    if (!s_fragment_rules_added) return;
+    s_fragment_rules_added = false;
+    
+    if (command_exists("iptables")) {
+        run_shell_command("iptables -t raw -D OUTPUT -f -j CT --notrack >/dev/null 2>&1");
+        run_shell_command("iptables -t raw -D PREROUTING -f -j CT --notrack >/dev/null 2>&1");
+    }
+    if (command_exists("nft")) {
+        // Delete the dedicated fragment bypass table in one shot
+        run_shell_command("nft delete table ip nat_type_tester_frag >/dev/null 2>&1");
+    }
+}
+
+void ensure_fragment_conntrack_bypass() {
+    bool configured = ensure_iptables_fragment_notrack();
+    if (!configured) configured = ensure_nftables_fragment_notrack();
+    s_fragment_rules_added = configured;
+    if (configured) {
+        std::cout << "Note: IP Fragment conntrack bypass (notrack) is active.\n";
+        std::atexit(cleanup_fragment_conntrack_bypass);
+        return;
+    }
+    if (geteuid() != 0)
+        std::cerr << "Warning: Fragment notrack rules not configured (run as root). OutOfOrderTest may fail.\n";
+    else
+        std::cerr << "Warning: Failed to configure fragment notrack rules via iptables/nft.\n";
+}
+
 void try_disable_kernel_icmp_echo_auto_reply() {
     FILE* f1 = fopen("/proc/sys/net/ipv4/icmp_echo_ignore_all", "w");
     if (f1) { fputs("1\n", f1); fclose(f1); }
@@ -1040,6 +1115,7 @@ int main(int argc, char** argv) {
 
         ensure_icmp_conntrack_bypass();
         try_disable_kernel_icmp_echo_auto_reply();
+        ensure_fragment_conntrack_bypass();
 
         std::cout << "Starting Server Engine with TCP Multiplexing & Interface Binding Penetration...\n";
         for (int i = 0; i < 4; ++i) {
