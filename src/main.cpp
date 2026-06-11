@@ -98,14 +98,6 @@ void ensure_icmp_conntrack_bypass_if_needed(const std::string& command, bool use
     if (!configured) {
         configured = ensure_nftables_icmp_notrack();
     }
-    if (configured) {
-        if (use_stderr) {
-            std::cerr << "Note: ICMP conntrack bypass (notrack) is active for raw ICMP probes.\n";
-        } else {
-            std::cout << "Note: ICMP conntrack bypass (notrack) is active for raw ICMP probes.\n";
-        }
-        return;
-    }
     if (geteuid() != 0) {
         std::cerr << "Warning: ICMP notrack rules not configured (run as root). Raw ICMP probes may be dropped as INVALID.\n";
     } else {
