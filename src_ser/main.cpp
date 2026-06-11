@@ -466,7 +466,7 @@ std::uint16_t calculate_checksum(const void* data, std::size_t len) {
     if (len == 1) sum += static_cast<std::uint16_t>(static_cast<std::uint16_t>(bytes[0]) << 8);
     sum = (sum >> 16) + (sum & 0xFFFF);
     sum += (sum >> 16);
-    return static_cast<std::uint16_t>(~sum);
+    return htons(static_cast<std::uint16_t>(~sum)); // 修复：必须转为网络字节序
 }
 
 std::uint16_t calculate_icmp_checksum(const void* data, std::size_t len) {
@@ -490,7 +490,7 @@ std::uint16_t calculate_udp_checksum_ipv4(const iphdr& ip_header, const udphdr& 
     add_buffer(&protocol_word, 2); add_buffer(&udp_header.len, 2);
     add_buffer(&udp_header, sizeof(udphdr)); add_buffer(payload, payload_len);
     while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
-    return static_cast<std::uint16_t>(~sum);
+    return htons(static_cast<std::uint16_t>(~sum)); // 修复：必须转为网络字节序
 }
 
 // ================= Custom TCP Helper Functions =================
@@ -640,12 +640,12 @@ bool send_ipv4_icmp_error(const IpEndpoint& peer, const IpEndpoint& local_pub, i
     return false;
 }
 
-// 修复 #2: IP_HDRINCL 下，外层与内层源 IP 强制使用公网地址，应对 VPC SNAT 不转换分片的场景
-bool send_ipv4_icmp_error_variant(const IpEndpoint& peer, const IpEndpoint& outer_source_pub,
+// 修复：IP_HDRINCL 下，外层源IP强制使用网卡实际绑定的私网IP (outer_source_bind) 应对云主机防欺骗
+bool send_ipv4_icmp_error_variant(const IpEndpoint& peer, const IpEndpoint& outer_source_bind,
                                   const IpEndpoint& inner_source, const IpEndpoint& inner_destination_pub,
                                   std::uint16_t inner_source_port, std::uint16_t inner_destination_port,
                                   std::uint16_t marker, IcmpErrorVariant variant, const std::string& iface) {
-    if (peer.family != AF_INET || outer_source_pub.family != AF_INET) return false;
+    if (peer.family != AF_INET || outer_source_bind.family != AF_INET) return false;
     int raw_fd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
     if (raw_fd < 0) return false;
     int enable = 1; setsockopt(raw_fd, IPPROTO_IP, IP_HDRINCL, &enable, sizeof(enable));
@@ -655,7 +655,7 @@ bool send_ipv4_icmp_error_variant(const IpEndpoint& peer, const IpEndpoint& oute
     auto* outer_ip = reinterpret_cast<iphdr*>(packet.data());
     outer_ip->ihl = 5; outer_ip->version = 4; outer_ip->tot_len = htons(packet.size());
     outer_ip->ttl = 64; outer_ip->protocol = IPPROTO_ICMP;
-    std::memcpy(&outer_ip->saddr, outer_source_pub.address.data(), 4);
+    std::memcpy(&outer_ip->saddr, outer_source_bind.address.data(), 4); // <--- 这里改用 bind_ep (私网)
     std::memcpy(&outer_ip->daddr, peer.address.data(), 4);
     outer_ip->check = calculate_checksum(outer_ip, sizeof(iphdr));
 
@@ -666,11 +666,11 @@ bool send_ipv4_icmp_error_variant(const IpEndpoint& peer, const IpEndpoint& oute
     inner_ip->ihl = 5; inner_ip->version = 4; inner_ip->tot_len = htons(sizeof(iphdr) + sizeof(udphdr));
     inner_ip->id = htons(marker); inner_ip->ttl = 64; inner_ip->protocol = IPPROTO_UDP;
     std::memcpy(&inner_ip->saddr, inner_source.address.data(), 4);
-    std::memcpy(&inner_ip->daddr, inner_destination_pub.address.data(), 4); // <--- pub_ep
+    std::memcpy(&inner_ip->daddr, inner_destination_pub.address.data(), 4); // 内层保留使用公网目标
     inner_ip->check = calculate_checksum(inner_ip, sizeof(iphdr));
 
     auto* inner_udp = reinterpret_cast<udphdr*>(packet.data() + sizeof(iphdr) + sizeof(icmphdr) + sizeof(iphdr));
-    inner_udp->source = htons(inner_source_port); inner_udp->dest = htons(inner_destination_port); // <--- pub_ep port
+    inner_udp->source = htons(inner_source_port); inner_udp->dest = htons(inner_destination_port);
     inner_udp->len = htons(sizeof(udphdr));
     inner_udp->check = calculate_udp_checksum_ipv4(*inner_ip, *inner_udp, nullptr, 0);
     if (inner_udp->check == 0) inner_udp->check = 0xFFFF;
@@ -688,9 +688,9 @@ bool send_ipv4_icmp_error_variant(const IpEndpoint& peer, const IpEndpoint& oute
     return sent == static_cast<ssize_t>(packet.size());
 }
 
-// 修复 #2: IP_HDRINCL 下发乱序分片，必须用公网 IP 防止丢弃
-bool send_out_of_order_fragmented_udp(const IpEndpoint& peer, const IpEndpoint& local_pub, const std::string& iface) {
-    if (peer.family != AF_INET || local_pub.family != AF_INET) return false;
+// 修复：IP_HDRINCL 下发乱序分片，外层IP强制使用本地绑定的私网IP通过云VPC网关，NAT将接管后续转换
+bool send_out_of_order_fragmented_udp(const IpEndpoint& peer, const IpEndpoint& local_bind, const std::string& iface) {
+    if (peer.family != AF_INET || local_bind.family != AF_INET) return false;
     int raw_fd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
     if (raw_fd < 0) return false;
     int enable = 1; setsockopt(raw_fd, IPPROTO_IP, IP_HDRINCL, &enable, sizeof(enable));
@@ -701,11 +701,11 @@ bool send_out_of_order_fragmented_udp(const IpEndpoint& peer, const IpEndpoint& 
     
     iphdr ip_base{};
     ip_base.ihl = 5; ip_base.version = 4; ip_base.id = htons(0x4A87); ip_base.ttl = 64; ip_base.protocol = IPPROTO_UDP;
-    std::memcpy(&ip_base.saddr, local_pub.address.data(), 4); // <--- 关键修复：写入公网源IP
+    std::memcpy(&ip_base.saddr, local_bind.address.data(), 4); // <--- 改回使用网卡的私有 IP
     std::memcpy(&ip_base.daddr, peer.address.data(), 4);
 
     udphdr udp{};
-    udp.source = htons(local_pub.port); udp.dest = htons(peer.port);
+    udp.source = htons(local_bind.port); udp.dest = htons(peer.port);
     udp.len = htons(sizeof(udphdr) + kRfc4787OutOfOrderFragmentPayload.size());
     udp.check = calculate_udp_checksum_ipv4(ip_base, udp, reinterpret_cast<const std::uint8_t*>(kRfc4787OutOfOrderFragmentPayload.data()), kRfc4787OutOfOrderFragmentPayload.size());
     if (udp.check == 0) udp.check = 0xFFFF;
@@ -965,9 +965,9 @@ void handle_tcp_client(int client_fd, const StunNode& primary, const StunNode& s
                         if (target.family != AF_INET || peer_endpoint.family != AF_INET) { 
                             log_tcp("IE (ICMP Error Variants)", "Family mismatch"); send_all(client_fd, "E=0\n"); continue; 
                         }
-                        bool s_out = send_ipv4_icmp_error_variant(target, primary.pub_ep, peer_endpoint, primary.pub_ep, target.port, primary.pub_ep.port, m_out, IcmpErrorVariant::BadOuterChecksum, primary.iface_name);
-                        bool s_in  = send_ipv4_icmp_error_variant(target, primary.pub_ep, peer_endpoint, primary.pub_ep, target.port, primary.pub_ep.port, m_in,  IcmpErrorVariant::BadInnerIpChecksum, primary.iface_name);
-                        bool s_udp = send_ipv4_icmp_error_variant(target, primary.pub_ep, peer_endpoint, primary.pub_ep, target.port, primary.pub_ep.port, m_udp, IcmpErrorVariant::BadUdpChecksum, primary.iface_name);
+                        bool s_out = send_ipv4_icmp_error_variant(target, primary.bind_ep, peer_endpoint, primary.pub_ep, target.port, primary.pub_ep.port, m_out, IcmpErrorVariant::BadOuterChecksum, primary.iface_name);
+                        bool s_in  = send_ipv4_icmp_error_variant(target, primary.bind_ep, peer_endpoint, primary.pub_ep, target.port, primary.pub_ep.port, m_in,  IcmpErrorVariant::BadInnerIpChecksum, primary.iface_name);
+                        bool s_udp = send_ipv4_icmp_error_variant(target, primary.bind_ep, peer_endpoint, primary.pub_ep, target.port, primary.pub_ep.port, m_udp, IcmpErrorVariant::BadUdpChecksum, primary.iface_name);
                         std::string res = std::string("E=") + ((s_out && s_in && s_udp) ? "1" : "0");
                         log_tcp("IE (ICMP Error Variants)", res); send_all(client_fd, res + "\n");
                     }
@@ -1109,7 +1109,7 @@ void handle_udp_packet(int rx_idx, const StunContext& ctx) {
     }
 
     if (received >= 1 && buffer[0] == 'O') {
-        bool sent = send_out_of_order_fragmented_udp(peer_endpoint, rx_node.pub_ep, rx_node.iface_name);
+        bool sent = send_out_of_order_fragmented_udp(peer_endpoint, rx_node.bind_ep, rx_node.iface_name);
         std::cout << "[UDP-CUST] Req from " << endpoint_host(peer_endpoint) << ":" << peer_endpoint.port << " | Cmd: O | Sent=" << sent << "\n";
         std::string reply = std::string("O=") + (sent ? "1" : "0") + "\n";
         sendto(udp_fd, reply.data(), reply.size(), 0, reinterpret_cast<sockaddr*>(&peer), peer_length);
