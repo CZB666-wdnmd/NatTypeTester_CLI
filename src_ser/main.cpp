@@ -220,18 +220,6 @@ IpEndpoint from_sockaddr(const sockaddr* address, socklen_t length) {
     fail("Unsupported sockaddr family");
 }
 
-std::pair<std::string, std::uint16_t> split_host_port(std::string_view input, std::uint16_t default_port) {
-    if (input.empty()) fail("Endpoint cannot be empty");
-    if (input.front() == '[') {
-        std::size_t end = input.find(']');
-        if (end == std::string_view::npos || end + 1 >= input.size() || input[end + 1] != ':') fail("Invalid IPv6 endpoint syntax");
-        return {std::string(input.substr(1, end - 1)), static_cast<std::uint16_t>(std::stoul(std::string(input.substr(end + 2))))};
-    }
-    std::size_t last_colon = input.rfind(':');
-    if (last_colon == std::string_view::npos || input.find(':') != last_colon) return {std::string(input), default_port};
-    return {std::string(input.substr(0, last_colon)), static_cast<std::uint16_t>(std::stoul(std::string(input.substr(last_colon + 1))))};
-}
-
 IpEndpoint resolve_endpoint(const std::string& host, std::uint16_t port) {
     addrinfo hints{};
     hints.ai_family = AF_UNSPEC;
@@ -621,8 +609,10 @@ void handle_icmp_packet(int raw_fd, IcmpRawContext& icmp_ctx) {
     const ssize_t received = recvfrom(raw_fd, buffer.data(), buffer.size(), 0, reinterpret_cast<sockaddr*>(&peer), &peer_length);
     if (received <= static_cast<ssize_t>(sizeof(iphdr) + sizeof(icmphdr))) return;
 
+    IpEndpoint peer_endpoint = from_sockaddr(reinterpret_cast<sockaddr*>(&peer), peer_length);
     const auto* ip_header = reinterpret_cast<const iphdr*>(buffer.data());
     if (ip_header->version != 4 || ip_header->protocol != IPPROTO_ICMP) return;
+    
     const std::size_t ip_header_length = static_cast<std::size_t>(ip_header->ihl) * 4;
     if (received <= static_cast<ssize_t>(ip_header_length + sizeof(icmphdr))) return;
 
@@ -632,8 +622,10 @@ void handle_icmp_packet(int raw_fd, IcmpRawContext& icmp_ctx) {
         if (static_cast<std::size_t>(received) >= min_size) {
             const auto* inner_ip = reinterpret_cast<const iphdr*>(buffer.data() + ip_header_length + sizeof(icmphdr));
             if (inner_ip->version == 4 && inner_ip->protocol == IPPROTO_UDP) {
+                uint16_t marker = ntohs(inner_ip->id);
+                std::cout << "[ICMP-RAW] Port Unreach from " << endpoint_host(peer_endpoint) << " | Marker=" << marker << "\n";
                 std::lock_guard<std::mutex> lock(icmp_ctx.observed_error_markers_mutex);
-                icmp_ctx.observed_error_markers.insert(ntohs(inner_ip->id));
+                icmp_ctx.observed_error_markers.insert(marker);
             }
         }
         return;
@@ -644,8 +636,8 @@ void handle_icmp_packet(int raw_fd, IcmpRawContext& icmp_ctx) {
     const std::size_t payload_size = static_cast<std::size_t>(received) - ip_header_length - sizeof(icmphdr);
     std::string_view payload(payload_data, payload_size);
 
-    IpEndpoint peer_endpoint = from_sockaddr(reinterpret_cast<sockaddr*>(&peer), peer_length);
     if (std::optional<std::string> token = parse_rfc5508_mapping_token(payload); token.has_value()) {
+        std::cout << "[ICMP-RAW] Echo Req from " << endpoint_host(peer_endpoint) << " | Token=" << *token << " | MapQuery=" << ntohs(icmp->un.echo.id) << "\n";
         IcmpMappingRecord record;
         record.peer_host = endpoint_host(peer_endpoint);
         record.mapped_query = ntohs(icmp->un.echo.id);
@@ -662,19 +654,37 @@ void handle_tcp_client(int client_fd, const StunNode& primary, const StunNode& s
         if (getpeername(client_fd, reinterpret_cast<sockaddr*>(&peer), &peer_length) != 0) throw system_error("getpeername failed");
         IpEndpoint peer_endpoint = from_sockaddr(reinterpret_cast<sockaddr*>(&peer), peer_length);
         
+        // 线程安全的打印助手
+        auto log_tcp = [&](const std::string& cmd, const std::string& extra = "") {
+            std::ostringstream oss;
+            oss << "[TCP-CUST] Req from " << endpoint_host(peer_endpoint) << ":" << peer_endpoint.port << " | Cmd: " << cmd;
+            if (!extra.empty()) oss << " | " << extra;
+            oss << "\n";
+            std::cout << oss.str();
+        };
+
+        log_tcp("NEW_CONNECTION");
+
         while (true) {
             std::string command = recv_line(client_fd, 30000);
-            if (command.empty()) return;
+            if (command.empty()) {
+                log_tcp("DISCONNECT");
+                return;
+            }
             
             if (command == "M") {
-                send_all(client_fd, endpoint_line(peer_endpoint)); continue;
+                log_tcp("M (Mapping Test)");
+                send_all(client_fd, endpoint_line(peer_endpoint)); 
+                continue;
             }
             if (command == "F") {
                 IpEndpoint p_src = primary.bind_ep; p_src.port = 0;
                 IpEndpoint s_src = secondary.bind_ep; s_src.port = 0;
                 bool p_ok = try_connect_from_source(p_src, peer_endpoint, timeout_ms);
                 bool s_ok = try_connect_from_source(s_src, peer_endpoint, timeout_ms);
-                send_all(client_fd, std::string("P=") + (p_ok ? "1" : "0") + " S=" + (s_ok ? "1" : "0") + "\n");
+                std::string res = std::string("P=") + (p_ok ? "1" : "0") + " S=" + (s_ok ? "1" : "0");
+                log_tcp("F (Filter Probe)", res);
+                send_all(client_fd, res + "\n");
                 continue;
             }
             if (command == "S") {
@@ -683,13 +693,17 @@ void handle_tcp_client(int client_fd, const StunNode& primary, const StunNode& s
                 bool imm_ok = try_connect_from_source(imm_src, peer_endpoint, timeout_ms);
                 std::this_thread::sleep_for(std::chrono::milliseconds(syn_delay_ms));
                 bool del_ok = try_connect_from_source(del_src, peer_endpoint, timeout_ms);
-                send_all(client_fd, std::string("I=") + (imm_ok ? "1" : "0") + " D=" + (del_ok ? "1" : "0") + "\n");
+                std::string res = std::string("I=") + (imm_ok ? "1" : "0") + " D=" + (del_ok ? "1" : "0");
+                log_tcp("S (SYN Delay Test)", res);
+                send_all(client_fd, res + "\n");
                 continue;
             }
             if (command == "U") {
                 IpEndpoint udp_src = primary.bind_ep; udp_src.port = 0;
                 bool sent = try_send_udp_from_source(udp_src, peer_endpoint, kRfc7857UdpProbePayload);
-                send_all(client_fd, std::string("R=") + (sent ? "1" : "0") + "\n");
+                std::string res = std::string("R=") + (sent ? "1" : "0");
+                log_tcp("U (UDP Probe)", res);
+                send_all(client_fd, res + "\n");
                 continue;
             }
             if (command.rfind("C ", 0) == 0) {
@@ -698,7 +712,9 @@ void handle_tcp_client(int client_fd, const StunNode& primary, const StunNode& s
                 IpEndpoint target = resolve_endpoint(target_host, target_port);
                 IpEndpoint src = primary.bind_ep; src.port = 0;
                 bool connected = try_connect_from_source(src, target, timeout_ms);
-                send_all(client_fd, std::string("R=") + (connected ? "1" : "0") + "\n");
+                std::string res = std::string("R=") + (connected ? "1" : "0");
+                log_tcp("C (Connect Target)", target_host + ":" + std::to_string(target_port) + " -> " + res);
+                send_all(client_fd, res + "\n");
                 continue;
             }
             if (command == "I") {
@@ -706,7 +722,9 @@ void handle_tcp_client(int client_fd, const StunNode& primary, const StunNode& s
                 getsockname(client_fd, reinterpret_cast<sockaddr*>(&local_addr), &local_length);
                 IpEndpoint local_endpoint = from_sockaddr(reinterpret_cast<sockaddr*>(&local_addr), local_length);
                 bool icmp_sent = send_ipv4_icmp_error(peer_endpoint, local_endpoint, IPPROTO_TCP);
-                send_all(client_fd, std::string("I=") + (icmp_sent ? "1" : "0") + "\n");
+                std::string res = std::string("I=") + (icmp_sent ? "1" : "0");
+                log_tcp("I (ICMP TCP Inject)", res);
+                send_all(client_fd, res + "\n");
                 continue;
             }
             if (command.rfind("V ", 0) == 0) {
@@ -716,8 +734,9 @@ void handle_tcp_client(int client_fd, const StunNode& primary, const StunNode& s
                 IpEndpoint local_endpoint = from_sockaddr(reinterpret_cast<sockaddr*>(&local_addr), local_length);
 
                 std::optional<std::uint16_t> obs_id = observe_udp_ipv4_id(peer_endpoint, local_endpoint, token, timeout_ms);
-                if (!obs_id.has_value()) send_all(client_fd, "V=-1\n");
-                else send_all(client_fd, "V=" + std::to_string(*obs_id) + "\n");
+                std::string res = obs_id.has_value() ? ("V=" + std::to_string(*obs_id)) : "V=-1";
+                log_tcp("V (Verify ID)", "Token=" + token + " -> " + res);
+                send_all(client_fd, res + "\n");
                 continue;
             }
             if (command.rfind("IE ", 0) == 0) {
@@ -725,28 +744,40 @@ void handle_tcp_client(int client_fd, const StunNode& primary, const StunNode& s
                 std::string op, target_literal;
                 std::uint16_t m_out = 0, m_in = 0, m_udp = 0;
                 if (!(stream >> op >> target_literal >> m_out >> m_in >> m_udp)) {
+                    log_tcp("IE (ICMP Error Variants)", "Invalid Params");
                     send_all(client_fd, "E=0\n"); continue;
                 }
                 auto [target_host, target_port] = split_host_port(target_literal, 0);
                 IpEndpoint target = resolve_endpoint(target_host, target_port);
-                if (target.family != AF_INET || peer_endpoint.family != AF_INET) { send_all(client_fd, "E=0\n"); continue; }
+                if (target.family != AF_INET || peer_endpoint.family != AF_INET) { 
+                    log_tcp("IE (ICMP Error Variants)", "Family mismatch");
+                    send_all(client_fd, "E=0\n"); continue; 
+                }
 
                 bool s_out = send_ipv4_icmp_error_variant(target, primary.bind_ep, peer_endpoint, primary.pub_ep, target.port, primary.pub_ep.port, m_out, IcmpErrorVariant::BadOuterChecksum);
                 bool s_in = send_ipv4_icmp_error_variant(target, primary.bind_ep, peer_endpoint, primary.pub_ep, target.port, primary.pub_ep.port, m_in, IcmpErrorVariant::BadInnerIpChecksum);
                 bool s_udp = send_ipv4_icmp_error_variant(target, primary.bind_ep, peer_endpoint, primary.pub_ep, target.port, primary.pub_ep.port, m_udp, IcmpErrorVariant::BadUdpChecksum);
-                send_all(client_fd, std::string("E=") + ((s_out && s_in && s_udp) ? "1" : "0") + "\n");
+                std::string res = std::string("E=") + ((s_out && s_in && s_udp) ? "1" : "0");
+                log_tcp("IE (ICMP Error Variants)", res);
+                send_all(client_fd, res + "\n");
                 continue;
             }
             if (command == "IRR") {
                 { std::lock_guard<std::mutex> lock(icmp_ctx.observed_error_markers_mutex); icmp_ctx.observed_error_markers.clear(); }
+                log_tcp("IRR (ICMP Reset Markers)");
                 send_all(client_fd, "R=1\n"); continue;
             }
             if (command.rfind("IR ", 0) == 0) {
                 std::istringstream stream(command); std::string op; std::uint16_t marker = 0;
-                if (!(stream >> op >> marker)) { send_all(client_fd, "R=0\n"); continue; }
+                if (!(stream >> op >> marker)) { 
+                    log_tcp("IR (ICMP Check Marker)", "Invalid Params");
+                    send_all(client_fd, "R=0\n"); continue; 
+                }
                 bool seen = false;
                 { std::lock_guard<std::mutex> lock(icmp_ctx.observed_error_markers_mutex); seen = icmp_ctx.observed_error_markers.contains(marker); }
-                send_all(client_fd, std::string("R=") + (seen ? "1" : "0") + "\n"); continue;
+                std::string res = std::string("R=") + (seen ? "1" : "0");
+                log_tcp("IR (ICMP Check Marker)", "Marker=" + std::to_string(marker) + " -> " + res);
+                send_all(client_fd, res + "\n"); continue;
             }
             if (command.rfind("IM ", 0) == 0) {
                 const std::string token = command.substr(3);
@@ -756,29 +787,46 @@ void handle_tcp_client(int client_fd, const StunNode& primary, const StunNode& s
                     auto it = icmp_ctx.mappings.find(token);
                     if (it != icmp_ctx.mappings.end()) record = it->second;
                 }
-                if (!record.has_value()) { send_all(client_fd, "ERR\n"); continue; }
+                if (!record.has_value()) { 
+                    log_tcp("IM (ICMP Get Mapping)", token + " -> Not Found");
+                    send_all(client_fd, "ERR\n"); continue; 
+                }
+                log_tcp("IM (ICMP Get Mapping)", token + " -> Found");
                 send_all(client_fd, "M " + record->peer_host + " " + std::to_string(record->mapped_query) + "\n");
                 continue;
             }
             if (command.rfind("IF ", 0) == 0) {
                 std::istringstream stream(command); std::string op, role, token; std::uint16_t probe_query = 0;
-                if (!(stream >> op >> role >> token >> probe_query) || role.size() != 1) { send_all(client_fd, "F=0\n"); continue; }
+                if (!(stream >> op >> role >> token >> probe_query) || role.size() != 1) { 
+                    log_tcp("IF (ICMP Fragment/Echo)", "Invalid Params");
+                    send_all(client_fd, "F=0\n"); continue; 
+                }
                 std::optional<IcmpMappingRecord> record;
                 {
                     std::lock_guard<std::mutex> lock(icmp_ctx.mappings_mutex);
                     auto it = icmp_ctx.mappings.find(token);
                     if (it != icmp_ctx.mappings.end()) record = it->second;
                 }
-                if (!record.has_value()) { send_all(client_fd, "F=0\n"); continue; }
+                if (!record.has_value()) { 
+                    log_tcp("IF (ICMP Fragment/Echo)", token + " -> No Mapping");
+                    send_all(client_fd, "F=0\n"); continue; 
+                }
 
                 int raw_fd = (role[0] == 'P') ? icmp_ctx.primary_socket : ((role[0] == 'S') ? icmp_ctx.secondary_socket : -1);
-                if (raw_fd < 0) { send_all(client_fd, "F=0\n"); continue; }
+                if (raw_fd < 0) { 
+                    log_tcp("IF (ICMP Fragment/Echo)", "Invalid Socket");
+                    send_all(client_fd, "F=0\n"); continue; 
+                }
                 IpEndpoint target = resolve_endpoint(record->peer_host, 0); target.port = 0;
                 const std::string payload = "RFC5508-F:" + token + ":" + std::to_string(probe_query);
                 bool sent = send_icmp_echo(raw_fd, target, ICMP_ECHO, record->mapped_query, probe_query, payload);
-                send_all(client_fd, std::string("F=") + (sent ? "1" : "0") + "\n");
+                std::string res = std::string("F=") + (sent ? "1" : "0");
+                log_tcp("IF (ICMP Fragment/Echo)", "Token=" + token + " Role=" + role + " -> " + res);
+                send_all(client_fd, res + "\n");
                 continue;
             }
+            
+            log_tcp("UNKNOWN_CMD", command);
             send_all(client_fd, "ERR\n");
         }
     } catch (...) {}
@@ -870,6 +918,12 @@ void handle_udp_packet(int rx_idx, const StunContext& ctx) {
             
             bool is_rfc5389 = (tx_id[0] == 0x21 && tx_id[1] == 0x12 && tx_id[2] == 0xA4 && tx_id[3] == 0x42);
 
+            std::cout << "[STUN] Req from " << endpoint_host(peer_endpoint) << ":" << peer_endpoint.port 
+                      << " | Rx: " << rx_node.pub_ep.port << " (IP-" << (rx_idx & 2 ? "2" : "1") << ")"
+                      << " | ChgIP=" << change_ip << " ChgPort=" << change_port 
+                      << " | Reply: " << endpoint_host(reply_node.pub_ep) << ":" << reply_node.pub_ep.port 
+                      << (reply_node.iface_name.empty() ? "" : (" via " + reply_node.iface_name)) << "\n";
+
             append_stun_address(stun_resp, 0x0001, peer_endpoint, tx_id, false); 
             append_stun_address(stun_resp, 0x0004, reply_node.pub_ep, tx_id, false);  
             append_stun_address(stun_resp, 0x0005, other_node.pub_ep, tx_id, false); 
@@ -891,6 +945,7 @@ void handle_udp_packet(int rx_idx, const StunContext& ctx) {
 
     // 2. 映射地址测试
     if (received >= 1 && buffer[0] == 'M') {
+        std::cout << "[UDP-CUST] Req from " << endpoint_host(peer_endpoint) << ":" << peer_endpoint.port << " | Cmd: M (Mapping Test)\n";
         std::string payload = endpoint_line(peer_endpoint);
         sendto(udp_fd, payload.data(), payload.size(), 0, reinterpret_cast<sockaddr*>(&peer), peer_length);
         return;
@@ -898,6 +953,7 @@ void handle_udp_packet(int rx_idx, const StunContext& ctx) {
 
     // 3. 配置拓扑下发指令 (Config): 强行返回 Node0 (IP1) 和 Node2 (IP2)，两者的 Port 完全一致，以便完美兼容老客户端
     if (received >= 1 && buffer[0] == 'C') {
+        std::cout << "[UDP-CUST] Req from " << endpoint_host(peer_endpoint) << ":" << peer_endpoint.port << " | Cmd: C (Config Matrix Download)\n";
         std::string payload = 
             "PRIMARY " + endpoint_host(ctx.nodes[0].pub_ep) + " " + std::to_string(ctx.nodes[0].pub_ep.port) + "\n" +
             "SECONDARY " + endpoint_host(ctx.nodes[2].pub_ep) + " " + std::to_string(ctx.nodes[2].pub_ep.port) + "\n";
@@ -909,6 +965,7 @@ void handle_udp_packet(int rx_idx, const StunContext& ctx) {
     // 4. ICMP 注入测试
     if (received >= 1 && buffer[0] == 'I') {
         bool sent = send_ipv4_icmp_error(peer_endpoint, rx_node.bind_ep, IPPROTO_UDP);
+        std::cout << "[UDP-CUST] Req from " << endpoint_host(peer_endpoint) << ":" << peer_endpoint.port << " | Cmd: I (ICMP UDP Inject) | Sent=" << sent << "\n";
         std::string reply = std::string("I=") + (sent ? "1" : "0") + "\n";
         sendto(udp_fd, reply.data(), reply.size(), 0, reinterpret_cast<sockaddr*>(&peer), peer_length);
         return;
@@ -917,6 +974,7 @@ void handle_udp_packet(int rx_idx, const StunContext& ctx) {
     // 5. 乱序分片 UDP 测试
     if (received >= 1 && buffer[0] == 'O') {
         bool sent = send_out_of_order_fragmented_udp(peer_endpoint, rx_node.bind_ep);
+        std::cout << "[UDP-CUST] Req from " << endpoint_host(peer_endpoint) << ":" << peer_endpoint.port << " | Cmd: O (Out-of-order Fragment) | Sent=" << sent << "\n";
         std::string reply = std::string("O=") + (sent ? "1" : "0") + "\n";
         sendto(udp_fd, reply.data(), reply.size(), 0, reinterpret_cast<sockaddr*>(&peer), peer_length);
         return;
@@ -967,7 +1025,6 @@ int main(int argc, char** argv) {
             else std::cout << "  (Device: Default)\n";
         }
 
-        // 使用 Node0(IP1:Port1) 和 Node2(IP2:Port1) 作为自定义测试的 Primary 和 Secondary
         int primary_tcp_fd = create_tcp_listener(stun_ctx.nodes[0].bind_ep);
         int secondary_tcp_fd = create_tcp_listener(stun_ctx.nodes[2].bind_ep);
 
@@ -976,7 +1033,8 @@ int main(int argc, char** argv) {
             stun_ctx.icmp_ctx.secondary_socket = create_icmp_raw_listener(stun_ctx.nodes[2].bind_ep);
         }
 
-        std::cout << "\n>>> Server fully ready! TCP/ICMP custom tests attached to Node 0 and Node 2.\n";
+        std::cout << "\n>>> Server fully ready! Logs will appear below...\n";
+        std::cout << "========================================================\n";
 
         while (true) {
             std::array<pollfd, 8> descriptors{{
