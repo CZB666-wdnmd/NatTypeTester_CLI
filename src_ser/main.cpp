@@ -113,18 +113,18 @@ bool ensure_iptables_icmp_notrack() {
 bool ensure_nftables_icmp_notrack() {
     if (!command_exists("nft")) return false;
     bool ok = true;
-    if (!run_shell_command("nft list table inet raw >/dev/null 2>&1") &&
-        !run_shell_command("nft add table inet raw >/dev/null 2>&1")) ok = false;
-    if (!run_shell_command("nft list chain inet raw prerouting >/dev/null 2>&1") &&
-        !run_shell_command("nft add chain inet raw prerouting '{ type filter hook prerouting priority raw; }' >/dev/null 2>&1")) ok = false;
-    if (!run_shell_command("nft list chain inet raw output >/dev/null 2>&1") &&
-        !run_shell_command("nft add chain inet raw output '{ type filter hook output priority raw; }' >/dev/null 2>&1")) ok = false;
+    if (!run_shell_command("nft list table ip raw >/dev/null 2>&1") &&
+        !run_shell_command("nft add table ip raw >/dev/null 2>&1")) ok = false;
+    if (!run_shell_command("nft list chain ip raw prerouting >/dev/null 2>&1") &&
+        !run_shell_command("nft add chain ip raw prerouting '{ type filter hook prerouting priority raw; }' >/dev/null 2>&1")) ok = false;
+    if (!run_shell_command("nft list chain ip raw output >/dev/null 2>&1") &&
+        !run_shell_command("nft add chain ip raw output '{ type filter hook output priority raw; }' >/dev/null 2>&1")) ok = false;
     
-    if (!run_shell_command("nft list chain inet raw output 2>/dev/null | grep -Eq 'meta l4proto \\{ icmp, ipv6-icmp \\} notrack'")) {
-        run_shell_command("nft add rule inet raw output meta l4proto '{ icmp, ipv6-icmp }' notrack >/dev/null 2>&1");
+    if (!run_shell_command("nft list chain ip raw output 2>/dev/null | grep -Eq '^[[:space:]]*ip protocol icmp notrack([[:space:]].*)?$'")) {
+        if (!run_shell_command("nft add rule ip raw output ip protocol icmp notrack >/dev/null 2>&1")) ok = false;
     }
-    if (!run_shell_command("nft list chain inet raw prerouting 2>/dev/null | grep -Eq 'meta l4proto \\{ icmp, ipv6-icmp \\} notrack'")) {
-        run_shell_command("nft add rule inet raw prerouting meta l4proto '{ icmp, ipv6-icmp }' notrack >/dev/null 2>&1");
+    if (!run_shell_command("nft list chain ip raw prerouting 2>/dev/null | grep -Eq '^[[:space:]]*ip protocol icmp notrack([[:space:]].*)?$'")) {
+        if (!run_shell_command("nft add rule ip raw prerouting ip protocol icmp notrack >/dev/null 2>&1")) ok = false;
     }
     return ok;
 }
@@ -132,7 +132,11 @@ bool ensure_nftables_icmp_notrack() {
 void ensure_icmp_conntrack_bypass() {
     bool configured = ensure_iptables_icmp_notrack();
     if (!configured) configured = ensure_nftables_icmp_notrack();
-    if (configured) std::cout << "Note: ICMP/ICMPv6 conntrack bypass (notrack) is active.\n";
+    if (configured) {
+        std::cout << "Note: ICMP conntrack bypass (notrack) is active for raw ICMP probes.\n";
+        return;
+    }
+    if (geteuid() != 0) std::cerr << "Warning: ICMP notrack rules not configured (run as root). Raw ICMP probes may be dropped.\n";
     else std::cerr << "Warning: Failed to configure ICMP notrack rules via iptables/nft.\n";
 }
 
@@ -160,14 +164,10 @@ std::string get_interface_name(const IpEndpoint& endpoint) {
         
         if (endpoint.family == AF_INET) {
             auto* ipv4 = reinterpret_cast<sockaddr_in*>(ifa->ifa_addr);
-            if (std::memcmp(&ipv4->sin_addr, endpoint.address.data(), 4) == 0) {
-                return ifa->ifa_name;
-            }
+            if (std::memcmp(&ipv4->sin_addr, endpoint.address.data(), 4) == 0) return ifa->ifa_name;
         } else if (endpoint.family == AF_INET6) {
             auto* ipv6 = reinterpret_cast<sockaddr_in6*>(ifa->ifa_addr);
-            if (std::memcmp(&ipv6->sin6_addr, endpoint.address.data(), 16) == 0) {
-                return ifa->ifa_name;
-            }
+            if (std::memcmp(&ipv6->sin6_addr, endpoint.address.data(), 16) == 0) return ifa->ifa_name;
         }
     }
     return "";
@@ -236,11 +236,11 @@ std::pair<std::string, std::uint16_t> split_host_port(std::string_view input, st
 IpEndpoint resolve_endpoint(const std::string& host, std::uint16_t port) {
     addrinfo hints{};
     hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_DGRAM; 
+    hints.ai_socktype = SOCK_STREAM; 
+    hints.ai_protocol = IPPROTO_TCP;
     addrinfo* result = nullptr;
     
-    std::string port_str = std::to_string(port);
-    int rc = getaddrinfo(host.c_str(), port_str.c_str(), &hints, &result);
+    int rc = getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &result);
     if (rc != 0) fail(std::string("getaddrinfo failed: ") + gai_strerror(rc));
 
     std::unique_ptr<addrinfo, decltype(&freeaddrinfo)> guard(result, freeaddrinfo);
@@ -290,7 +290,7 @@ int create_icmp_raw_listener(const IpEndpoint& endpoint, const std::string& ifac
     int socket_fd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
     if (socket_fd < 0) return -1;
     set_reuse_options(socket_fd);
-    bind_socket_to_device(socket_fd, iface); // 修复：绑定设备
+    bind_socket_to_device(socket_fd, iface);
     IpEndpoint bind_endpoint = endpoint;
     bind_endpoint.port = 0;
     SocketAddress address = to_sockaddr(bind_endpoint);
@@ -321,6 +321,25 @@ void send_all(int socket_fd, std::string_view payload) {
         if (written <= 0) throw system_error("send failed");
         offset += static_cast<std::size_t>(written);
     }
+}
+
+std::string recv_line(int socket_fd, int timeout_ms) {
+    std::string line;
+    std::array<char, 256> buffer{};
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (line.find('\n') == std::string::npos) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) throw std::runtime_error("recv timed out");
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+        pollfd descriptor{socket_fd, POLLIN, 0};
+        const int rc = poll(&descriptor, 1, static_cast<int>(remaining.count()));
+        if (rc <= 0 || (descriptor.revents & POLLIN) == 0) throw std::runtime_error("recv timed out");
+        ssize_t received = recv(socket_fd, buffer.data(), buffer.size(), 0);
+        if (received <= 0) break;
+        line.append(buffer.data(), static_cast<std::size_t>(received));
+        if (line.size() > 4096) fail("Protocol line too long");
+    }
+    return line.empty() ? "" : line.substr(0, line.find('\n'));
 }
 
 std::uint16_t calculate_checksum(const void* data, std::size_t len) {
@@ -362,14 +381,13 @@ std::uint16_t calculate_udp_checksum_ipv4(const iphdr& ip_header, const udphdr& 
 
 // ================= Custom TCP Helper Functions =================
 
-// 修复：强制绑定探测接口，防止动态连接时 Linux 内核按路由表伪造源 IP
 bool try_connect_from_source(const IpEndpoint& source_bind, const std::string& iface, const IpEndpoint& target, int timeout_ms) {
     int socket_fd = socket(target.family, SOCK_STREAM, IPPROTO_TCP);
     if (socket_fd < 0) return false;
     bool success = false;
     try {
         set_reuse_options(socket_fd);
-        bind_socket_to_device(socket_fd, iface); // <--- 关键修复：指定接口
+        bind_socket_to_device(socket_fd, iface);
         SocketAddress source = to_sockaddr(source_bind);
         if (bind(socket_fd, reinterpret_cast<sockaddr*>(&source.storage), source.length) == 0) {
             int flags = fcntl(socket_fd, F_GETFL, 0);
@@ -391,14 +409,13 @@ bool try_connect_from_source(const IpEndpoint& source_bind, const std::string& i
     return success;
 }
 
-// 修复：强制绑定探测接口
 bool try_send_udp_from_source(const IpEndpoint& source_bind, const std::string& iface, const IpEndpoint& target, std::string_view payload) {
     int socket_fd = socket(target.family, SOCK_DGRAM, IPPROTO_UDP);
     if (socket_fd < 0) return false;
     bool success = false;
     try {
         set_reuse_options(socket_fd);
-        bind_socket_to_device(socket_fd, iface); // <--- 关键修复：指定接口
+        bind_socket_to_device(socket_fd, iface);
         SocketAddress source = to_sockaddr(source_bind);
         bind(socket_fd, reinterpret_cast<sockaddr*>(&source.storage), source.length);
         SocketAddress destination = to_sockaddr(target);
@@ -416,11 +433,15 @@ std::optional<std::uint16_t> parse_payload_id(std::string_view payload, std::str
     const std::size_t newline = id_text.find('\n');
     if (newline != std::string_view::npos) id_text = id_text.substr(0, newline);
     if (id_text.empty()) return std::nullopt;
-    try { return static_cast<std::uint16_t>(std::stoi(std::string(id_text))); } catch (...) { return std::nullopt; }
+    try {
+        const int parsed = std::stoi(std::string(id_text));
+        if (parsed < 0 || parsed > 65535) return std::nullopt;
+        return static_cast<std::uint16_t>(parsed);
+    } catch (...) { return std::nullopt; }
 }
 
-std::optional<std::uint16_t> observe_udp_ipv4_id(const IpEndpoint& peer, const IpEndpoint& local, std::string_view token, const std::string& iface, int timeout_ms) {
-    if (peer.family != AF_INET || local.family != AF_INET) return std::nullopt;
+std::optional<std::uint16_t> observe_udp_ipv4_id(const IpEndpoint& peer, const IpEndpoint& local_bind, std::string_view token, const std::string& iface, int timeout_ms) {
+    if (peer.family != AF_INET || local_bind.family != AF_INET) return std::nullopt;
     int raw_fd = socket(AF_INET, SOCK_RAW, IPPROTO_UDP);
     if (raw_fd < 0) return std::nullopt;
     bind_socket_to_device(raw_fd, iface);
@@ -443,8 +464,8 @@ std::optional<std::uint16_t> observe_udp_ipv4_id(const IpEndpoint& peer, const I
             if (ip_header_length < sizeof(iphdr) || received <= static_cast<ssize_t>(ip_header_length + sizeof(udphdr))) continue;
             
             const auto* udp_header = reinterpret_cast<const udphdr*>(buffer.data() + ip_header_length);
-            if (ntohs(udp_header->dest) != local.port) continue;
-            if (std::memcmp(&ip_header->saddr, peer.address.data(), 4) != 0 || std::memcmp(&ip_header->daddr, local.address.data(), 4) != 0) continue;
+            if (ntohs(udp_header->dest) != local_bind.port) continue;
+            if (std::memcmp(&ip_header->saddr, peer.address.data(), 4) != 0 || std::memcmp(&ip_header->daddr, local_bind.address.data(), 4) != 0) continue;
 
             const char* payload_data = reinterpret_cast<const char*>(buffer.data() + ip_header_length + sizeof(udphdr));
             const std::size_t payload_size = static_cast<std::size_t>(received) - ip_header_length - sizeof(udphdr);
@@ -473,8 +494,8 @@ bool send_icmp_echo(int raw_fd, const IpEndpoint& target, std::uint8_t type, std
     return sent == static_cast<ssize_t>(packet.size());
 }
 
-// 修复：强制绑定探测接口
-bool send_ipv4_icmp_error(const IpEndpoint& peer, const IpEndpoint& local, int protocol, const std::string& iface) {
+// 修复 #2: 内层 IP 负荷必须使用 NAT public 端地址，以免连接跟踪失败
+bool send_ipv4_icmp_error(const IpEndpoint& peer, const IpEndpoint& local_pub, int protocol, const std::string& iface) {
     if (peer.family == AF_INET) {
         int raw_fd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
         if (raw_fd < 0) return false;
@@ -488,11 +509,11 @@ bool send_ipv4_icmp_error(const IpEndpoint& peer, const IpEndpoint& local, int p
         inner_ip->ihl = 5; inner_ip->version = 4; inner_ip->tot_len = htons(sizeof(iphdr) + 8);
         inner_ip->id = htons(0x1234); inner_ip->ttl = 64; inner_ip->protocol = protocol; 
         std::memcpy(&inner_ip->saddr, peer.address.data(), 4);
-        std::memcpy(&inner_ip->daddr, local.address.data(), 4);
+        std::memcpy(&inner_ip->daddr, local_pub.address.data(), 4); // <--- 使用 pub_ep
         inner_ip->check = calculate_checksum(inner_ip, sizeof(iphdr));
 
         std::uint8_t* inner_l4 = packet.data() + sizeof(icmphdr) + sizeof(iphdr);
-        std::uint16_t sport = htons(peer.port), dport = htons(local.port);
+        std::uint16_t sport = htons(peer.port), dport = htons(local_pub.port); // <--- 使用 pub_ep 端口
         std::memcpy(inner_l4, &sport, 2); std::memcpy(inner_l4 + 2, &dport, 2);
         icmp->checksum = calculate_checksum(packet.data(), packet.size());
 
@@ -505,12 +526,12 @@ bool send_ipv4_icmp_error(const IpEndpoint& peer, const IpEndpoint& local, int p
     return false;
 }
 
-// 修复：强制绑定探测接口
-bool send_ipv4_icmp_error_variant(const IpEndpoint& peer, const IpEndpoint& outer_source,
-                                  const IpEndpoint& inner_source, const IpEndpoint& inner_destination,
+// 修复 #2: IP_HDRINCL 下，外层与内层源 IP 强制使用公网地址，应对 VPC SNAT 不转换分片的场景
+bool send_ipv4_icmp_error_variant(const IpEndpoint& peer, const IpEndpoint& outer_source_pub,
+                                  const IpEndpoint& inner_source, const IpEndpoint& inner_destination_pub,
                                   std::uint16_t inner_source_port, std::uint16_t inner_destination_port,
                                   std::uint16_t marker, IcmpErrorVariant variant, const std::string& iface) {
-    if (peer.family != AF_INET || outer_source.family != AF_INET) return false;
+    if (peer.family != AF_INET || outer_source_pub.family != AF_INET) return false;
     int raw_fd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
     if (raw_fd < 0) return false;
     int enable = 1; setsockopt(raw_fd, IPPROTO_IP, IP_HDRINCL, &enable, sizeof(enable));
@@ -520,7 +541,7 @@ bool send_ipv4_icmp_error_variant(const IpEndpoint& peer, const IpEndpoint& oute
     auto* outer_ip = reinterpret_cast<iphdr*>(packet.data());
     outer_ip->ihl = 5; outer_ip->version = 4; outer_ip->tot_len = htons(packet.size());
     outer_ip->ttl = 64; outer_ip->protocol = IPPROTO_ICMP;
-    std::memcpy(&outer_ip->saddr, outer_source.address.data(), 4);
+    std::memcpy(&outer_ip->saddr, outer_source_pub.address.data(), 4);
     std::memcpy(&outer_ip->daddr, peer.address.data(), 4);
     outer_ip->check = calculate_checksum(outer_ip, sizeof(iphdr));
 
@@ -531,11 +552,11 @@ bool send_ipv4_icmp_error_variant(const IpEndpoint& peer, const IpEndpoint& oute
     inner_ip->ihl = 5; inner_ip->version = 4; inner_ip->tot_len = htons(sizeof(iphdr) + sizeof(udphdr));
     inner_ip->id = htons(marker); inner_ip->ttl = 64; inner_ip->protocol = IPPROTO_UDP;
     std::memcpy(&inner_ip->saddr, inner_source.address.data(), 4);
-    std::memcpy(&inner_ip->daddr, inner_destination.address.data(), 4);
+    std::memcpy(&inner_ip->daddr, inner_destination_pub.address.data(), 4); // <--- pub_ep
     inner_ip->check = calculate_checksum(inner_ip, sizeof(iphdr));
 
     auto* inner_udp = reinterpret_cast<udphdr*>(packet.data() + sizeof(iphdr) + sizeof(icmphdr) + sizeof(iphdr));
-    inner_udp->source = htons(inner_source_port); inner_udp->dest = htons(inner_destination_port);
+    inner_udp->source = htons(inner_source_port); inner_udp->dest = htons(inner_destination_port); // <--- pub_ep port
     inner_udp->len = htons(sizeof(udphdr));
     inner_udp->check = calculate_udp_checksum_ipv4(*inner_ip, *inner_udp, nullptr, 0);
     if (inner_udp->check == 0) inner_udp->check = 0xFFFF;
@@ -553,9 +574,9 @@ bool send_ipv4_icmp_error_variant(const IpEndpoint& peer, const IpEndpoint& oute
     return sent == static_cast<ssize_t>(packet.size());
 }
 
-// 修复：强制绑定探测接口
-bool send_out_of_order_fragmented_udp(const IpEndpoint& peer, const IpEndpoint& local, const std::string& iface) {
-    if (peer.family != AF_INET || local.family != AF_INET) return false;
+// 修复 #2: IP_HDRINCL 下发乱序分片，必须用公网 IP 防止丢弃
+bool send_out_of_order_fragmented_udp(const IpEndpoint& peer, const IpEndpoint& local_pub, const std::string& iface) {
+    if (peer.family != AF_INET || local_pub.family != AF_INET) return false;
     int raw_fd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
     if (raw_fd < 0) return false;
     int enable = 1; setsockopt(raw_fd, IPPROTO_IP, IP_HDRINCL, &enable, sizeof(enable));
@@ -566,10 +587,11 @@ bool send_out_of_order_fragmented_udp(const IpEndpoint& peer, const IpEndpoint& 
     
     iphdr ip_base{};
     ip_base.ihl = 5; ip_base.version = 4; ip_base.id = htons(0x4A87); ip_base.ttl = 64; ip_base.protocol = IPPROTO_UDP;
-    std::memcpy(&ip_base.saddr, local.address.data(), 4); std::memcpy(&ip_base.daddr, peer.address.data(), 4);
+    std::memcpy(&ip_base.saddr, local_pub.address.data(), 4); // <--- 关键修复：写入公网源IP
+    std::memcpy(&ip_base.daddr, peer.address.data(), 4);
 
     udphdr udp{};
-    udp.source = htons(local.port); udp.dest = htons(peer.port);
+    udp.source = htons(local_pub.port); udp.dest = htons(peer.port);
     udp.len = htons(sizeof(udphdr) + kRfc4787OutOfOrderFragmentPayload.size());
     udp.check = calculate_udp_checksum_ipv4(ip_base, udp, reinterpret_cast<const std::uint8_t*>(kRfc4787OutOfOrderFragmentPayload.data()), kRfc4787OutOfOrderFragmentPayload.size());
     if (udp.check == 0) udp.check = 0xFFFF;
@@ -707,7 +729,6 @@ void handle_icmp_packet(int raw_fd, IcmpRawContext& icmp_ctx) {
     send_icmp_echo(raw_fd, peer_endpoint, ICMP_ECHOREPLY, ntohs(icmp->un.echo.id), ntohs(icmp->un.echo.sequence), std::string(payload));
 }
 
-// 修复：TCP 支持协议复用（STUN + 明文指令）与 接口绑定注入
 void handle_tcp_client(int client_fd, const StunNode& primary, const StunNode& secondary, IcmpRawContext& icmp_ctx, int timeout_ms, int syn_delay_ms) {
     try {
         sockaddr_storage peer{}; socklen_t peer_length = sizeof(peer);
@@ -719,8 +740,10 @@ void handle_tcp_client(int client_fd, const StunNode& primary, const StunNode& s
         IpEndpoint local_endpoint = from_sockaddr(reinterpret_cast<sockaddr*>(&local), local_length);
 
         std::string current_iface = primary.iface_name;
+        IpEndpoint current_pub_ep = primary.pub_ep;
         if (local_endpoint.port == secondary.bind_ep.port && std::memcmp(local_endpoint.address.data(), secondary.bind_ep.address.data(), local_endpoint.address_length) == 0) {
             current_iface = secondary.iface_name;
+            current_pub_ep = secondary.pub_ep;
         }
 
         auto log_tcp = [&](const std::string& cmd, const std::string& extra = "") {
@@ -745,24 +768,21 @@ void handle_tcp_client(int client_fd, const StunNode& primary, const StunNode& s
             tcp_buffer.insert(tcp_buffer.end(), buf.begin(), buf.begin() + received);
 
             while (!tcp_buffer.empty()) {
-                // 判断是否是 STUN over TCP 请求 (0x00 / 0x01)
-                if (tcp_buffer[0] == 0x00 || tcp_buffer[0] == 0x01) {
+                if (tcp_buffer[0] == 0x00 || tcp_buffer[0] == 0x01) { // STUN Multplexing
                     if (tcp_buffer.size() < 20) break;
                     uint16_t msg_length = static_cast<uint16_t>((tcp_buffer[2] << 8) | tcp_buffer[3]);
                     if (tcp_buffer.size() < 20U + msg_length) break;
 
                     uint16_t msg_type = static_cast<uint16_t>((tcp_buffer[0] << 8) | tcp_buffer[1]);
-                    if (msg_type == 0x0001) { // Binding Request
+                    if (msg_type == 0x0001) { 
                         const uint8_t* tx_id = tcp_buffer.data() + 4;
                         bool is_rfc5389 = (tx_id[0] == 0x21 && tx_id[1] == 0x12 && tx_id[2] == 0xA4 && tx_id[3] == 0x42);
-                        
                         auto stun_resp = generate_stun_binding_response(tx_id, peer_endpoint, primary.pub_ep, secondary.pub_ep, is_rfc5389);
                         send_all(client_fd, std::string_view(reinterpret_cast<const char*>(stun_resp.data()), stun_resp.size()));
-                        log_tcp("STUN Binding Req (TCP)", "Sent mapped address, resolved Hairpinning issue natively");
+                        log_tcp("STUN Binding Req (TCP)", "Sent mapped address");
                     }
                     tcp_buffer.erase(tcp_buffer.begin(), tcp_buffer.begin() + 20 + msg_length);
                 } else {
-                    // 自定义文本测试指令处理
                     auto newline_pos = std::find(tcp_buffer.begin(), tcp_buffer.end(), '\n');
                     if (newline_pos == tcp_buffer.end()) {
                         if (tcp_buffer.size() > 4096) throw std::runtime_error("Line too long");
@@ -773,83 +793,69 @@ void handle_tcp_client(int client_fd, const StunNode& primary, const StunNode& s
                     if (!command.empty() && command.back() == '\r') command.pop_back();
 
                     if (command == "M") {
-                        log_tcp("M (Mapping Test)");
-                        send_all(client_fd, endpoint_line(peer_endpoint));
+                        log_tcp("M (Mapping Test)"); send_all(client_fd, endpoint_line(peer_endpoint));
                     }
                     else if (command == "F") {
                         IpEndpoint p_src = primary.bind_ep; p_src.port = 0;
                         IpEndpoint s_src = secondary.bind_ep; s_src.port = 0;
-                        // 强制透传 interface name
                         bool p_ok = try_connect_from_source(p_src, primary.iface_name, peer_endpoint, timeout_ms);
                         bool s_ok = try_connect_from_source(s_src, secondary.iface_name, peer_endpoint, timeout_ms);
                         std::string res = std::string("P=") + (p_ok ? "1" : "0") + " S=" + (s_ok ? "1" : "0");
-                        log_tcp("F (Filter Probe)", res);
-                        send_all(client_fd, res + "\n");
+                        log_tcp("F (Filter Probe)", res); send_all(client_fd, res + "\n");
                     }
                     else if (command == "S") {
                         IpEndpoint imm_src = secondary.bind_ep; imm_src.port = 0;
                         IpEndpoint del_src = primary.bind_ep; del_src.port = 0;
-                        // 强制透传 interface name
                         bool imm_ok = try_connect_from_source(imm_src, secondary.iface_name, peer_endpoint, timeout_ms);
                         std::this_thread::sleep_for(std::chrono::milliseconds(syn_delay_ms));
                         bool del_ok = try_connect_from_source(del_src, primary.iface_name, peer_endpoint, timeout_ms);
                         std::string res = std::string("I=") + (imm_ok ? "1" : "0") + " D=" + (del_ok ? "1" : "0");
-                        log_tcp("S (SYN Delay Test)", res);
-                        send_all(client_fd, res + "\n");
+                        log_tcp("S (SYN Delay Test)", res); send_all(client_fd, res + "\n");
                     }
                     else if (command == "U") {
                         IpEndpoint udp_src = primary.bind_ep; udp_src.port = 0;
-                        // 强制透传 interface name
                         bool sent = try_send_udp_from_source(udp_src, primary.iface_name, peer_endpoint, kRfc7857UdpProbePayload);
                         std::string res = std::string("R=") + (sent ? "1" : "0");
-                        log_tcp("U (UDP Probe)", res);
-                        send_all(client_fd, res + "\n");
+                        log_tcp("U (UDP Probe)", res); send_all(client_fd, res + "\n");
                     }
                     else if (command.rfind("C ", 0) == 0) {
                         const std::string ep_str = command.substr(2);
                         auto [target_host, target_port] = split_host_port(ep_str, 0);
                         IpEndpoint target = resolve_endpoint(target_host, target_port);
                         IpEndpoint src = primary.bind_ep; src.port = 0;
-                        // 强制透传 interface name
                         bool connected = try_connect_from_source(src, primary.iface_name, target, timeout_ms);
                         std::string res = std::string("R=") + (connected ? "1" : "0");
                         log_tcp("C (Connect Target)", target_host + ":" + std::to_string(target_port) + " -> " + res);
                         send_all(client_fd, res + "\n");
                     }
                     else if (command == "I") {
-                        // 强制透传 interface name
-                        bool icmp_sent = send_ipv4_icmp_error(peer_endpoint, local_endpoint, IPPROTO_TCP, current_iface);
+                        bool icmp_sent = send_ipv4_icmp_error(peer_endpoint, current_pub_ep, IPPROTO_TCP, current_iface);
                         std::string res = std::string("I=") + (icmp_sent ? "1" : "0");
-                        log_tcp("I (ICMP TCP Inject)", res);
-                        send_all(client_fd, res + "\n");
+                        log_tcp("I (ICMP TCP Inject)", res); send_all(client_fd, res + "\n");
                     }
                     else if (command.rfind("V ", 0) == 0) {
                         std::string token = command.substr(2);
-                        // 强制透传 interface name
+                        // Here local_endpoint must be the private IP because the kernel receives it pre-NAT
                         std::optional<std::uint16_t> obs_id = observe_udp_ipv4_id(peer_endpoint, local_endpoint, token, current_iface, timeout_ms);
                         std::string res = obs_id.has_value() ? ("V=" + std::to_string(*obs_id)) : "V=-1";
-                        log_tcp("V (Verify ID)", "Token=" + token + " -> " + res);
-                        send_all(client_fd, res + "\n");
+                        log_tcp("V (Verify ID)", "Token=" + token + " -> " + res); send_all(client_fd, res + "\n");
                     }
                     else if (command.rfind("IE ", 0) == 0) {
                         std::istringstream stream(command); std::string op, target_literal;
                         std::uint16_t m_out = 0, m_in = 0, m_udp = 0;
                         if (!(stream >> op >> target_literal >> m_out >> m_in >> m_udp)) {
-                            log_tcp("IE (ICMP Error Variants)", "Invalid Params");
-                            send_all(client_fd, "E=0\n"); continue;
+                            log_tcp("IE (ICMP Error Variants)", "Invalid Params"); send_all(client_fd, "E=0\n"); continue;
                         }
                         auto [target_host, target_port] = split_host_port(target_literal, 0);
                         IpEndpoint target = resolve_endpoint(target_host, target_port);
                         if (target.family != AF_INET || peer_endpoint.family != AF_INET) { 
                             log_tcp("IE (ICMP Error Variants)", "Family mismatch"); send_all(client_fd, "E=0\n"); continue; 
                         }
-                        // 强制透传 interface name
-                        bool s_out = send_ipv4_icmp_error_variant(target, primary.bind_ep, peer_endpoint, primary.pub_ep, target.port, primary.pub_ep.port, m_out, IcmpErrorVariant::BadOuterChecksum, primary.iface_name);
-                        bool s_in  = send_ipv4_icmp_error_variant(target, primary.bind_ep, peer_endpoint, primary.pub_ep, target.port, primary.pub_ep.port, m_in,  IcmpErrorVariant::BadInnerIpChecksum, primary.iface_name);
-                        bool s_udp = send_ipv4_icmp_error_variant(target, primary.bind_ep, peer_endpoint, primary.pub_ep, target.port, primary.pub_ep.port, m_udp, IcmpErrorVariant::BadUdpChecksum, primary.iface_name);
+                        bool s_out = send_ipv4_icmp_error_variant(target, primary.pub_ep, peer_endpoint, primary.pub_ep, target.port, primary.pub_ep.port, m_out, IcmpErrorVariant::BadOuterChecksum, primary.iface_name);
+                        bool s_in  = send_ipv4_icmp_error_variant(target, primary.pub_ep, peer_endpoint, primary.pub_ep, target.port, primary.pub_ep.port, m_in,  IcmpErrorVariant::BadInnerIpChecksum, primary.iface_name);
+                        bool s_udp = send_ipv4_icmp_error_variant(target, primary.pub_ep, peer_endpoint, primary.pub_ep, target.port, primary.pub_ep.port, m_udp, IcmpErrorVariant::BadUdpChecksum, primary.iface_name);
                         std::string res = std::string("E=") + ((s_out && s_in && s_udp) ? "1" : "0");
-                        log_tcp("IE (ICMP Error Variants)", res);
-                        send_all(client_fd, res + "\n");
+                        log_tcp("IE (ICMP Error Variants)", res); send_all(client_fd, res + "\n");
                     }
                     else if (command == "IRR") {
                         { std::lock_guard<std::mutex> lock(icmp_ctx.observed_error_markers_mutex); icmp_ctx.observed_error_markers.clear(); }
@@ -861,8 +867,7 @@ void handle_tcp_client(int client_fd, const StunNode& primary, const StunNode& s
                         bool seen = false;
                         { std::lock_guard<std::mutex> lock(icmp_ctx.observed_error_markers_mutex); seen = icmp_ctx.observed_error_markers.contains(marker); }
                         std::string res = std::string("R=") + (seen ? "1" : "0");
-                        log_tcp("IR (ICMP Check Marker)", "Marker=" + std::to_string(marker) + " -> " + res);
-                        send_all(client_fd, res + "\n");
+                        log_tcp("IR (ICMP Check Marker)", "Marker=" + std::to_string(marker) + " -> " + res); send_all(client_fd, res + "\n");
                     }
                     else if (command.rfind("IM ", 0) == 0) {
                         const std::string token = command.substr(3);
@@ -893,8 +898,7 @@ void handle_tcp_client(int client_fd, const StunNode& primary, const StunNode& s
                         const std::string payload = "RFC5508-F:" + token + ":" + std::to_string(probe_query);
                         bool sent = send_icmp_echo(raw_fd, target, ICMP_ECHO, record->mapped_query, probe_query, payload);
                         std::string res = std::string("F=") + (sent ? "1" : "0");
-                        log_tcp("IF (ICMP Fragment/Echo)", "Token=" + token + " Role=" + role + " -> " + res);
-                        send_all(client_fd, res + "\n");
+                        log_tcp("IF (ICMP Fragment/Echo)", "Token=" + token + " Role=" + role + " -> " + res); send_all(client_fd, res + "\n");
                     } else {
                         log_tcp("UNKNOWN_CMD", command); send_all(client_fd, "ERR\n");
                     }
@@ -983,8 +987,7 @@ void handle_udp_packet(int rx_idx, const StunContext& ctx) {
     }
 
     if (received >= 1 && buffer[0] == 'I') {
-        // 强制透传 interface name
-        bool sent = send_ipv4_icmp_error(peer_endpoint, rx_node.bind_ep, IPPROTO_UDP, rx_node.iface_name);
+        bool sent = send_ipv4_icmp_error(peer_endpoint, rx_node.pub_ep, IPPROTO_UDP, rx_node.iface_name);
         std::cout << "[UDP-CUST] Req from " << endpoint_host(peer_endpoint) << ":" << peer_endpoint.port << " | Cmd: I | Sent=" << sent << "\n";
         std::string reply = std::string("I=") + (sent ? "1" : "0") + "\n";
         sendto(udp_fd, reply.data(), reply.size(), 0, reinterpret_cast<sockaddr*>(&peer), peer_length);
@@ -992,13 +995,17 @@ void handle_udp_packet(int rx_idx, const StunContext& ctx) {
     }
 
     if (received >= 1 && buffer[0] == 'O') {
-        // 强制透传 interface name
-        bool sent = send_out_of_order_fragmented_udp(peer_endpoint, rx_node.bind_ep, rx_node.iface_name);
+        bool sent = send_out_of_order_fragmented_udp(peer_endpoint, rx_node.pub_ep, rx_node.iface_name);
         std::cout << "[UDP-CUST] Req from " << endpoint_host(peer_endpoint) << ":" << peer_endpoint.port << " | Cmd: O | Sent=" << sent << "\n";
         std::string reply = std::string("O=") + (sent ? "1" : "0") + "\n";
         sendto(udp_fd, reply.data(), reply.size(), 0, reinterpret_cast<sockaddr*>(&peer), peer_length);
         return;
     }
+
+    // 修复 #1: 兜底机制 (Generic UDP Echo Fallback)
+    // 如果走到这里，说明这既不是合法的 STUN (或并非 Binding Req)，也不是已知的明文指令。
+    // 这恰恰是 RFC 4787 分片测试要求的 —— 客户端发送带填充数据的 UDP 包，服务端必须原封不动回显。
+    sendto(udp_fd, buffer.data(), received, 0, reinterpret_cast<sockaddr*>(&peer), peer_length);
 }
 
 } // namespace
