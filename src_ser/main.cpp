@@ -148,7 +148,8 @@ void ensure_icmp_conntrack_bypass() {
 // We bypass conntrack for all IP fragments so they reach the kernel's
 // IP fragment reassembly layer intact.
 //
-// For iptables: -f matches all IP fragments (MF=1 or frag_off != 0).
+// For iptables: we prefer the "u32" match that covers ALL fragments.
+// Plain "-f" only matches non-initial fragments and is a fallback.
 // For nftables: a dedicated table is used for trivial cleanup on exit.
 
 static bool s_fragment_rules_added = false;
@@ -156,11 +157,43 @@ static bool s_fragment_rules_added = false;
 bool ensure_iptables_fragment_notrack() {
     if (!command_exists("iptables")) return false;
     bool ok = true;
-    if (!run_shell_command("iptables -t raw -C OUTPUT -f -j CT --notrack >/dev/null 2>&1")) {
-        if (!run_shell_command("iptables -t raw -I OUTPUT -f -j CT --notrack >/dev/null 2>&1")) ok = false;
-    }
-    if (!run_shell_command("iptables -t raw -C PREROUTING -f -j CT --notrack >/dev/null 2>&1")) {
-        if (!run_shell_command("iptables -t raw -I PREROUTING -f -j CT --notrack >/dev/null 2>&1")) ok = false;
+
+    // CAUTION: iptables "-f" only matches non-initial fragments (offset > 0).
+    // The first fragment (MF=1, offset=0) would still go through conntrack
+    // and get dropped as INVALID.  We use the u32 match to cover
+    // *all* fragments: offset (bits 0-12) != 0 OR MF flag (bit 13) is set.
+    // If the u32 module is not available we fall back to plain -f with a
+    // warning, knowing the first fragment will still be vulnerable.
+    constexpr const char* kOutputMatch =
+        "-m u32 --u32 \"" "6 & 0x3FFF != 0" "\" -j CT --notrack";
+    constexpr const char* kPreroutingMatch =
+        "-m u32 --u32 \"" "6 & 0x3FFF != 0" "\" -j CT --notrack";
+
+    // Quick probe: can we use the u32 module?
+    bool has_u32 = run_shell_command(
+        "iptables -m u32 -h >/dev/null 2>&1");
+
+    auto try_add_rule = [&](const char* chain, const char* match) -> bool {
+        std::string check = std::string("iptables -t raw -C ") + chain + " " + match + " >/dev/null 2>&1";
+        std::string insert = std::string("iptables -t raw -I ") + chain + " " + match + " >/dev/null 2>&1";
+        if (!run_shell_command(check)) {
+            if (!run_shell_command(insert)) return false;
+        }
+        return true;
+    };
+
+    if (has_u32) {
+        // Best-effort: match ALL fragments including the first
+        if (!try_add_rule("OUTPUT", kOutputMatch)) ok = false;
+        if (!try_add_rule("PREROUTING", kPreroutingMatch)) ok = false;
+    } else {
+        // Fallback: plain -f (only non-initial fragments)
+        if (!run_shell_command("iptables -t raw -C OUTPUT -f -j CT --notrack >/dev/null 2>&1")) {
+            if (!run_shell_command("iptables -t raw -I OUTPUT -f -j CT --notrack >/dev/null 2>&1")) ok = false;
+        }
+        if (!run_shell_command("iptables -t raw -C PREROUTING -f -j CT --notrack >/dev/null 2>&1")) {
+            if (!run_shell_command("iptables -t raw -I PREROUTING -f -j CT --notrack >/dev/null 2>&1")) ok = false;
+        }
     }
     return ok;
 }
@@ -191,6 +224,9 @@ void cleanup_fragment_conntrack_bypass() {
     s_fragment_rules_added = false;
     
     if (command_exists("iptables")) {
+        // Try both the u32-based rules (all fragments) and plain -f rules
+        run_shell_command("iptables -t raw -D OUTPUT -m u32 --u32 \"6 & 0x3FFF != 0\" -j CT --notrack >/dev/null 2>&1");
+        run_shell_command("iptables -t raw -D PREROUTING -m u32 --u32 \"6 & 0x3FFF != 0\" -j CT --notrack >/dev/null 2>&1");
         run_shell_command("iptables -t raw -D OUTPUT -f -j CT --notrack >/dev/null 2>&1");
         run_shell_command("iptables -t raw -D PREROUTING -f -j CT --notrack >/dev/null 2>&1");
     }
@@ -201,8 +237,11 @@ void cleanup_fragment_conntrack_bypass() {
 }
 
 void ensure_fragment_conntrack_bypass() {
-    bool configured = ensure_iptables_fragment_notrack();
-    if (!configured) configured = ensure_nftables_fragment_notrack();
+    // Prefer nftables: "ip frag-off & 0x3fff != 0" covers ALL fragments natively.
+    // iptables requires the u32 match module for the same effect; plain -f
+    // only matches non-initial fragments and is used as a degraded fallback.
+    bool configured = ensure_nftables_fragment_notrack();
+    if (!configured) configured = ensure_iptables_fragment_notrack();
     s_fragment_rules_added = configured;
     if (configured) {
         std::cout << "Note: IP Fragment conntrack bypass (notrack) is active.\n";
