@@ -39,6 +39,7 @@ Rfc5508Result run_rfc5508_tests(const RequestOptions& options,
                                 const std::optional<IpEndpoint>& local_bind);
 
 ProbeStatus run_icmp_hairpinning_probe(int raw_fd,
+                                       int raw_send_fd,
                                        const IpEndpoint& primary_server,
                                        const IpEndpoint& local_endpoint,
                                        const IpEndpoint& public_endpoint,

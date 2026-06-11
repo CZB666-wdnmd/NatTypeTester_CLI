@@ -151,6 +151,45 @@ bool send_icmp_echo(int raw_fd,
     return sent == static_cast<ssize_t>(packet.size());
 }
 
+bool send_icmp_echo_raw_send(int raw_send_fd,
+                             const IpEndpoint& target,
+                             const IpEndpoint& local_source,
+                             std::uint8_t type,
+                             std::uint16_t identifier,
+                             std::uint16_t sequence,
+                             std::string_view payload) {
+    // Build ICMP body (same as send_icmp_echo)
+    std::vector<std::uint8_t> icmp_body = build_icmp_echo(type, identifier, sequence, payload);
+
+    // Build full IP packet with manual IP header (via raw_send_fd + IP_HDRINCL)
+    std::vector<std::uint8_t> packet(sizeof(iphdr) + icmp_body.size(), 0);
+    auto* ip = reinterpret_cast<iphdr*>(packet.data());
+    ip->ihl = 5;
+    ip->version = 4;
+    ip->tos = 0;
+    ip->tot_len = htons(static_cast<std::uint16_t>(packet.size()));
+    ip->id = 0;
+    ip->frag_off = 0;
+    ip->ttl = 64;
+    ip->protocol = IPPROTO_ICMP;
+    std::memcpy(&ip->saddr, local_source.address.data(), 4);
+    std::memcpy(&ip->daddr, target.address.data(), 4);
+    ip->check = 0;
+    ip->check = calculate_checksum(ip, sizeof(iphdr));
+
+    // Copy ICMP body after IP header
+    std::memcpy(packet.data() + sizeof(iphdr), icmp_body.data(), icmp_body.size());
+
+    SocketAddress remote = to_sockaddr(target);
+    const ssize_t sent = sendto(raw_send_fd,
+                                packet.data(),
+                                packet.size(),
+                                0,
+                                reinterpret_cast<sockaddr*>(&remote.storage),
+                                remote.length);
+    return sent == static_cast<ssize_t>(packet.size());
+}
+
 bool send_ipv4_icmp_error_packet(int raw_send_fd,
                                  const IpEndpoint& target,
                                  const IpEndpoint& outer_source,
@@ -401,6 +440,7 @@ std::string make_token(std::mt19937& generator) {
 // ---- RFC5508 probe implementations ----
 
 MappingProbeSample run_mapping_probe(int raw_fd,
+                                     int raw_send_fd,
                                      const IpEndpoint& target_server,
                                      const IpEndpoint& control_server,
                                      const IpEndpoint& control_local,
@@ -412,7 +452,9 @@ MappingProbeSample run_mapping_probe(int raw_fd,
     sample.token = make_token(generator);
     const std::string payload = "RFC5508-M:" + sample.token;
 
-    if (!send_icmp_echo(raw_fd, target_server, ICMP_ECHO, local_query, remote_query, payload)) {
+    // Use raw_send_fd (IP_HDRINCL) to send ICMP Echo via hand-crafted IP header,
+    // avoiding kernel IP header construction that may fail under NOTRACK rules.
+    if (!send_icmp_echo_raw_send(raw_send_fd, target_server, control_local, ICMP_ECHO, local_query, remote_query, payload)) {
         return sample;
     }
 
@@ -655,8 +697,8 @@ void run_icmp_hairpinning_probes(Rfc5508Result& result,
     const std::string payload_a = "RFC5508-HP-QA";
     const std::string payload_b = "RFC5508-HP-QB";
 
-    const bool send_a = send_icmp_echo(raw_fd, hairpin_target, ICMP_ECHO, mapped_query_b, mapped_query_a, payload_a);
-    const bool send_b = send_icmp_echo(raw_fd, hairpin_target, ICMP_ECHO, mapped_query_a, mapped_query_b, payload_b);
+    const bool send_a = send_icmp_echo_raw_send(raw_send_fd, hairpin_target, local_ip_only, ICMP_ECHO, mapped_query_b, mapped_query_a, payload_a);
+    const bool send_b = send_icmp_echo_raw_send(raw_send_fd, hairpin_target, local_ip_only, ICMP_ECHO, mapped_query_a, mapped_query_b, payload_b);
     if (!send_a || !send_b) {
         result.icmp_hairpin_query = ProbeStatus::Inconclusive;
         result.icmp_hairpin_error = ProbeStatus::Inconclusive;
@@ -712,6 +754,7 @@ void run_icmp_hairpinning_probes(Rfc5508Result& result,
 // Test pattern: 2 x ICMP Query -> 1 x ICMP Error -> 1 x ICMP Query
 // All four packets must successfully hairpin through the NAT.
 ProbeStatus run_icmp_hairpinning_probe(int raw_fd,
+                                       int raw_send_fd,
                                        const IpEndpoint& primary_server,
                                        const IpEndpoint& local_endpoint,
                                        const IpEndpoint& public_endpoint,
@@ -719,13 +762,13 @@ ProbeStatus run_icmp_hairpinning_probe(int raw_fd,
                                        std::chrono::milliseconds timeout) {
     // Phase 1: Send 2 ICMP Echo Requests to establish ICMP Query mappings
     constexpr std::uint16_t hairpin_query_id = 0x55AA;
-    if (!send_icmp_echo(raw_fd, primary_server, ICMP_ECHO, hairpin_query_id, 1, "hairpin-q1")) {
+    if (!send_icmp_echo_raw_send(raw_send_fd, primary_server, local_endpoint, ICMP_ECHO, hairpin_query_id, 1, "hairpin-q1")) {
         return ProbeStatus::Fail;
     }
     auto reply1 = receive_icmp_packet(raw_fd, timeout);
     if (!reply1.has_value()) return ProbeStatus::Fail;
 
-    if (!send_icmp_echo(raw_fd, primary_server, ICMP_ECHO, hairpin_query_id, 2, "hairpin-q2")) {
+    if (!send_icmp_echo_raw_send(raw_send_fd, primary_server, local_endpoint, ICMP_ECHO, hairpin_query_id, 2, "hairpin-q2")) {
         return ProbeStatus::Fail;
     }
     auto reply2 = receive_icmp_packet(raw_fd, timeout);
@@ -739,7 +782,7 @@ ProbeStatus run_icmp_hairpinning_probe(int raw_fd,
     local_ip_only.port = 0;
     IpEndpoint public_ip_only = public_endpoint;
     public_ip_only.port = 0;
-    send_ipv4_icmp_error_packet(raw_fd,
+    send_ipv4_icmp_error_packet(raw_send_fd,
                                 public_endpoint,          // target = own public endpoint (hairpin!)
                                 local_ip_only,            // outer_source = local IP (for source addr)
                                 public_ip_only,           // inner_source = public IP
@@ -754,7 +797,7 @@ ProbeStatus run_icmp_hairpinning_probe(int raw_fd,
     auto hairpin_errors = receive_icmp_errors_by_markers(raw_fd, markers, timeout);
 
     // Phase 3: Send 1 more ICMP Echo Request to verify mapping still alive
-    if (!send_icmp_echo(raw_fd, primary_server, ICMP_ECHO, hairpin_query_id, 3, "hairpin-q3")) {
+    if (!send_icmp_echo_raw_send(raw_send_fd, primary_server, local_endpoint, ICMP_ECHO, hairpin_query_id, 3, "hairpin-q3")) {
         return ProbeStatus::Fail;
     }
     auto reply3 = receive_icmp_packet(raw_fd, timeout);
@@ -898,6 +941,7 @@ Rfc5508Result run_rfc5508_tests(const RequestOptions& options,
 
         if (run_all || test_type == Rfc5508TestType::Mapping) {
             const MappingProbeSample primary_sample = run_mapping_probe(raw_fd,
+                                                                        raw_send_fd,
                                                                         primary_server,
                                                                         primary_server,
                                                                         *result.local_endpoint,
@@ -906,6 +950,7 @@ Rfc5508Result run_rfc5508_tests(const RequestOptions& options,
                                                                         options.timeout,
                                                                         generator);
             const MappingProbeSample secondary_sample = run_mapping_probe(raw_fd,
+                                                                          raw_send_fd,
                                                                           secondary_server,
                                                                           primary_server,
                                                                           *result.local_endpoint,
@@ -924,6 +969,7 @@ Rfc5508Result run_rfc5508_tests(const RequestOptions& options,
                 result.mapping_behavior = MappingBehavior::EndpointIndependent;
             } else {
                 const MappingProbeSample same_ip_diff_query = run_mapping_probe(raw_fd,
+                                                                                 raw_send_fd,
                                                                                  primary_server,
                                                                                  primary_server,
                                                                                  *result.local_endpoint,
@@ -943,6 +989,7 @@ Rfc5508Result run_rfc5508_tests(const RequestOptions& options,
 
         if (run_all || test_type == Rfc5508TestType::Filtering) {
             const MappingProbeSample base = run_mapping_probe(raw_fd,
+                                                              raw_send_fd,
                                                               primary_server,
                                                               primary_server,
                                                               *result.local_endpoint,
@@ -1025,6 +1072,7 @@ Rfc5508Result run_rfc5508_tests(const RequestOptions& options,
                                                                                            options.timeout);
 
                         const MappingProbeSample hairpin_a = run_mapping_probe(raw_fd,
+                                                                               raw_send_fd,
                                                                                primary_server,
                                                                                primary_server,
                                                                                *result.local_endpoint,
@@ -1033,6 +1081,7 @@ Rfc5508Result run_rfc5508_tests(const RequestOptions& options,
                                                                                options.timeout,
                                                                                generator);
                         const MappingProbeSample hairpin_b = run_mapping_probe(raw_fd,
+                                                                               raw_send_fd,
                                                                                primary_server,
                                                                                primary_server,
                                                                                *result.local_endpoint,
