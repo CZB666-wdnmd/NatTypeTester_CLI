@@ -6,9 +6,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(OpenSSL REQUIRED)
+
+enable_testing()
 include(CTest)
 
-add_library(nat_type_tester_cli_lib
+add_library(nat_type_tester_cli_lib STATIC
   utils/net_utils.cpp
   utils/stun_utils.cpp
   tests/test_dispatcher.cpp
@@ -18,6 +20,7 @@ add_library(nat_type_tester_cli_lib
   tests/rfc5382_test.cpp
   tests/rfc5508_test.cpp
   tests/rfc7857_test.cpp
+  tests/rfc5597_test.cpp
 )
 
 target_include_directories(nat_type_tester_cli_lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

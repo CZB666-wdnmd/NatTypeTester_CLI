@@ -40,7 +40,7 @@ void TestDispatcher::printBanner() {
     std::cout
         << "NatTypeTester standalone C++ CLI\n"
         << "================================\n"
-        << "一个多协议 NAT 行为与穿透特性测试工具，支持 RFC 3489 / 5780 / 4787 / 5382 / 7857。\n\n"
+        << "Comprehensive NAT type detection covering RFC 3489 / 5780 / 4787 / 5382 / 5508 / 7857 / 5597\n"
         << "Usage:\n";
 }
 

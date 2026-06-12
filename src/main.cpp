@@ -6,6 +6,7 @@
 #include "tests/rfc5382_test.h"
 #include "tests/rfc5508_test.h"
 #include "tests/rfc7857_test.h"
+#include "tests/rfc5597_test.h"
 
 #include <sys/socket.h>
 #include <unistd.h>
@@ -87,7 +88,7 @@ bool ensure_nftables_icmp_notrack() {
 }
 
 bool command_needs_icmp_notrack(const std::string& command) {
-    return command == "rfc4787" || command == "rfc5382" || command == "rfc5508" || command == "rfc7857";
+    return command == "rfc4787" || command == "rfc5382" || command == "rfc5508" || command == "rfc7857" || command == "rfc5597";
 }
 
 void ensure_icmp_conntrack_bypass_if_needed(const std::string& command, bool use_stderr = false) {
@@ -107,7 +108,7 @@ void ensure_icmp_conntrack_bypass_if_needed(const std::string& command, bool use
 
 ParsedArguments parse_arguments(int argc, char** argv) {
     if (argc < 2) {
-        fail("Expected subcommand: rfc3489, rfc5780, rfc4787, rfc5382, rfc5508, or rfc7857");
+        fail("Expected subcommand: rfc3489, rfc5780, rfc4787, rfc5382, rfc5508, rfc7857, or rfc5597");
     }
 
     ParsedArguments result;
@@ -149,6 +150,7 @@ natcli::TestDispatcher create_dispatcher() {
     dispatcher.registerTest(std::make_unique<natcli::Rfc5382Test>());
     dispatcher.registerTest(std::make_unique<natcli::Rfc5508Test>());
     dispatcher.registerTest(std::make_unique<natcli::Rfc7857Test>());
+    dispatcher.registerTest(std::make_unique<natcli::Rfc5597Test>());
     return dispatcher;
 }
 
@@ -167,7 +169,7 @@ int main(int argc, char** argv) {
 
         if (args.command != "rfc3489" && args.command != "rfc5780" && args.command != "rfc4787" &&
             args.command != "rfc5508" &&
-            args.command != "rfc5382" && args.command != "rfc7857") {
+            args.command != "rfc5382" && args.command != "rfc7857" && args.command != "rfc5597") {
             fail("Unknown subcommand: " + args.command);
         }
 
