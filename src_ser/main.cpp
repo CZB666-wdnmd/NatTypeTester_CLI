@@ -568,6 +568,7 @@ std::optional<std::uint16_t> observe_udp_ipv4_id(const IpEndpoint& peer, const I
 }
 
 bool send_icmp_echo(int raw_fd, const IpEndpoint& target, std::uint8_t type, std::uint16_t identifier, std::uint16_t sequence, std::string_view payload) {
+    if (raw_fd < 0) return false;
     std::vector<std::uint8_t> packet(sizeof(icmphdr) + payload.size(), 0);
     auto* icmp = reinterpret_cast<icmphdr*>(packet.data());
     icmp->type = type; icmp->code = 0;
@@ -807,8 +808,9 @@ void handle_icmp_packet(int raw_fd, IcmpRawContext& icmp_ctx) {
     send_icmp_echo(raw_fd, peer_endpoint, ICMP_ECHOREPLY, ntohs(icmp->un.echo.id), ntohs(icmp->un.echo.sequence), std::string(payload));
 }
 
-void handle_stream_client(int client_fd, int rx_idx, const StunContext& ctx, bool is_tls, IcmpRawContext& icmp_ctx, int timeout_ms, int syn_delay_ms) {
+void handle_stream_client(int client_fd, int rx_idx, std::shared_ptr<StunContext> ctx_ptr, bool is_tls, const std::string& prefix_name, int timeout_ms, int syn_delay_ms) {
     try {
+        const StunContext& ctx = *ctx_ptr;
         const StunNode* current_nodes = is_tls ? ctx.tls_nodes : ctx.nodes;
         const StunNode& rx_node = current_nodes[rx_idx];
         const StunNode& other_node = current_nodes[rx_idx ^ 3];
@@ -823,7 +825,7 @@ void handle_stream_client(int client_fd, int rx_idx, const StunContext& ctx, boo
 
         auto log_stream = [&](const std::string& cmd, const std::string& extra = "") {
             std::ostringstream oss;
-            oss << "[" << (is_tls ? "TLS-CUST" : "TCP-CUST") << "] Req from " << endpoint_host(peer_endpoint) << ":" << peer_endpoint.port << " | Cmd: " << cmd;
+            oss << "[" << prefix_name << "] [" << (is_tls ? "TLS-CUST" : "TCP-CUST") << "] Req from " << endpoint_host(peer_endpoint) << ":" << peer_endpoint.port << " | Cmd: " << cmd;
             if (!extra.empty()) oss << " | " << extra;
             oss << "\n";
             std::cout << oss.str();
@@ -883,7 +885,6 @@ void handle_stream_client(int client_fd, int rx_idx, const StunContext& ctx, boo
                     tcp_buffer.erase(tcp_buffer.begin(), newline_pos + 1);
                     if (!command.empty() && command.back() == '\r') command.pop_back();
 
-                    // Commands testing out-of-band features ALWAYS rely on plain UDP context (Node 0 & 2) 
                     const StunNode& primary = ctx.nodes[0];
                     const StunNode& secondary = ctx.nodes[2];
 
@@ -942,9 +943,6 @@ void handle_stream_client(int client_fd, int rx_idx, const StunContext& ctx, boo
                         }
                         auto [target_host, target_port] = split_host_port(target_literal, 0);
                         IpEndpoint target = resolve_endpoint(target_host, target_port);
-                        if (target.family != AF_INET || peer_endpoint.family != AF_INET) { 
-                            log_stream("IE (ICMP Error Variants)", "Family mismatch"); stream_send(active_ssl, client_fd, "E=0\n"); continue; 
-                        }
                         bool s_out = send_ipv4_icmp_error_variant(target, primary.bind_ep, peer_endpoint, primary.pub_ep, target.port, primary.pub_ep.port, m_out, IcmpErrorVariant::BadOuterChecksum, primary.iface_name);
                         bool s_in  = send_ipv4_icmp_error_variant(target, primary.bind_ep, peer_endpoint, primary.pub_ep, target.port, primary.pub_ep.port, m_in,  IcmpErrorVariant::BadInnerIpChecksum, primary.iface_name);
                         bool s_udp = send_ipv4_icmp_error_variant(target, primary.bind_ep, peer_endpoint, primary.pub_ep, target.port, primary.pub_ep.port, m_udp, IcmpErrorVariant::BadUdpChecksum, primary.iface_name);
@@ -952,14 +950,14 @@ void handle_stream_client(int client_fd, int rx_idx, const StunContext& ctx, boo
                         log_stream("IE (ICMP Error Variants)", res); stream_send(active_ssl, client_fd, res + "\n");
                     }
                     else if (command == "IRR") {
-                        { std::lock_guard<std::mutex> lock(icmp_ctx.observed_error_markers_mutex); icmp_ctx.observed_error_markers.clear(); }
+                        { std::lock_guard<std::mutex> lock(ctx_ptr->icmp_ctx.observed_error_markers_mutex); ctx_ptr->icmp_ctx.observed_error_markers.clear(); }
                         log_stream("IRR (ICMP Reset Markers)"); stream_send(active_ssl, client_fd, "R=1\n");
                     }
                     else if (command.rfind("IR ", 0) == 0) {
                         std::istringstream stream(command); std::string op; std::uint16_t marker = 0;
                         if (!(stream >> op >> marker)) { log_stream("IR (ICMP Check Marker)", "Invalid"); stream_send(active_ssl, client_fd, "R=0\n"); continue; }
                         bool seen = false;
-                        { std::lock_guard<std::mutex> lock(icmp_ctx.observed_error_markers_mutex); seen = icmp_ctx.observed_error_markers.contains(marker); }
+                        { std::lock_guard<std::mutex> lock(ctx_ptr->icmp_ctx.observed_error_markers_mutex); seen = ctx_ptr->icmp_ctx.observed_error_markers.contains(marker); }
                         std::string res = std::string("R=") + (seen ? "1" : "0");
                         log_stream("IR (ICMP Check Marker)", "Marker=" + std::to_string(marker) + " -> " + res); stream_send(active_ssl, client_fd, res + "\n");
                     }
@@ -967,9 +965,9 @@ void handle_stream_client(int client_fd, int rx_idx, const StunContext& ctx, boo
                         const std::string token = command.substr(3);
                         std::optional<IcmpMappingRecord> record;
                         {
-                            std::lock_guard<std::mutex> lock(icmp_ctx.mappings_mutex);
-                            auto it = icmp_ctx.mappings.find(token);
-                            if (it != icmp_ctx.mappings.end()) record = it->second;
+                            std::lock_guard<std::mutex> lock(ctx_ptr->icmp_ctx.mappings_mutex);
+                            auto it = ctx_ptr->icmp_ctx.mappings.find(token);
+                            if (it != ctx_ptr->icmp_ctx.mappings.end()) record = it->second;
                         }
                         if (!record.has_value()) { log_stream("IM", token + " -> Not Found"); stream_send(active_ssl, client_fd, "ERR\n"); continue; }
                         log_stream("IM (ICMP Get Mapping)", token + " -> Found");
@@ -980,13 +978,13 @@ void handle_stream_client(int client_fd, int rx_idx, const StunContext& ctx, boo
                         if (!(stream >> op >> role >> token >> probe_query) || role.size() != 1) { log_stream("IF", "Invalid Params"); stream_send(active_ssl, client_fd, "F=0\n"); continue; }
                         std::optional<IcmpMappingRecord> record;
                         {
-                            std::lock_guard<std::mutex> lock(icmp_ctx.mappings_mutex);
-                            auto it = icmp_ctx.mappings.find(token);
-                            if (it != icmp_ctx.mappings.end()) record = it->second;
+                            std::lock_guard<std::mutex> lock(ctx_ptr->icmp_ctx.mappings_mutex);
+                            auto it = ctx_ptr->icmp_ctx.mappings.find(token);
+                            if (it != ctx_ptr->icmp_ctx.mappings.end()) record = it->second;
                         }
                         if (!record.has_value()) { log_stream("IF", token + " -> No Mapping"); stream_send(active_ssl, client_fd, "F=0\n"); continue; }
 
-                        int raw_fd = (role[0] == 'P') ? icmp_ctx.primary_socket : ((role[0] == 'S') ? icmp_ctx.secondary_socket : -1);
+                        int raw_fd = (role[0] == 'P') ? ctx.icmp_ctx.primary_socket : ((role[0] == 'S') ? ctx.icmp_ctx.secondary_socket : -1);
                         if (raw_fd < 0) { log_stream("IF", "Invalid Socket"); stream_send(active_ssl, client_fd, "F=0\n"); continue; }
                         IpEndpoint target = resolve_endpoint(record->peer_host, 0); target.port = 0;
                         const std::string payload = "RFC5508-F:" + token + ":" + std::to_string(probe_query);
@@ -1000,11 +998,11 @@ void handle_stream_client(int client_fd, int rx_idx, const StunContext& ctx, boo
             }
         }
     } catch (const std::exception& e) {
-        std::cerr << "[" << (is_tls ? "TLS-CUST" : "TCP-CUST") << "] Error handling client: " << e.what() << "\n";
+        std::cerr << "[" << prefix_name << "] [" << (is_tls ? "TLS-CUST" : "TCP-CUST") << "] Error handling client: " << e.what() << "\n";
     }
 }
 
-void handle_dtls_client(SSL* ssl, int dtls_fd, int rx_idx, const StunContext& ctx) {
+void handle_dtls_client(SSL* ssl, int dtls_fd, int rx_idx, const StunContext& ctx, const std::string& prefix_name) {
     const StunNode& rx_node = ctx.tls_nodes[rx_idx];
     const StunNode& other_node = ctx.tls_nodes[rx_idx ^ 3];
     
@@ -1013,7 +1011,7 @@ void handle_dtls_client(SSL* ssl, int dtls_fd, int rx_idx, const StunContext& ct
     IpEndpoint peer_endpoint = from_sockaddr(reinterpret_cast<sockaddr*>(&peer), peer_len);
 
     auto log_dtls = [&](const std::string& msg) {
-        std::cout << "[DTLS] Req from " << endpoint_host(peer_endpoint) << ":" << peer_endpoint.port << " | " << msg << "\n";
+        std::cout << "[" << prefix_name << "] [DTLS] Req from " << endpoint_host(peer_endpoint) << ":" << peer_endpoint.port << " | " << msg << "\n";
     };
 
     log_dtls("Handshake Success! Connection established.");
@@ -1051,7 +1049,7 @@ void handle_dtls_client(SSL* ssl, int dtls_fd, int rx_idx, const StunContext& ct
     }
 }
 
-void handle_dtls_listen(int listen_fd, int rx_idx, const StunContext& ctx) {
+void handle_dtls_listen(int listen_fd, int rx_idx, std::shared_ptr<StunContext> ctx_ptr, const std::string& prefix_name) {
     BIO_ADDR *client_addr = BIO_ADDR_new();
     if (!client_addr) return;
 
@@ -1065,7 +1063,7 @@ void handle_dtls_listen(int listen_fd, int rx_idx, const StunContext& ctx) {
             int err = SSL_get_error(ssl, ret);
             char buf[256];
             ERR_error_string_n(ERR_get_error(), buf, sizeof(buf));
-            std::cout << "[DTLS] DTLSv1_listen error: " << err << ", " << buf << "\n";
+            std::cout << "[" << prefix_name << "] [DTLS] DTLSv1_listen error: " << err << ", " << buf << "\n";
         }
         BIO_ADDR_free(client_addr);
         SSL_free(ssl);
@@ -1076,7 +1074,6 @@ void handle_dtls_listen(int listen_fd, int rx_idx, const StunContext& ctx) {
     peer_endpoint.family = BIO_ADDR_family(client_addr);
     peer_endpoint.port = ntohs(BIO_ADDR_rawport(client_addr));
     
-    // 修复1：初始化 addr_len 为最大尺寸，否则 OpenSSL 不会拷贝任何 IP 地址！
     size_t addr_len = peer_endpoint.address.size(); 
     BIO_ADDR_rawaddress(client_addr, peer_endpoint.address.data(), &addr_len);
     peer_endpoint.address_length = addr_len;
@@ -1086,46 +1083,40 @@ void handle_dtls_listen(int listen_fd, int rx_idx, const StunContext& ctx) {
     if (new_fd < 0) { SSL_free(ssl); return; }
     set_reuse_options(new_fd);
 
-    const StunNode& rx_node = ctx.tls_nodes[rx_idx];
+    const StunNode& rx_node = ctx_ptr->tls_nodes[rx_idx];
     bind_socket_to_device(new_fd, rx_node.iface_name);
 
     SocketAddress local_addr = to_sockaddr(rx_node.bind_ep);
     if (bind(new_fd, reinterpret_cast<sockaddr*>(&local_addr.storage), local_addr.length) < 0) {
-        std::cout << "[DTLS] Failed to bind new socket.\n";
+        std::cout << "[" << prefix_name << "] [DTLS] Failed to bind new socket.\n";
         close(new_fd); SSL_free(ssl); return;
     }
 
     SocketAddress peer_addr = to_sockaddr(peer_endpoint);
     if (connect(new_fd, reinterpret_cast<sockaddr*>(&peer_addr.storage), peer_addr.length) < 0) {
-        std::cout << "[DTLS] Failed to connect new socket.\n";
+        std::cout << "[" << prefix_name << "] [DTLS] Failed to connect new socket.\n";
         close(new_fd); SSL_free(ssl); return;
     }
 
     BIO *new_bio = BIO_new_dgram(new_fd, BIO_NOCLOSE);
-    
-    // 修复2：强制通知 OpenSSL 当前的 dgram BIO 已经处于 connected 状态
-    // 并且把对方的地址注入，以防止 OpenSSL 使用 sendto 时内部抛出异常中断握手
     BIO_ctrl(new_bio, BIO_CTRL_DGRAM_SET_CONNECTED, 0, &peer_addr.storage);
-    
     SSL_set_bio(ssl, new_bio, new_bio);
 
-    std::thread([ssl, new_fd, rx_idx, &ctx]() {
-        // 修复3：握手阶段（SSL_accept）极其容易发生丢包
-        // 必须在握手前就设定好系统级的 Socket I/O 超时，防止被挂起
+    std::thread([ssl, new_fd, rx_idx, ctx_ptr, prefix_name]() {
         struct timeval tv;
-        tv.tv_sec = 3;
+        tv.tv_sec = 3;  
         tv.tv_usec = 0;
         setsockopt(new_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         setsockopt(new_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
         int accept_ret = SSL_accept(ssl);
         if (accept_ret > 0) {
-            handle_dtls_client(ssl, new_fd, rx_idx, ctx);
+            handle_dtls_client(ssl, new_fd, rx_idx, *ctx_ptr, prefix_name);
         } else {
             int err = SSL_get_error(ssl, accept_ret);
             char buf[256];
             ERR_error_string_n(ERR_get_error(), buf, sizeof(buf));
-            std::cout << "[DTLS] SSL_accept handshake failed: " << err << ", " << buf << "\n";
+            std::cout << "[" << prefix_name << "] [DTLS] SSL_accept handshake failed: " << err << ", " << buf << "\n";
         }
         
         SSL_free(ssl);
@@ -1133,7 +1124,7 @@ void handle_dtls_listen(int listen_fd, int rx_idx, const StunContext& ctx) {
     }).detach();
 }
 
-void handle_udp_packet(int rx_idx, const StunContext& ctx) {
+void handle_udp_packet(int rx_idx, const StunContext& ctx, const std::string& prefix_name) {
     const StunNode& rx_node = ctx.nodes[rx_idx];
     int udp_fd = rx_node.fd;
     if (udp_fd < 0) return;
@@ -1181,7 +1172,7 @@ void handle_udp_packet(int rx_idx, const StunContext& ctx) {
             const uint8_t* tx_id = reinterpret_cast<const uint8_t*>(buffer.data() + 4); 
             bool is_rfc5389 = (tx_id[0] == 0x21 && tx_id[1] == 0x12 && tx_id[2] == 0xA4 && tx_id[3] == 0x42);
 
-            std::cout << "[STUN] Req from " << endpoint_host(peer_endpoint) << ":" << peer_endpoint.port 
+            std::cout << "[" << prefix_name << "] [STUN] Req from " << endpoint_host(peer_endpoint) << ":" << peer_endpoint.port 
                       << " | Rx: " << rx_node.pub_ep.port << " (IP-" << (rx_idx & 2 ? "2" : "1") << ")"
                       << " | ChgIP=" << change_ip << " ChgPort=" << change_port 
                       << " | Reply: " << endpoint_host(reply_node.pub_ep) << ":" << reply_node.pub_ep.port 
@@ -1194,14 +1185,14 @@ void handle_udp_packet(int rx_idx, const StunContext& ctx) {
     }
 
     if (received >= 1 && buffer[0] == 'M') {
-        std::cout << "[UDP-CUST] Req from " << endpoint_host(peer_endpoint) << ":" << peer_endpoint.port << " | Cmd: M\n";
+        std::cout << "[" << prefix_name << "] [UDP-CUST] Req from " << endpoint_host(peer_endpoint) << ":" << peer_endpoint.port << " | Cmd: M\n";
         std::string payload = endpoint_line(peer_endpoint);
         sendto(udp_fd, payload.data(), payload.size(), 0, reinterpret_cast<sockaddr*>(&peer), peer_length);
         return;
     }
 
     if (received >= 1 && buffer[0] == 'C') {
-        std::cout << "[UDP-CUST] Req from " << endpoint_host(peer_endpoint) << ":" << peer_endpoint.port << " | Cmd: C\n";
+        std::cout << "[" << prefix_name << "] [UDP-CUST] Req from " << endpoint_host(peer_endpoint) << ":" << peer_endpoint.port << " | Cmd: C\n";
         std::string payload = 
             "PRIMARY " + endpoint_host(ctx.nodes[0].pub_ep) + " " + std::to_string(ctx.nodes[0].pub_ep.port) + "\n" +
             "SECONDARY " + endpoint_host(ctx.nodes[2].pub_ep) + " " + std::to_string(ctx.nodes[2].pub_ep.port) + "\n";
@@ -1211,7 +1202,7 @@ void handle_udp_packet(int rx_idx, const StunContext& ctx) {
 
     if (received >= 1 && buffer[0] == 'I') {
         bool sent = send_ipv4_icmp_error(peer_endpoint, rx_node.pub_ep, IPPROTO_UDP, rx_node.iface_name);
-        std::cout << "[UDP-CUST] Req from " << endpoint_host(peer_endpoint) << ":" << peer_endpoint.port << " | Cmd: I | Sent=" << sent << "\n";
+        std::cout << "[" << prefix_name << "] [UDP-CUST] Req from " << endpoint_host(peer_endpoint) << ":" << peer_endpoint.port << " | Cmd: I | Sent=" << sent << "\n";
         std::string reply = std::string("I=") + (sent ? "1" : "0") + "\n";
         sendto(udp_fd, reply.data(), reply.size(), 0, reinterpret_cast<sockaddr*>(&peer), peer_length);
         return;
@@ -1219,7 +1210,7 @@ void handle_udp_packet(int rx_idx, const StunContext& ctx) {
 
     if (received >= 1 && buffer[0] == 'O') {
         bool sent = send_out_of_order_fragmented_udp(peer_endpoint, rx_node.bind_ep, rx_node.iface_name);
-        std::cout << "[UDP-CUST] Req from " << endpoint_host(peer_endpoint) << ":" << peer_endpoint.port << " | Cmd: O | Sent=" << sent << "\n";
+        std::cout << "[" << prefix_name << "] [UDP-CUST] Req from " << endpoint_host(peer_endpoint) << ":" << peer_endpoint.port << " | Cmd: O | Sent=" << sent << "\n";
         std::string reply = std::string("O=") + (sent ? "1" : "0") + "\n";
         sendto(udp_fd, reply.data(), reply.size(), 0, reinterpret_cast<sockaddr*>(&peer), peer_length);
         return;
@@ -1231,14 +1222,14 @@ void handle_udp_packet(int rx_idx, const StunContext& ctx) {
 void generate_self_signed_cert() {
     EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, nullptr);
     EVP_PKEY_keygen_init(pctx);
-    EVP_PKEY_CTX_set_ec_paramgen_curve_nid(pctx, NID_X9_62_prime256v1); // 使用高兼容性的 prime256v1 (secp256r1)
+    EVP_PKEY_CTX_set_ec_paramgen_curve_nid(pctx, NID_X9_62_prime256v1); 
     EVP_PKEY_keygen(pctx, &generated_key);
     EVP_PKEY_CTX_free(pctx);
 
     generated_cert = X509_new();
     ASN1_INTEGER_set(X509_get_serialNumber(generated_cert), 1);
     X509_gmtime_adj(X509_get_notBefore(generated_cert), 0);
-    X509_gmtime_adj(X509_get_notAfter(generated_cert), 31536000L); // 1 year
+    X509_gmtime_adj(X509_get_notAfter(generated_cert), 31536000L); 
     X509_set_pubkey(generated_cert, generated_key);
     X509_NAME *name = X509_get_subject_name(generated_cert);
     X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, reinterpret_cast<const unsigned char*>("NatTypeTester"), -1, -1, 0);
@@ -1246,34 +1237,24 @@ void generate_self_signed_cert() {
     X509_sign(generated_cert, generated_key, EVP_sha256());
 }
 
-int dtls_verify_cookie(SSL*, const unsigned char*, unsigned int) {
-    return 1;
-}
+int dtls_verify_cookie(SSL*, const unsigned char*, unsigned int) { return 1; }
 
 int dtls_generate_cookie(SSL*, unsigned char* cookie, unsigned int* cookie_len) {
-    *cookie_len = 16;
-    std::memset(cookie, 0, 16);
-    return 1;
+    *cookie_len = 16; std::memset(cookie, 0, 16); return 1;
 }
 
 void init_openssl(const std::string& cert_file, const std::string& key_file) {
-    SSL_library_init();
-    OpenSSL_add_all_algorithms();
-    SSL_load_error_strings();
-
+    SSL_library_init(); OpenSSL_add_all_algorithms(); SSL_load_error_strings();
     if (cert_file.empty() || key_file.empty()) {
         std::cout << "Generating self-signed certificate (ECDSA prime256v1) for TLS/DTLS...\n";
         generate_self_signed_cert();
     }
-
     tls_ctx = SSL_CTX_new(TLS_server_method());
     dtls_ctx = SSL_CTX_new(DTLS_server_method());
     if (!tls_ctx || !dtls_ctx) fail("Failed to create OpenSSL contexts");
-
     SSL_CTX_set_cookie_generate_cb(dtls_ctx, dtls_generate_cookie);
     SSL_CTX_set_cookie_verify_cb(dtls_ctx, dtls_verify_cookie);
 
-    // 启用最高兼容性的 Cipher 列表并放宽安全级别以兼容所有版本的测试客户端
     SSL_CTX_set_cipher_list(tls_ctx, "ALL:!aNULL:!eNULL");
     SSL_CTX_set_cipher_list(dtls_ctx, "ALL:!aNULL:!eNULL");
 #if OPENSSL_VERSION_NUMBER >= 0x10100000L
@@ -1290,19 +1271,116 @@ void init_openssl(const std::string& cert_file, const std::string& key_file) {
             SSL_CTX_use_PrivateKey(ctx, generated_key);
         }
     };
-    configure_ctx(tls_ctx);
-    configure_ctx(dtls_ctx);
+    configure_ctx(tls_ctx); configure_ctx(dtls_ctx);
+}
+
+void run_server_engine(std::shared_ptr<StunContext> ctx_ptr, int probe_timeout_ms, int syn_delay_ms, const std::string& prefix_name) {
+    StunContext& stun_ctx = *ctx_ptr;
+    int tcp_fds[4] = {-1, -1, -1, -1};
+    int tls_fds[4] = {-1, -1, -1, -1};
+    int dtls_fds[4] = {-1, -1, -1, -1};
+
+    std::cout << "\n[" << prefix_name << "] Starting Engine with TCP/UDP Multiplexing & Interface Binding Penetration...\n";
+    for (int i = 0; i < 4; ++i) {
+        stun_ctx.nodes[i].iface_name = get_interface_name(stun_ctx.nodes[i].bind_ep);
+        stun_ctx.nodes[i].fd = create_udp_listener(stun_ctx.nodes[i].bind_ep, stun_ctx.nodes[i].iface_name);
+        tcp_fds[i] = create_tcp_listener(stun_ctx.nodes[i].bind_ep, stun_ctx.nodes[i].iface_name);
+        
+        int flags = fcntl(tcp_fds[i], F_GETFL, 0); fcntl(tcp_fds[i], F_SETFL, flags | O_NONBLOCK);
+        
+        std::cout << "  [" << prefix_name << "] Node " << i << ": Bind=" << endpoint_host(stun_ctx.nodes[i].bind_ep) << ":" << stun_ctx.nodes[i].bind_ep.port 
+                  << "  Public=" << endpoint_host(stun_ctx.nodes[i].pub_ep) << ":" << stun_ctx.nodes[i].pub_ep.port << "\n";
+    }
+    
+    std::cout << "[" << prefix_name << "] Starting TLS/DTLS Endpoints...\n";
+    for (int i = 0; i < 4; ++i) {
+        stun_ctx.tls_nodes[i].iface_name = get_interface_name(stun_ctx.tls_nodes[i].bind_ep);
+        tls_fds[i] = create_tcp_listener(stun_ctx.tls_nodes[i].bind_ep, stun_ctx.tls_nodes[i].iface_name);
+        dtls_fds[i] = create_udp_listener(stun_ctx.tls_nodes[i].bind_ep, stun_ctx.tls_nodes[i].iface_name);
+        
+        int tcp_f = fcntl(tls_fds[i], F_GETFL, 0); fcntl(tls_fds[i], F_SETFL, tcp_f | O_NONBLOCK);
+        int udp_f = fcntl(dtls_fds[i], F_GETFL, 0); fcntl(dtls_fds[i], F_SETFL, udp_f | O_NONBLOCK);
+        
+        std::cout << "  [" << prefix_name << "] TLS Node " << i << ": Bind=" << endpoint_host(stun_ctx.tls_nodes[i].bind_ep) << ":" << stun_ctx.tls_nodes[i].bind_ep.port 
+                  << "  Public=" << endpoint_host(stun_ctx.tls_nodes[i].pub_ep) << ":" << stun_ctx.tls_nodes[i].pub_ep.port << "\n";
+    }
+
+    if (stun_ctx.nodes[0].bind_ep.family == AF_INET) {
+        stun_ctx.icmp_ctx.primary_socket = create_icmp_raw_listener(stun_ctx.nodes[0].bind_ep, stun_ctx.nodes[0].iface_name);
+        stun_ctx.icmp_ctx.secondary_socket = create_icmp_raw_listener(stun_ctx.nodes[2].bind_ep, stun_ctx.nodes[2].iface_name);
+    }
+
+    std::cout << ">>> [" << prefix_name << "] Server fully ready! Logs will appear below...\n";
+    std::cout << "========================================================\n";
+
+    std::vector<pollfd> descriptors;
+    for (int i = 0; i < 4; i++) descriptors.push_back({tcp_fds[i], POLLIN, 0});
+    for (int i = 0; i < 4; i++) descriptors.push_back({stun_ctx.nodes[i].fd, POLLIN, 0});
+    for (int i = 0; i < 4; i++) descriptors.push_back({tls_fds[i], POLLIN, 0});
+    for (int i = 0; i < 4; i++) descriptors.push_back({dtls_fds[i], POLLIN, 0});
+    if (stun_ctx.icmp_ctx.primary_socket >= 0) descriptors.push_back({stun_ctx.icmp_ctx.primary_socket, POLLIN, 0});
+    if (stun_ctx.icmp_ctx.secondary_socket >= 0) descriptors.push_back({stun_ctx.icmp_ctx.secondary_socket, POLLIN, 0});
+
+    while (true) {
+        for (auto& d : descriptors) d.revents = 0;
+        if (poll(descriptors.data(), descriptors.size(), -1) < 0) throw system_error("poll failed");
+        
+        int idx = 0;
+        for (int i = 0; i < 4; i++, idx++) {
+            if (descriptors[idx].revents & POLLIN) {
+                sockaddr_storage client{}; socklen_t len = sizeof(client);
+                int client_fd = accept(tcp_fds[i], reinterpret_cast<sockaddr*>(&client), &len);
+                if (client_fd >= 0) {
+                    std::thread([client_fd, i, ctx_ptr, prefix_name, probe_timeout_ms, syn_delay_ms]() {
+                        handle_stream_client(client_fd, i, ctx_ptr, false, prefix_name, probe_timeout_ms, syn_delay_ms);
+                        close(client_fd);
+                    }).detach();
+                }
+            }
+        }
+        for (int i = 0; i < 4; i++, idx++) {
+            if (descriptors[idx].revents & POLLIN) handle_udp_packet(i, stun_ctx, prefix_name);
+        }
+        for (int i = 0; i < 4; i++, idx++) {
+            if (descriptors[idx].revents & POLLIN) {
+                sockaddr_storage client{}; socklen_t len = sizeof(client);
+                int client_fd = accept(tls_fds[i], reinterpret_cast<sockaddr*>(&client), &len);
+                if (client_fd >= 0) {
+                    std::thread([client_fd, i, ctx_ptr, prefix_name, probe_timeout_ms, syn_delay_ms]() {
+                        handle_stream_client(client_fd, i, ctx_ptr, true, prefix_name, probe_timeout_ms, syn_delay_ms);
+                        close(client_fd);
+                    }).detach();
+                }
+            }
+        }
+        for (int i = 0; i < 4; i++, idx++) {
+            if (descriptors[idx].revents & POLLIN) handle_dtls_listen(dtls_fds[i], i, ctx_ptr, prefix_name);
+        }
+        if (stun_ctx.icmp_ctx.primary_socket >= 0) {
+            if (descriptors[idx].revents & POLLIN) handle_icmp_packet(stun_ctx.icmp_ctx.primary_socket, stun_ctx.icmp_ctx);
+            idx++;
+        }
+        if (stun_ctx.icmp_ctx.secondary_socket >= 0) {
+            if (descriptors[idx].revents & POLLIN) handle_icmp_packet(stun_ctx.icmp_ctx.secondary_socket, stun_ctx.icmp_ctx);
+            idx++;
+        }
+    }
 }
 
 } // namespace
 
 int main(int argc, char** argv) {
     try {
-        std::string bind_ip1 = "0.0.0.0", pub_ip1 = "";
-        std::string bind_ip2 = "0.0.0.0", pub_ip2 = "";
+        std::string bind_ip1 = "", pub_ip1 = "";
+        std::string bind_ip2 = "", pub_ip2 = "";
+        std::string v6_ip1 = "", v6_ip2 = "";
+        
         std::string cert_file, key_file;
         uint16_t port1 = 3478, port2 = 3479;
         uint16_t tls_port1 = 5349, tls_port2 = 5350;
+        uint16_t v6_port1 = 3478, v6_port2 = 3479;
+        uint16_t v6_tls_port1 = 5349, v6_tls_port2 = 5350;
+
         int probe_timeout_ms = 1200;
         int syn_delay_ms = 350;
 
@@ -1312,120 +1390,79 @@ int main(int argc, char** argv) {
             else if (token == "--pub-ip1") pub_ip1 = argv[++index];
             else if (token == "--bind-ip2") bind_ip2 = argv[++index];
             else if (token == "--pub-ip2") pub_ip2 = argv[++index];
+            
+            else if (token == "--v6-ip1") v6_ip1 = argv[++index];
+            else if (token == "--v6-ip2") v6_ip2 = argv[++index];
+            
             else if (token == "--port1") port1 = static_cast<uint16_t>(std::stoi(argv[++index]));
             else if (token == "--port2") port2 = static_cast<uint16_t>(std::stoi(argv[++index]));
             else if (token == "--tls-port1") tls_port1 = static_cast<uint16_t>(std::stoi(argv[++index]));
             else if (token == "--tls-port2") tls_port2 = static_cast<uint16_t>(std::stoi(argv[++index]));
+
+            else if (token == "--v6-port1") v6_port1 = static_cast<uint16_t>(std::stoi(argv[++index]));
+            else if (token == "--v6-port2") v6_port2 = static_cast<uint16_t>(std::stoi(argv[++index]));
+            else if (token == "--v6-tls-port1") v6_tls_port1 = static_cast<uint16_t>(std::stoi(argv[++index]));
+            else if (token == "--v6-tls-port2") v6_tls_port2 = static_cast<uint16_t>(std::stoi(argv[++index]));
+
             else if (token == "--cert") cert_file = argv[++index];
             else if (token == "--key") key_file = argv[++index];
             else if (token == "--probe-timeout-ms") probe_timeout_ms = std::stoi(argv[++index]);
             else if (token == "--syn-delay-ms") syn_delay_ms = std::stoi(argv[++index]);
         }
 
-        if (pub_ip1.empty() || pub_ip2.empty()) fail("Both --pub-ip1 and --pub-ip2 are required.");
+        bool has_ipv4 = !pub_ip1.empty() && !pub_ip2.empty();
+        bool has_ipv6 = !v6_ip1.empty() && !v6_ip2.empty();
 
-        ensure_icmp_conntrack_bypass();
-        try_disable_kernel_icmp_echo_auto_reply();
-        ensure_fragment_conntrack_bypass();
+        if (!has_ipv4 && !has_ipv6) {
+            fail("Must provide either IPv4 config (--pub-ip1/2) or IPv6 config (--v6-ip1/2).");
+        }
+
+        if (has_ipv4) {
+            if (bind_ip1.empty()) bind_ip1 = "0.0.0.0";
+            if (bind_ip2.empty()) bind_ip2 = "0.0.0.0";
+            ensure_icmp_conntrack_bypass();
+            try_disable_kernel_icmp_echo_auto_reply();
+            ensure_fragment_conntrack_bypass();
+        }
+
         init_openssl(cert_file, key_file);
 
-        StunContext stun_ctx;
-        stun_ctx.nodes[0].bind_ep = resolve_endpoint(bind_ip1, port1); stun_ctx.nodes[0].pub_ep = resolve_endpoint(pub_ip1, port1);
-        stun_ctx.nodes[1].bind_ep = resolve_endpoint(bind_ip1, port2); stun_ctx.nodes[1].pub_ep = resolve_endpoint(pub_ip1, port2);
-        stun_ctx.nodes[2].bind_ep = resolve_endpoint(bind_ip2, port1); stun_ctx.nodes[2].pub_ep = resolve_endpoint(pub_ip2, port1);
-        stun_ctx.nodes[3].bind_ep = resolve_endpoint(bind_ip2, port2); stun_ctx.nodes[3].pub_ep = resolve_endpoint(pub_ip2, port2);
-        
-        stun_ctx.tls_nodes[0].bind_ep = resolve_endpoint(bind_ip1, tls_port1); stun_ctx.tls_nodes[0].pub_ep = resolve_endpoint(pub_ip1, tls_port1);
-        stun_ctx.tls_nodes[1].bind_ep = resolve_endpoint(bind_ip1, tls_port2); stun_ctx.tls_nodes[1].pub_ep = resolve_endpoint(pub_ip1, tls_port2);
-        stun_ctx.tls_nodes[2].bind_ep = resolve_endpoint(bind_ip2, tls_port1); stun_ctx.tls_nodes[2].pub_ep = resolve_endpoint(pub_ip2, tls_port1);
-        stun_ctx.tls_nodes[3].bind_ep = resolve_endpoint(bind_ip2, tls_port2); stun_ctx.tls_nodes[3].pub_ep = resolve_endpoint(pub_ip2, tls_port2);
+        std::vector<std::thread> engines;
 
-        int tcp_fds[4], tls_fds[4], dtls_fds[4];
-        std::cout << "Starting Server Engine with TCP/UDP Multiplexing & Interface Binding Penetration...\n";
-        for (int i = 0; i < 4; ++i) {
-            stun_ctx.nodes[i].iface_name = get_interface_name(stun_ctx.nodes[i].bind_ep);
-            stun_ctx.nodes[i].fd = create_udp_listener(stun_ctx.nodes[i].bind_ep, stun_ctx.nodes[i].iface_name);
-            tcp_fds[i] = create_tcp_listener(stun_ctx.nodes[i].bind_ep, stun_ctx.nodes[i].iface_name);
+        if (has_ipv4) {
+            auto v4_ctx = std::make_shared<StunContext>();
+            v4_ctx->nodes[0].bind_ep = resolve_endpoint(bind_ip1, port1); v4_ctx->nodes[0].pub_ep = resolve_endpoint(pub_ip1, port1);
+            v4_ctx->nodes[1].bind_ep = resolve_endpoint(bind_ip1, port2); v4_ctx->nodes[1].pub_ep = resolve_endpoint(pub_ip1, port2);
+            v4_ctx->nodes[2].bind_ep = resolve_endpoint(bind_ip2, port1); v4_ctx->nodes[2].pub_ep = resolve_endpoint(pub_ip2, port1);
+            v4_ctx->nodes[3].bind_ep = resolve_endpoint(bind_ip2, port2); v4_ctx->nodes[3].pub_ep = resolve_endpoint(pub_ip2, port2);
             
-            int flags = fcntl(tcp_fds[i], F_GETFL, 0); fcntl(tcp_fds[i], F_SETFL, flags | O_NONBLOCK);
-            
-            std::cout << "  Node " << i << ": Bind=" << endpoint_host(stun_ctx.nodes[i].bind_ep) << ":" << stun_ctx.nodes[i].bind_ep.port 
-                      << "  Public=" << endpoint_host(stun_ctx.nodes[i].pub_ep) << ":" << stun_ctx.nodes[i].pub_ep.port << "\n";
-        }
-        
-        std::cout << "Starting TLS/DTLS Endpoints...\n";
-        for (int i = 0; i < 4; ++i) {
-            stun_ctx.tls_nodes[i].iface_name = get_interface_name(stun_ctx.tls_nodes[i].bind_ep);
-            tls_fds[i] = create_tcp_listener(stun_ctx.tls_nodes[i].bind_ep, stun_ctx.tls_nodes[i].iface_name);
-            dtls_fds[i] = create_udp_listener(stun_ctx.tls_nodes[i].bind_ep, stun_ctx.tls_nodes[i].iface_name);
-            
-            int tcp_f = fcntl(tls_fds[i], F_GETFL, 0); fcntl(tls_fds[i], F_SETFL, tcp_f | O_NONBLOCK);
-            int udp_f = fcntl(dtls_fds[i], F_GETFL, 0); fcntl(dtls_fds[i], F_SETFL, udp_f | O_NONBLOCK);
-            
-            std::cout << "  TLS Node " << i << ": Bind=" << endpoint_host(stun_ctx.tls_nodes[i].bind_ep) << ":" << stun_ctx.tls_nodes[i].bind_ep.port 
-                      << "  Public=" << endpoint_host(stun_ctx.tls_nodes[i].pub_ep) << ":" << stun_ctx.tls_nodes[i].pub_ep.port << "\n";
+            v4_ctx->tls_nodes[0].bind_ep = resolve_endpoint(bind_ip1, tls_port1); v4_ctx->tls_nodes[0].pub_ep = resolve_endpoint(pub_ip1, tls_port1);
+            v4_ctx->tls_nodes[1].bind_ep = resolve_endpoint(bind_ip1, tls_port2); v4_ctx->tls_nodes[1].pub_ep = resolve_endpoint(pub_ip1, tls_port2);
+            v4_ctx->tls_nodes[2].bind_ep = resolve_endpoint(bind_ip2, tls_port1); v4_ctx->tls_nodes[2].pub_ep = resolve_endpoint(pub_ip2, tls_port1);
+            v4_ctx->tls_nodes[3].bind_ep = resolve_endpoint(bind_ip2, tls_port2); v4_ctx->tls_nodes[3].pub_ep = resolve_endpoint(pub_ip2, tls_port2);
+
+            engines.emplace_back(run_server_engine, v4_ctx, probe_timeout_ms, syn_delay_ms, "IPv4");
         }
 
-        if (stun_ctx.nodes[0].bind_ep.family == AF_INET) {
-            stun_ctx.icmp_ctx.primary_socket = create_icmp_raw_listener(stun_ctx.nodes[0].bind_ep, stun_ctx.nodes[0].iface_name);
-            stun_ctx.icmp_ctx.secondary_socket = create_icmp_raw_listener(stun_ctx.nodes[2].bind_ep, stun_ctx.nodes[2].iface_name);
-        }
-
-        std::cout << "\n>>> Server fully ready! Logs will appear below...\n";
-        std::cout << "========================================================\n";
-
-        std::vector<pollfd> descriptors;
-        for (int i = 0; i < 4; i++) descriptors.push_back({tcp_fds[i], POLLIN, 0});
-        for (int i = 0; i < 4; i++) descriptors.push_back({stun_ctx.nodes[i].fd, POLLIN, 0});
-        for (int i = 0; i < 4; i++) descriptors.push_back({tls_fds[i], POLLIN, 0});
-        for (int i = 0; i < 4; i++) descriptors.push_back({dtls_fds[i], POLLIN, 0});
-        if (stun_ctx.icmp_ctx.primary_socket >= 0) descriptors.push_back({stun_ctx.icmp_ctx.primary_socket, POLLIN, 0});
-        if (stun_ctx.icmp_ctx.secondary_socket >= 0) descriptors.push_back({stun_ctx.icmp_ctx.secondary_socket, POLLIN, 0});
-
-        while (true) {
-            for (auto& d : descriptors) d.revents = 0;
-            if (poll(descriptors.data(), descriptors.size(), -1) < 0) throw system_error("poll failed");
+        if (has_ipv6) {
+            auto v6_ctx = std::make_shared<StunContext>();
+            v6_ctx->nodes[0].bind_ep = resolve_endpoint(v6_ip1, v6_port1); v6_ctx->nodes[0].pub_ep = v6_ctx->nodes[0].bind_ep;
+            v6_ctx->nodes[1].bind_ep = resolve_endpoint(v6_ip1, v6_port2); v6_ctx->nodes[1].pub_ep = v6_ctx->nodes[1].bind_ep;
+            v6_ctx->nodes[2].bind_ep = resolve_endpoint(v6_ip2, v6_port1); v6_ctx->nodes[2].pub_ep = v6_ctx->nodes[2].bind_ep;
+            v6_ctx->nodes[3].bind_ep = resolve_endpoint(v6_ip2, v6_port2); v6_ctx->nodes[3].pub_ep = v6_ctx->nodes[3].bind_ep;
             
-            int idx = 0;
-            for (int i = 0; i < 4; i++, idx++) {
-                if (descriptors[idx].revents & POLLIN) {
-                    sockaddr_storage client{}; socklen_t len = sizeof(client);
-                    int client_fd = accept(tcp_fds[i], reinterpret_cast<sockaddr*>(&client), &len);
-                    if (client_fd >= 0) {
-                        std::thread([client_fd, i, &stun_ctx, probe_timeout_ms, syn_delay_ms]() {
-                            handle_stream_client(client_fd, i, stun_ctx, false, const_cast<IcmpRawContext&>(stun_ctx.icmp_ctx), probe_timeout_ms, syn_delay_ms);
-                            close(client_fd);
-                        }).detach();
-                    }
-                }
-            }
-            for (int i = 0; i < 4; i++, idx++) {
-                if (descriptors[idx].revents & POLLIN) handle_udp_packet(i, stun_ctx);
-            }
-            for (int i = 0; i < 4; i++, idx++) {
-                if (descriptors[idx].revents & POLLIN) {
-                    sockaddr_storage client{}; socklen_t len = sizeof(client);
-                    int client_fd = accept(tls_fds[i], reinterpret_cast<sockaddr*>(&client), &len);
-                    if (client_fd >= 0) {
-                        std::thread([client_fd, i, &stun_ctx, probe_timeout_ms, syn_delay_ms]() {
-                            handle_stream_client(client_fd, i, stun_ctx, true, const_cast<IcmpRawContext&>(stun_ctx.icmp_ctx), probe_timeout_ms, syn_delay_ms);
-                            close(client_fd);
-                        }).detach();
-                    }
-                }
-            }
-            for (int i = 0; i < 4; i++, idx++) {
-                if (descriptors[idx].revents & POLLIN) handle_dtls_listen(dtls_fds[i], i, stun_ctx);
-            }
-            if (stun_ctx.icmp_ctx.primary_socket >= 0) {
-                if (descriptors[idx].revents & POLLIN) handle_icmp_packet(stun_ctx.icmp_ctx.primary_socket, stun_ctx.icmp_ctx);
-                idx++;
-            }
-            if (stun_ctx.icmp_ctx.secondary_socket >= 0) {
-                if (descriptors[idx].revents & POLLIN) handle_icmp_packet(stun_ctx.icmp_ctx.secondary_socket, stun_ctx.icmp_ctx);
-                idx++;
-            }
+            v6_ctx->tls_nodes[0].bind_ep = resolve_endpoint(v6_ip1, v6_tls_port1); v6_ctx->tls_nodes[0].pub_ep = v6_ctx->tls_nodes[0].bind_ep;
+            v6_ctx->tls_nodes[1].bind_ep = resolve_endpoint(v6_ip1, v6_tls_port2); v6_ctx->tls_nodes[1].pub_ep = v6_ctx->tls_nodes[1].bind_ep;
+            v6_ctx->tls_nodes[2].bind_ep = resolve_endpoint(v6_ip2, v6_tls_port1); v6_ctx->tls_nodes[2].pub_ep = v6_ctx->tls_nodes[2].bind_ep;
+            v6_ctx->tls_nodes[3].bind_ep = resolve_endpoint(v6_ip2, v6_tls_port2); v6_ctx->tls_nodes[3].pub_ep = v6_ctx->tls_nodes[3].bind_ep;
+
+            engines.emplace_back(run_server_engine, v6_ctx, probe_timeout_ms, syn_delay_ms, "IPv6");
         }
+
+        for (auto& t : engines) {
+            t.join();
+        }
+
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << '\n';
         return 1;
