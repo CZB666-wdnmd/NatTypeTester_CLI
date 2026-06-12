@@ -45,8 +45,13 @@
 #include <vector>
 #include <fstream>
 #include <cctype>
+#include <filesystem>
 
 namespace {
+
+std::mutex g_console_mutex;
+#define LOG_INFO(...) { std::lock_guard<std::mutex> lock(g_console_mutex); std::cout << __VA_ARGS__; std::cout.flush(); }
+#define LOG_ERR(...) { std::lock_guard<std::mutex> lock(g_console_mutex); std::cerr << __VA_ARGS__; std::cerr.flush(); }
 
 constexpr std::string_view kRfc7857UdpProbePayload = "RFC7857-UDP-PROBE\n";
 constexpr std::string_view kRfc4787OutOfOrderFragmentPayload = "RFC4787-OOO-FRAGMENT\n";
@@ -117,6 +122,86 @@ bool command_exists(const std::string& command) {
     return run_shell_command("command -v " + command + " >/dev/null 2>&1");
 }
 
+void install_systemd_service() {
+    if (!command_exists("systemctl") || !std::filesystem::exists("/etc/systemd/system")) {
+        LOG_ERR("Error: systemd not found. This command is only supported on systemd-based Linux.\n");
+        std::exit(1);
+    }
+    if (geteuid() != 0) {
+        LOG_ERR("Error: Please run --service-install as root (e.g., via sudo).\n");
+        std::exit(1);
+    }
+
+    std::error_code ec;
+    std::filesystem::create_directories("/etc/nat_type_tester_server", ec);
+    if (ec) {
+        LOG_ERR("Error creating directory /etc/nat_type_tester_server: " << ec.message() << "\n");
+        std::exit(1);
+    }
+
+    std::filesystem::copy_file("/proc/self/exe", "/etc/nat_type_tester_server/nat_type_tester_server", std::filesystem::copy_options::overwrite_existing, ec);
+    if (ec) {
+        LOG_ERR("Error copying executable: " << ec.message() << "\n");
+        std::exit(1);
+    }
+
+    std::string config_path = "/etc/nat_type_tester_server/config.json";
+    if (!std::filesystem::exists(config_path)) {
+        std::ofstream ofs(config_path);
+        ofs << R"({
+    "bind-ip1": "0.0.0.0",
+    "pub-ip1": "",
+    "bind-ip2": "0.0.0.0",
+    "pub-ip2": "",
+    "v6-ip1": "",
+    "v6-ip2": "",
+    "port1": 3478,
+    "port2": 3479,
+    "tls-port1": 5349,
+    "tls-port2": 5350,
+    "v6-port1": 3478,
+    "v6-port2": 3479,
+    "v6-tls-port1": 5349,
+    "v6-tls-port2": 5350,
+    "probe-timeout-ms": 1200,
+    "syn-delay-ms": 350,
+    "cert": "",
+    "key": ""
+})";
+    }
+
+    std::ofstream unit("/etc/systemd/system/nat_type_tester_server.service");
+    unit << R"([Unit]
+Description=NAT Type Tester Server
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/etc/nat_type_tester_server
+ExecStart=/etc/nat_type_tester_server/nat_type_tester_server -c /etc/nat_type_tester_server/config.json
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+)";
+    unit.close();
+
+    run_shell_command("systemctl daemon-reload");
+    run_shell_command("systemctl enable nat_type_tester_server");
+
+    LOG_INFO("--------------------------------------------------\n");
+    LOG_INFO("Service installed and enabled successfully!\n");
+    LOG_INFO("Binary path: /etc/nat_type_tester_server/nat_type_tester_server\n");
+    LOG_INFO("Config path: " << config_path << "\n\n");
+    LOG_INFO("Please edit the config file to set up your IPs, then run:\n");
+    LOG_INFO("  systemctl start nat_type_tester_server\n");
+    LOG_INFO("  systemctl status nat_type_tester_server\n");
+    LOG_INFO("--------------------------------------------------\n");
+    std::exit(0);
+}
+
 bool ensure_iptables_icmp_notrack() {
     if (!command_exists("iptables")) return false;
     bool ok = true;
@@ -152,11 +237,11 @@ void ensure_icmp_conntrack_bypass() {
     bool configured = ensure_iptables_icmp_notrack();
     if (!configured) configured = ensure_nftables_icmp_notrack();
     if (configured) {
-        std::cout << "Note: ICMP conntrack bypass (notrack) is active for raw ICMP probes.\n";
+        LOG_INFO("Note: ICMP conntrack bypass (notrack) is active for raw ICMP probes.\n");
         return;
     }
-    if (geteuid() != 0) std::cerr << "Warning: ICMP notrack rules not configured (run as root). Raw ICMP probes may be dropped.\n";
-    else std::cerr << "Warning: Failed to configure ICMP notrack rules via iptables/nft.\n";
+    if (geteuid() != 0) LOG_ERR("Warning: ICMP notrack rules not configured (run as root). Raw ICMP probes may be dropped.\n");
+    else LOG_ERR("Warning: Failed to configure ICMP notrack rules via iptables/nft.\n");
 }
 
 static bool s_fragment_rules_added = false;
@@ -224,12 +309,12 @@ void ensure_fragment_conntrack_bypass() {
     if (!configured) configured = ensure_iptables_fragment_notrack();
     s_fragment_rules_added = configured;
     if (configured) {
-        std::cout << "Note: IP Fragment conntrack bypass (notrack) is active.\n";
+        LOG_INFO("Note: IP Fragment conntrack bypass (notrack) is active.\n");
         std::atexit(cleanup_fragment_conntrack_bypass);
         return;
     }
-    if (geteuid() != 0) std::cerr << "Warning: Fragment notrack rules not configured (run as root). OutOfOrderTest may fail.\n";
-    else std::cerr << "Warning: Failed to configure fragment notrack rules via iptables/nft.\n";
+    if (geteuid() != 0) LOG_ERR("Warning: Fragment notrack rules not configured (run as root). OutOfOrderTest may fail.\n");
+    else LOG_ERR("Warning: Failed to configure fragment notrack rules via iptables/nft.\n");
 }
 
 void try_disable_kernel_icmp_echo_auto_reply() {
@@ -785,7 +870,7 @@ void handle_icmp_packet(int raw_fd, IcmpRawContext& icmp_ctx) {
             const auto* inner_ip = reinterpret_cast<const iphdr*>(buffer.data() + ip_header_length + sizeof(icmphdr));
             if (inner_ip->version == 4 && inner_ip->protocol == IPPROTO_UDP) {
                 uint16_t marker = ntohs(inner_ip->id);
-                std::cout << "[ICMP-RAW] Port Unreach from " << endpoint_host(peer_endpoint) << " | Marker=" << marker << "\n";
+                LOG_INFO("[ICMP-RAW] Port Unreach from " << endpoint_host(peer_endpoint) << " | Marker=" << marker << "\n");
                 std::lock_guard<std::mutex> lock(icmp_ctx.observed_error_markers_mutex);
                 icmp_ctx.observed_error_markers.insert(marker);
             }
@@ -799,7 +884,7 @@ void handle_icmp_packet(int raw_fd, IcmpRawContext& icmp_ctx) {
     std::string_view payload(payload_data, payload_size);
 
     if (std::optional<std::string> token = parse_rfc5508_mapping_token(payload); token.has_value()) {
-        std::cout << "[ICMP-RAW] Echo Req from " << endpoint_host(peer_endpoint) << " | Token=" << *token << " | MapQuery=" << ntohs(icmp->un.echo.id) << "\n";
+        LOG_INFO("[ICMP-RAW] Echo Req from " << endpoint_host(peer_endpoint) << " | Token=" << *token << " | MapQuery=" << ntohs(icmp->un.echo.id) << "\n");
         IcmpMappingRecord record;
         record.peer_host = endpoint_host(peer_endpoint);
         record.mapped_query = ntohs(icmp->un.echo.id);
@@ -830,7 +915,7 @@ void handle_stream_client(int client_fd, int rx_idx, std::shared_ptr<StunContext
             oss << "[" << prefix_name << "] [" << (is_tls ? "TLS-CUST" : "TCP-CUST") << "] Req from " << endpoint_host(peer_endpoint) << ":" << peer_endpoint.port << " | Cmd: " << cmd;
             if (!extra.empty()) oss << " | " << extra;
             oss << "\n";
-            std::cout << oss.str();
+            LOG_INFO(oss.str());
         };
 
         log_stream("NEW_CONNECTION", "Interface: " + (rx_node.iface_name.empty() ? "default" : rx_node.iface_name));
@@ -1000,7 +1085,7 @@ void handle_stream_client(int client_fd, int rx_idx, std::shared_ptr<StunContext
             }
         }
     } catch (const std::exception& e) {
-        std::cerr << "[" << prefix_name << "] [" << (is_tls ? "TLS-CUST" : "TCP-CUST") << "] Error handling client: " << e.what() << "\n";
+        LOG_ERR("[" << prefix_name << "] [" << (is_tls ? "TLS-CUST" : "TCP-CUST") << "] Error handling client: " << e.what() << "\n");
     }
 }
 
@@ -1013,7 +1098,7 @@ void handle_dtls_client(SSL* ssl, int dtls_fd, int rx_idx, const StunContext& ct
     IpEndpoint peer_endpoint = from_sockaddr(reinterpret_cast<sockaddr*>(&peer), peer_len);
 
     auto log_dtls = [&](const std::string& msg) {
-        std::cout << "[" << prefix_name << "] [DTLS] Req from " << endpoint_host(peer_endpoint) << ":" << peer_endpoint.port << " | " << msg << "\n";
+        LOG_INFO("[" << prefix_name << "] [DTLS] Req from " << endpoint_host(peer_endpoint) << ":" << peer_endpoint.port << " | " << msg << "\n");
     };
 
     log_dtls("Handshake Success! Connection established.");
@@ -1065,7 +1150,7 @@ void handle_dtls_listen(int listen_fd, int rx_idx, std::shared_ptr<StunContext> 
             int err = SSL_get_error(ssl, ret);
             char buf[256];
             ERR_error_string_n(ERR_get_error(), buf, sizeof(buf));
-            std::cout << "[" << prefix_name << "] [DTLS] DTLSv1_listen error: " << err << ", " << buf << "\n";
+            LOG_ERR("[" << prefix_name << "] [DTLS] DTLSv1_listen error: " << err << ", " << buf << "\n");
         }
         BIO_ADDR_free(client_addr);
         SSL_free(ssl);
@@ -1090,13 +1175,13 @@ void handle_dtls_listen(int listen_fd, int rx_idx, std::shared_ptr<StunContext> 
 
     SocketAddress local_addr = to_sockaddr(rx_node.bind_ep);
     if (bind(new_fd, reinterpret_cast<sockaddr*>(&local_addr.storage), local_addr.length) < 0) {
-        std::cout << "[" << prefix_name << "] [DTLS] Failed to bind new socket.\n";
+        LOG_ERR("[" << prefix_name << "] [DTLS] Failed to bind new socket.\n");
         close(new_fd); SSL_free(ssl); return;
     }
 
     SocketAddress peer_addr = to_sockaddr(peer_endpoint);
     if (connect(new_fd, reinterpret_cast<sockaddr*>(&peer_addr.storage), peer_addr.length) < 0) {
-        std::cout << "[" << prefix_name << "] [DTLS] Failed to connect new socket.\n";
+        LOG_ERR("[" << prefix_name << "] [DTLS] Failed to connect new socket.\n");
         close(new_fd); SSL_free(ssl); return;
     }
 
@@ -1118,7 +1203,7 @@ void handle_dtls_listen(int listen_fd, int rx_idx, std::shared_ptr<StunContext> 
             int err = SSL_get_error(ssl, accept_ret);
             char buf[256];
             ERR_error_string_n(ERR_get_error(), buf, sizeof(buf));
-            std::cout << "[" << prefix_name << "] [DTLS] SSL_accept handshake failed: " << err << ", " << buf << "\n";
+            LOG_ERR("[" << prefix_name << "] [DTLS] SSL_accept handshake failed: " << err << ", " << buf << "\n");
         }
         
         SSL_free(ssl);
@@ -1174,11 +1259,11 @@ void handle_udp_packet(int rx_idx, const StunContext& ctx, const std::string& pr
             const uint8_t* tx_id = reinterpret_cast<const uint8_t*>(buffer.data() + 4); 
             bool is_rfc5389 = (tx_id[0] == 0x21 && tx_id[1] == 0x12 && tx_id[2] == 0xA4 && tx_id[3] == 0x42);
 
-            std::cout << "[" << prefix_name << "] [STUN] Req from " << endpoint_host(peer_endpoint) << ":" << peer_endpoint.port 
+            LOG_INFO("[" << prefix_name << "] [STUN] Req from " << endpoint_host(peer_endpoint) << ":" << peer_endpoint.port 
                       << " | Rx: " << rx_node.pub_ep.port << " (IP-" << (rx_idx & 2 ? "2" : "1") << ")"
                       << " | ChgIP=" << change_ip << " ChgPort=" << change_port 
                       << " | Reply: " << endpoint_host(reply_node.pub_ep) << ":" << reply_node.pub_ep.port 
-                      << (reply_node.iface_name.empty() ? "" : (" via " + reply_node.iface_name)) << "\n";
+                      << (reply_node.iface_name.empty() ? "" : (" via " + reply_node.iface_name)) << "\n");
 
             auto stun_resp = generate_stun_binding_response(tx_id, peer_endpoint, reply_node.pub_ep, other_node.pub_ep, is_rfc5389);
             sendto(reply_node.fd, stun_resp.data(), stun_resp.size(), 0, reinterpret_cast<sockaddr*>(&peer), peer_length);
@@ -1187,14 +1272,14 @@ void handle_udp_packet(int rx_idx, const StunContext& ctx, const std::string& pr
     }
 
     if (received >= 1 && buffer[0] == 'M') {
-        std::cout << "[" << prefix_name << "] [UDP-CUST] Req from " << endpoint_host(peer_endpoint) << ":" << peer_endpoint.port << " | Cmd: M\n";
+        LOG_INFO("[" << prefix_name << "] [UDP-CUST] Req from " << endpoint_host(peer_endpoint) << ":" << peer_endpoint.port << " | Cmd: M\n");
         std::string payload = endpoint_line(peer_endpoint);
         sendto(udp_fd, payload.data(), payload.size(), 0, reinterpret_cast<sockaddr*>(&peer), peer_length);
         return;
     }
 
     if (received >= 1 && buffer[0] == 'C') {
-        std::cout << "[" << prefix_name << "] [UDP-CUST] Req from " << endpoint_host(peer_endpoint) << ":" << peer_endpoint.port << " | Cmd: C\n";
+        LOG_INFO("[" << prefix_name << "] [UDP-CUST] Req from " << endpoint_host(peer_endpoint) << ":" << peer_endpoint.port << " | Cmd: C\n");
         std::string payload = 
             "PRIMARY " + endpoint_host(ctx.nodes[0].pub_ep) + " " + std::to_string(ctx.nodes[0].pub_ep.port) + "\n" +
             "SECONDARY " + endpoint_host(ctx.nodes[2].pub_ep) + " " + std::to_string(ctx.nodes[2].pub_ep.port) + "\n";
@@ -1204,7 +1289,7 @@ void handle_udp_packet(int rx_idx, const StunContext& ctx, const std::string& pr
 
     if (received >= 1 && buffer[0] == 'I') {
         bool sent = send_ipv4_icmp_error(peer_endpoint, rx_node.pub_ep, IPPROTO_UDP, rx_node.iface_name);
-        std::cout << "[" << prefix_name << "] [UDP-CUST] Req from " << endpoint_host(peer_endpoint) << ":" << peer_endpoint.port << " | Cmd: I | Sent=" << sent << "\n";
+        LOG_INFO("[" << prefix_name << "] [UDP-CUST] Req from " << endpoint_host(peer_endpoint) << ":" << peer_endpoint.port << " | Cmd: I | Sent=" << sent << "\n");
         std::string reply = std::string("I=") + (sent ? "1" : "0") + "\n";
         sendto(udp_fd, reply.data(), reply.size(), 0, reinterpret_cast<sockaddr*>(&peer), peer_length);
         return;
@@ -1212,7 +1297,7 @@ void handle_udp_packet(int rx_idx, const StunContext& ctx, const std::string& pr
 
     if (received >= 1 && buffer[0] == 'O') {
         bool sent = send_out_of_order_fragmented_udp(peer_endpoint, rx_node.bind_ep, rx_node.iface_name);
-        std::cout << "[" << prefix_name << "] [UDP-CUST] Req from " << endpoint_host(peer_endpoint) << ":" << peer_endpoint.port << " | Cmd: O | Sent=" << sent << "\n";
+        LOG_INFO("[" << prefix_name << "] [UDP-CUST] Req from " << endpoint_host(peer_endpoint) << ":" << peer_endpoint.port << " | Cmd: O | Sent=" << sent << "\n");
         std::string reply = std::string("O=") + (sent ? "1" : "0") + "\n";
         sendto(udp_fd, reply.data(), reply.size(), 0, reinterpret_cast<sockaddr*>(&peer), peer_length);
         return;
@@ -1248,7 +1333,7 @@ int dtls_generate_cookie(SSL*, unsigned char* cookie, unsigned int* cookie_len) 
 void init_openssl(const std::string& cert_file, const std::string& key_file) {
     SSL_library_init(); OpenSSL_add_all_algorithms(); SSL_load_error_strings();
     if (cert_file.empty() || key_file.empty()) {
-        std::cout << "Generating self-signed certificate (ECDSA prime256v1) for TLS/DTLS...\n";
+        LOG_INFO("Generating self-signed certificate (ECDSA prime256v1) for TLS/DTLS...\n");
         generate_self_signed_cert();
     }
     tls_ctx = SSL_CTX_new(TLS_server_method());
@@ -1282,7 +1367,7 @@ void run_server_engine(std::shared_ptr<StunContext> ctx_ptr, int probe_timeout_m
     int tls_fds[4] = {-1, -1, -1, -1};
     int dtls_fds[4] = {-1, -1, -1, -1};
 
-    std::cout << "\n[" << prefix_name << "] Starting Engine with TCP/UDP Multiplexing & Interface Binding Penetration...\n";
+    LOG_INFO("\n[" << prefix_name << "] Starting Engine with TCP/UDP Multiplexing & Interface Binding Penetration...\n");
     for (int i = 0; i < 4; ++i) {
         stun_ctx.nodes[i].iface_name = get_interface_name(stun_ctx.nodes[i].bind_ep);
         stun_ctx.nodes[i].fd = create_udp_listener(stun_ctx.nodes[i].bind_ep, stun_ctx.nodes[i].iface_name);
@@ -1290,11 +1375,11 @@ void run_server_engine(std::shared_ptr<StunContext> ctx_ptr, int probe_timeout_m
         
         int flags = fcntl(tcp_fds[i], F_GETFL, 0); fcntl(tcp_fds[i], F_SETFL, flags | O_NONBLOCK);
         
-        std::cout << "  [" << prefix_name << "] Node " << i << ": Bind=" << endpoint_host(stun_ctx.nodes[i].bind_ep) << ":" << stun_ctx.nodes[i].bind_ep.port 
-                  << "  Public=" << endpoint_host(stun_ctx.nodes[i].pub_ep) << ":" << stun_ctx.nodes[i].pub_ep.port << "\n";
+        LOG_INFO("  [" << prefix_name << "] Node " << i << ": Bind=" << endpoint_host(stun_ctx.nodes[i].bind_ep) << ":" << stun_ctx.nodes[i].bind_ep.port 
+                  << "  Public=" << endpoint_host(stun_ctx.nodes[i].pub_ep) << ":" << stun_ctx.nodes[i].pub_ep.port << "\n");
     }
     
-    std::cout << "[" << prefix_name << "] Starting TLS/DTLS Endpoints...\n";
+    LOG_INFO("[" << prefix_name << "] Starting TLS/DTLS Endpoints...\n");
     for (int i = 0; i < 4; ++i) {
         stun_ctx.tls_nodes[i].iface_name = get_interface_name(stun_ctx.tls_nodes[i].bind_ep);
         tls_fds[i] = create_tcp_listener(stun_ctx.tls_nodes[i].bind_ep, stun_ctx.tls_nodes[i].iface_name);
@@ -1303,8 +1388,8 @@ void run_server_engine(std::shared_ptr<StunContext> ctx_ptr, int probe_timeout_m
         int tcp_f = fcntl(tls_fds[i], F_GETFL, 0); fcntl(tls_fds[i], F_SETFL, tcp_f | O_NONBLOCK);
         int udp_f = fcntl(dtls_fds[i], F_GETFL, 0); fcntl(dtls_fds[i], F_SETFL, udp_f | O_NONBLOCK);
         
-        std::cout << "  [" << prefix_name << "] TLS Node " << i << ": Bind=" << endpoint_host(stun_ctx.tls_nodes[i].bind_ep) << ":" << stun_ctx.tls_nodes[i].bind_ep.port 
-                  << "  Public=" << endpoint_host(stun_ctx.tls_nodes[i].pub_ep) << ":" << stun_ctx.tls_nodes[i].pub_ep.port << "\n";
+        LOG_INFO("  [" << prefix_name << "] TLS Node " << i << ": Bind=" << endpoint_host(stun_ctx.tls_nodes[i].bind_ep) << ":" << stun_ctx.tls_nodes[i].bind_ep.port 
+                  << "  Public=" << endpoint_host(stun_ctx.tls_nodes[i].pub_ep) << ":" << stun_ctx.tls_nodes[i].pub_ep.port << "\n");
     }
 
     if (stun_ctx.nodes[0].bind_ep.family == AF_INET) {
@@ -1312,8 +1397,8 @@ void run_server_engine(std::shared_ptr<StunContext> ctx_ptr, int probe_timeout_m
         stun_ctx.icmp_ctx.secondary_socket = create_icmp_raw_listener(stun_ctx.nodes[2].bind_ep, stun_ctx.nodes[2].iface_name);
     }
 
-    std::cout << ">>> [" << prefix_name << "] Server fully ready! Logs will appear below...\n";
-    std::cout << "========================================================\n";
+    LOG_INFO(">>> [" << prefix_name << "] Server fully ready! Logs will appear below...\n");
+    LOG_INFO("========================================================\n");
 
     std::vector<pollfd> descriptors;
     for (int i = 0; i < 4; i++) descriptors.push_back({tcp_fds[i], POLLIN, 0});
@@ -1373,8 +1458,13 @@ void run_server_engine(std::shared_ptr<StunContext> ctx_ptr, int probe_timeout_m
 
 int main(int argc, char** argv) {
     try {
+        for (int i = 1; i < argc; ++i) {
+            if (std::string(argv[i]) == "--service-install") {
+                install_systemd_service();
+            }
+        }
+
         std::unordered_map<std::string, std::string> cfg;
-        // 预设默认值
         cfg["port1"] = "3478";
         cfg["port2"] = "3479";
         cfg["tls-port1"] = "5349";
@@ -1386,7 +1476,6 @@ int main(int argc, char** argv) {
         cfg["probe-timeout-ms"] = "1200";
         cfg["syn-delay-ms"] = "350";
 
-        // 第一遍扫描：寻找 -c 或 --config
         std::string config_file;
         for (int i = 1; i < argc; ++i) {
             std::string arg = argv[i];
@@ -1396,7 +1485,6 @@ int main(int argc, char** argv) {
             }
         }
 
-// 如果指定了配置文件，通过纯字符串查找解析扁平 JSON（完全不依赖正则）
         if (!config_file.empty()) {
             std::ifstream ifs(config_file);
             if (!ifs) fail("Failed to open config file: " + config_file);
@@ -1404,40 +1492,33 @@ int main(int argc, char** argv) {
             
             size_t pos = 0;
             while ((pos = content.find('"', pos)) != std::string::npos) {
-                // 提取 Key
                 size_t key_end = content.find('"', pos + 1);
                 if (key_end == std::string::npos) break;
                 std::string key = content.substr(pos + 1, key_end - pos - 1);
                 
-                // 寻找冒号
                 size_t colon_pos = content.find(':', key_end + 1);
                 if (colon_pos == std::string::npos) break;
                 
-                // 寻找 Value 的起始位置
                 size_t val_start = content.find_first_not_of(" \t\r\n", colon_pos + 1);
                 if (val_start == std::string::npos) break;
                 
                 if (content[val_start] == '"') { 
-                    // 匹配字符串: "key": "value"
                     size_t val_end = content.find('"', val_start + 1);
                     if (val_end == std::string::npos) break;
                     cfg[key] = content.substr(val_start + 1, val_end - val_start - 1);
                     pos = val_end + 1;
                 } else if (content[val_start] == '-' || std::isdigit(static_cast<unsigned char>(content[val_start]))) { 
-                    // 匹配数字: "key": 1234
                     size_t val_end = content.find_first_not_of("-0123456789", val_start);
                     size_t len = (val_end == std::string::npos) ? std::string::npos : (val_end - val_start);
                     cfg[key] = content.substr(val_start, len);
                     pos = (val_end == std::string::npos) ? content.length() : val_end;
                 } else {
-                    // 跳过未知的格式(例如 {}, [])
                     pos = val_start + 1;
                 }
             }
-            std::cout << "Loaded configuration from " << config_file << "\n";
+            LOG_INFO("Loaded configuration from " << config_file << "\n");
         }
 
-        // 第二遍扫描：读取命令行参数，它将覆盖 JSON 中的同名配置
         for (int i = 1; i < argc; ++i) {
             std::string arg = argv[i];
             if (arg == "-c" || arg == "--config") { ++i; continue; }
@@ -1451,7 +1532,6 @@ int main(int argc, char** argv) {
             }
         }
 
-        // 提取最终参数
         std::string bind_ip1 = cfg["bind-ip1"];
         std::string pub_ip1  = cfg["pub-ip1"];
         std::string bind_ip2 = cfg["bind-ip2"];
@@ -1528,7 +1608,7 @@ int main(int argc, char** argv) {
         }
 
     } catch (const std::exception& e) {
-        std::cerr << "Error: " << e.what() << '\n';
+        LOG_ERR("Error: " << e.what() << '\n');
         return 1;
     }
 }
