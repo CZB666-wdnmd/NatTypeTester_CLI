@@ -1015,16 +1015,15 @@ void handle_dtls_client(SSL* ssl, int dtls_fd, int rx_idx, const StunContext& ct
         std::cout << "[DTLS] Req from " << endpoint_host(peer_endpoint) << ":" << peer_endpoint.port << " | " << msg << "\n";
     };
 
-    struct timeval tv;
-    tv.tv_sec = 30;
-    tv.tv_usec = 0;
-    setsockopt(dtls_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(dtls_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    log_dtls("Handshake Success! Connection established.");
 
     while (true) {
         std::array<char, 4096> buffer{};
         int received = SSL_read(ssl, buffer.data(), buffer.size());
-        if (received <= 0) { log_dtls("Closed/Timeout"); break; }
+        if (received <= 0) { 
+            log_dtls("Closed/Timeout"); 
+            break; 
+        }
         
         if (received >= 20 && (buffer[0] & 0xC0) == 0) {
             uint16_t msg_type = static_cast<uint16_t>((static_cast<uint8_t>(buffer[0]) << 8) | static_cast<uint8_t>(buffer[1]));
@@ -1037,6 +1036,16 @@ void handle_dtls_client(SSL* ssl, int dtls_fd, int rx_idx, const StunContext& ct
                 SSL_write(ssl, stun_resp.data(), stun_resp.size());
                 log_dtls("STUN Binding Req -> Sent mapped address");
             }
+        } else if (received >= 1 && buffer[0] == 'M') {
+            log_dtls("Cmd: M");
+            std::string payload = endpoint_line(peer_endpoint);
+            SSL_write(ssl, payload.data(), payload.size());
+        } else if (received >= 1 && buffer[0] == 'C') {
+            log_dtls("Cmd: C");
+            std::string payload = 
+                "PRIMARY " + endpoint_host(ctx.nodes[0].pub_ep) + " " + std::to_string(ctx.nodes[0].pub_ep.port) + "\n" +
+                "SECONDARY " + endpoint_host(ctx.nodes[2].pub_ep) + " " + std::to_string(ctx.nodes[2].pub_ep.port) + "\n";
+            SSL_write(ssl, payload.data(), payload.size());
         }
     }
 }
@@ -1051,6 +1060,12 @@ void handle_dtls_listen(int listen_fd, int rx_idx, const StunContext& ctx) {
 
     int ret = DTLSv1_listen(ssl, client_addr);
     if (ret <= 0) {
+        if (ret < 0) {
+            int err = SSL_get_error(ssl, ret);
+            char buf[256];
+            ERR_error_string_n(ERR_get_error(), buf, sizeof(buf));
+            std::cout << "[DTLS] DTLSv1_listen error: " << err << ", " << buf << "\n";
+        }
         BIO_ADDR_free(client_addr);
         SSL_free(ssl);
         return;
@@ -1059,7 +1074,9 @@ void handle_dtls_listen(int listen_fd, int rx_idx, const StunContext& ctx) {
     IpEndpoint peer_endpoint{};
     peer_endpoint.family = BIO_ADDR_family(client_addr);
     peer_endpoint.port = ntohs(BIO_ADDR_rawport(client_addr));
-    size_t addr_len = 0;
+    
+    // 修复1：初始化 addr_len 为最大尺寸，否则 OpenSSL 不会拷贝任何 IP 地址！
+    size_t addr_len = peer_endpoint.address.size(); 
     BIO_ADDR_rawaddress(client_addr, peer_endpoint.address.data(), &addr_len);
     peer_endpoint.address_length = addr_len;
     BIO_ADDR_free(client_addr);
@@ -1073,21 +1090,43 @@ void handle_dtls_listen(int listen_fd, int rx_idx, const StunContext& ctx) {
 
     SocketAddress local_addr = to_sockaddr(rx_node.bind_ep);
     if (bind(new_fd, reinterpret_cast<sockaddr*>(&local_addr.storage), local_addr.length) < 0) {
+        std::cout << "[DTLS] Failed to bind new socket.\n";
         close(new_fd); SSL_free(ssl); return;
     }
 
     SocketAddress peer_addr = to_sockaddr(peer_endpoint);
     if (connect(new_fd, reinterpret_cast<sockaddr*>(&peer_addr.storage), peer_addr.length) < 0) {
+        std::cout << "[DTLS] Failed to connect new socket.\n";
         close(new_fd); SSL_free(ssl); return;
     }
 
     BIO *new_bio = BIO_new_dgram(new_fd, BIO_NOCLOSE);
+    
+    // 修复2：强制通知 OpenSSL 当前的 dgram BIO 已经处于 connected 状态
+    // 并且把对方的地址注入，以防止 OpenSSL 使用 sendto 时内部抛出异常中断握手
+    BIO_ctrl(new_bio, BIO_CTRL_DGRAM_SET_CONNECTED, 0, &peer_addr.storage);
+    
     SSL_set_bio(ssl, new_bio, new_bio);
 
     std::thread([ssl, new_fd, rx_idx, &ctx]() {
-        if (SSL_accept(ssl) > 0) {
+        // 修复3：握手阶段（SSL_accept）极其容易发生丢包
+        // 必须在握手前就设定好系统级的 Socket I/O 超时，防止被挂起
+        struct timeval tv;
+        tv.tv_sec = 10;
+        tv.tv_usec = 0;
+        setsockopt(new_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(new_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+        int accept_ret = SSL_accept(ssl);
+        if (accept_ret > 0) {
             handle_dtls_client(ssl, new_fd, rx_idx, ctx);
+        } else {
+            int err = SSL_get_error(ssl, accept_ret);
+            char buf[256];
+            ERR_error_string_n(ERR_get_error(), buf, sizeof(buf));
+            std::cout << "[DTLS] SSL_accept handshake failed: " << err << ", " << buf << "\n";
         }
+        
         SSL_free(ssl);
         close(new_fd);
     }).detach();
