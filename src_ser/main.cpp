@@ -13,6 +13,10 @@
 #include <netinet/ip6.h>
 #include <ifaddrs.h>
 
+#ifndef IPPROTO_DCCP
+#define IPPROTO_DCCP 33
+#endif
+
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/x509.h>
@@ -89,10 +93,26 @@ struct IcmpRawContext {
     std::mutex observed_error_markers_mutex;
 };
 
+struct DccpRecord {
+    IpEndpoint peer_endpoint;
+    std::uint8_t type;
+    std::uint8_t cscov;
+    bool valid_csum;
+};
+
+struct DccpContext {
+    int primary_socket{-1};
+    int secondary_socket{-1};
+    std::unordered_map<std::uint32_t, DccpRecord> requests_by_sc;
+    std::unordered_map<std::string, DccpRecord> packets_by_ep;
+    std::mutex mutex;
+};
+
 struct StunContext {
     StunNode nodes[4];
     StunNode tls_nodes[4];
     IcmpRawContext icmp_ctx;
+    DccpContext dccp_ctx;
 };
 
 enum class IcmpErrorVariant : std::uint8_t {
@@ -478,6 +498,22 @@ int create_icmp_raw_listener(const IpEndpoint& endpoint, const std::string& ifac
     return socket_fd;
 }
 
+int create_dccp_raw_listener(const IpEndpoint& endpoint, const std::string& iface) {
+    if (endpoint.family != AF_INET) return -1;
+    int socket_fd = socket(AF_INET, SOCK_RAW, IPPROTO_DCCP);
+    if (socket_fd < 0) return -1;
+    set_reuse_options(socket_fd);
+    bind_socket_to_device(socket_fd, iface);
+    IpEndpoint bind_endpoint = endpoint;
+    bind_endpoint.port = 0;
+    SocketAddress address = to_sockaddr(bind_endpoint);
+    if (bind(socket_fd, reinterpret_cast<sockaddr*>(&address.storage), address.length) != 0) {
+        close(socket_fd);
+        return -1;
+    }
+    return socket_fd;
+}
+
 std::string endpoint_host(const IpEndpoint& endpoint) {
     char buffer[INET6_ADDRSTRLEN]{};
     if (endpoint.family == AF_INET) inet_ntop(AF_INET, endpoint.address.data(), buffer, sizeof(buffer));
@@ -790,6 +826,72 @@ bool send_out_of_order_fragmented_udp(const IpEndpoint& peer, const IpEndpoint& 
     return first_sent == static_cast<ssize_t>(first_fragment.size()) && second_sent == static_cast<ssize_t>(second_fragment.size());
 }
 
+bool send_raw_dccp(const IpEndpoint& src, const IpEndpoint& dst, std::uint8_t type, std::uint32_t service_code, std::uint8_t cscov, const std::string& iface) {
+    if (src.family != AF_INET) return false;
+    int raw_fd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+    if (raw_fd < 0) return false;
+    int enable = 1; setsockopt(raw_fd, IPPROTO_IP, IP_HDRINCL, &enable, sizeof(enable));
+    bind_socket_to_device(raw_fd, iface);
+
+    std::vector<std::uint8_t> packet;
+    std::size_t ip_len = sizeof(iphdr);
+    std::size_t dccp_len = 16;
+    if (type == 0) dccp_len += 4;
+    else if (type == 7) dccp_len += 12; 
+    else if (type != 2) dccp_len += 8; 
+    packet.resize(ip_len + dccp_len, 0);
+    
+    auto* ip = reinterpret_cast<iphdr*>(packet.data());
+    ip->ihl = 5; ip->version = 4; ip->tot_len = htons(packet.size());
+    ip->id = htons(0xDC00 + type); ip->ttl = 64; ip->protocol = IPPROTO_DCCP; 
+    std::memcpy(&ip->saddr, src.address.data(), 4);
+    std::memcpy(&ip->daddr, dst.address.data(), 4);
+    ip->check = calculate_checksum(ip, sizeof(iphdr));
+    
+    std::uint8_t* dccp = packet.data() + ip_len;
+    std::uint16_t sport = htons(src.port);
+    std::uint16_t dport = htons(dst.port);
+    std::memcpy(dccp, &sport, 2); std::memcpy(dccp + 2, &dport, 2);
+    dccp[4] = static_cast<std::uint8_t>(dccp_len / 4);
+    dccp[5] = cscov & 0x0F; 
+    dccp[8] = (type << 1) | 0x01; 
+    dccp[9] = 0; dccp[10] = 0; dccp[11] = 0; dccp[12] = 0; dccp[13] = 0; dccp[14] = 0; dccp[15] = 1;
+    if (type == 0) {
+        std::uint32_t sc = htonl(service_code); std::memcpy(dccp + 16, &sc, 4);
+    } else if (type == 7) {
+        dccp[24] = 0; dccp[25] = 0; dccp[26] = 0; dccp[27] = 0; 
+    }
+    
+    struct __attribute__((packed)) pseudo_hdr {
+        std::uint32_t saddr; std::uint32_t daddr; std::uint8_t zero; std::uint8_t protocol; std::uint16_t dccp_length;
+    } ph;
+    std::memcpy(&ph.saddr, src.address.data(), 4); std::memcpy(&ph.daddr, dst.address.data(), 4);
+    ph.zero = 0; ph.protocol = IPPROTO_DCCP; ph.dccp_length = htons(static_cast<std::uint16_t>(dccp_len));
+    
+    std::uint32_t sum = 0;
+    auto add_buf = [&](const void* buf, std::size_t len) {
+        const std::uint8_t* ptr = static_cast<const std::uint8_t*>(buf);
+        while (len >= 2) { sum += (ptr[0] << 8) | ptr[1]; ptr += 2; len -= 2; }
+        if (len == 1) sum += (ptr[0] << 8);
+    };
+    add_buf(&ph, sizeof(ph));
+    std::size_t cov_len = dccp_len;
+    if (cscov > 0) {
+        std::size_t req_cov = (dccp[4] * 4) + (cscov - 1) * 4;
+        if (req_cov < dccp_len) cov_len = req_cov;
+    }
+    add_buf(dccp, cov_len);
+    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+    std::uint16_t checksum = htons(static_cast<std::uint16_t>(~sum));
+    std::memcpy(dccp + 6, &checksum, 2);
+    
+    sockaddr_in dest{}; dest.sin_family = AF_INET;
+    std::memcpy(&dest.sin_addr, dst.address.data(), 4);
+    ssize_t sent = sendto(raw_fd, packet.data(), packet.size(), 0, reinterpret_cast<sockaddr*>(&dest), sizeof(dest));
+    close(raw_fd);
+    return sent == static_cast<ssize_t>(packet.size());
+}
+
 void append_stun_address(std::vector<uint8_t>& out, uint16_t attr_type, const IpEndpoint& ep, const uint8_t* tx_id, bool xor_mapped) {
     out.push_back(attr_type >> 8); 
     out.push_back(attr_type & 0xFF);
@@ -893,6 +995,59 @@ void handle_icmp_packet(int raw_fd, IcmpRawContext& icmp_ctx) {
     }
 
     send_icmp_echo(raw_fd, peer_endpoint, ICMP_ECHOREPLY, ntohs(icmp->un.echo.id), ntohs(icmp->un.echo.sequence), std::string(payload));
+}
+
+void handle_dccp_packet(int raw_fd, DccpContext& ctx) {
+    std::array<std::uint8_t, 4096> buffer{};
+    sockaddr_storage peer{}; socklen_t peer_length = sizeof(peer);
+    const ssize_t received = recvfrom(raw_fd, buffer.data(), buffer.size(), 0, reinterpret_cast<sockaddr*>(&peer), &peer_length);
+    if (received < static_cast<ssize_t>(sizeof(iphdr) + 12)) return;
+    IpEndpoint peer_endpoint = from_sockaddr(reinterpret_cast<sockaddr*>(&peer), peer_length);
+    const auto* ip_header = reinterpret_cast<const iphdr*>(buffer.data());
+    if (ip_header->version != 4 || ip_header->protocol != IPPROTO_DCCP) return;
+    
+    const std::size_t ip_header_length = static_cast<std::size_t>(ip_header->ihl) * 4;
+    if (received < static_cast<ssize_t>(ip_header_length + 12)) return;
+    const std::uint8_t* dccp = buffer.data() + ip_header_length;
+    std::size_t dccp_len = received - ip_header_length;
+    
+    std::uint16_t sport = (dccp[0] << 8) | dccp[1]; peer_endpoint.port = sport;
+    std::uint8_t data_offset = dccp[4];
+    if (dccp_len < static_cast<std::size_t>(data_offset) * 4) return;
+    
+    std::uint8_t cscov = dccp[5] & 0x0F;
+    std::uint8_t type = (dccp[8] >> 1) & 0x0F;
+    bool x = (dccp[8] & 0x01) != 0;
+    
+    struct __attribute__((packed)) pseudo_hdr {
+        std::uint32_t saddr; std::uint32_t daddr; std::uint8_t zero; std::uint8_t protocol; std::uint16_t dccp_length;
+    } ph;
+    std::memcpy(&ph.saddr, &ip_header->saddr, 4); std::memcpy(&ph.daddr, &ip_header->daddr, 4);
+    ph.zero = 0; ph.protocol = IPPROTO_DCCP; ph.dccp_length = htons(static_cast<std::uint16_t>(dccp_len));
+    
+    std::uint32_t sum = 0;
+    auto add_buf = [&](const void* buf, std::size_t len) {
+        const std::uint8_t* ptr = static_cast<const std::uint8_t*>(buf);
+        while (len >= 2) { sum += (ptr[0] << 8) | ptr[1]; ptr += 2; len -= 2; }
+        if (len == 1) sum += (ptr[0] << 8);
+    };
+    add_buf(&ph, sizeof(ph));
+    std::size_t cov_len = dccp_len;
+    if (cscov > 0) {
+        std::size_t req_cov = (data_offset * 4) + (cscov - 1) * 4;
+        if (req_cov < dccp_len) cov_len = req_cov;
+    }
+    add_buf(dccp, cov_len);
+    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+    bool valid_csum = (static_cast<std::uint16_t>(~sum) == 0);
+    
+    std::lock_guard<std::mutex> lock(ctx.mutex);
+    std::string ep_key = endpoint_host(peer_endpoint) + ":" + std::to_string(sport);
+    ctx.packets_by_ep[ep_key] = {peer_endpoint, type, cscov, valid_csum};
+    if (type == 0 && x && dccp_len >= 20) {
+        std::uint32_t sc; std::memcpy(&sc, dccp + 16, 4); sc = ntohl(sc);
+        ctx.requests_by_sc[sc] = {peer_endpoint, type, cscov, valid_csum};
+    }
 }
 
 void handle_stream_client(int client_fd, int rx_idx, std::shared_ptr<StunContext> ctx_ptr, bool is_tls, const std::string& prefix_name, int timeout_ms, int syn_delay_ms) {
@@ -1078,6 +1233,54 @@ void handle_stream_client(int client_fd, int rx_idx, std::shared_ptr<StunContext
                         bool sent = send_icmp_echo(raw_fd, target, ICMP_ECHO, record->mapped_query, probe_query, payload);
                         std::string res = std::string("F=") + (sent ? "1" : "0");
                         log_stream("IF (ICMP Fragment/Echo)", "Token=" + token + " Role=" + role + " -> " + res); stream_send(active_ssl, client_fd, res + "\n");
+                    }
+                    else if (command.rfind("DCCP_GET_REQ ", 0) == 0) {
+                        try {
+                            std::uint32_t sc = static_cast<std::uint32_t>(std::stoul(command.substr(13)));
+                            bool found = false; DccpRecord rec;
+                            {
+                                std::lock_guard<std::mutex> lock(ctx_ptr->dccp_ctx.mutex);
+                                auto it = ctx_ptr->dccp_ctx.requests_by_sc.find(sc);
+                                if (it != ctx_ptr->dccp_ctx.requests_by_sc.end()) { found = true; rec = it->second; }
+                            }
+                            if (found) {
+                                std::string res = "DCCP_REQ " + endpoint_host(rec.peer_endpoint) + " " + std::to_string(rec.peer_endpoint.port) + " " + std::to_string(rec.cscov) + " " + (rec.valid_csum ? "1" : "0");
+                                log_stream("DCCP_GET_REQ", std::to_string(sc) + " -> Found"); stream_send(active_ssl, client_fd, res + "\n");
+                            } else { stream_send(active_ssl, client_fd, "DCCP_REQ NONE\n"); }
+                        } catch (...) { stream_send(active_ssl, client_fd, "ERR\n"); }
+                    }
+                    else if (command.rfind("DCCP_GET_EP ", 0) == 0) {
+                        std::string ep_key = command.substr(12);
+                        bool found = false; DccpRecord rec;
+                        {
+                            std::lock_guard<std::mutex> lock(ctx_ptr->dccp_ctx.mutex);
+                            auto it = ctx_ptr->dccp_ctx.packets_by_ep.find(ep_key);
+                            if (it != ctx_ptr->dccp_ctx.packets_by_ep.end()) { found = true; rec = it->second; }
+                        }
+                        if (found) {
+                            std::string res = "DCCP_EP " + std::to_string(rec.type) + " " + std::to_string(rec.cscov) + " " + (rec.valid_csum ? "1" : "0");
+                            log_stream("DCCP_GET_EP", ep_key + " -> Found"); stream_send(active_ssl, client_fd, res + "\n");
+                        } else { stream_send(active_ssl, client_fd, "DCCP_EP NONE\n"); }
+                    }
+                    else if (command.rfind("DCCP_SEND ", 0) == 0) {
+                        std::istringstream stream(command); std::string cmd, role, target_literal;
+                        int type = 0, cscov = 0; std::uint32_t sc = 0;
+                        if (stream >> cmd >> role >> target_literal >> type >> sc >> cscov) {
+                            int n_idx = 0;
+                            if (role == "P2") n_idx = 1; else if (role == "S") n_idx = 2; else if (role == "S2") n_idx = 3;
+                            try {
+                                auto [thost, tport] = split_host_port(target_literal, 0);
+                                IpEndpoint tgt = resolve_endpoint(thost, tport);
+                                bool sent = send_raw_dccp(ctx.nodes[n_idx].bind_ep, tgt, static_cast<std::uint8_t>(type), sc, static_cast<std::uint8_t>(cscov), ctx.nodes[n_idx].iface_name);
+                                log_stream("DCCP_SEND", role + " to " + target_literal + " -> " + (sent ? "OK" : "FAIL"));
+                                stream_send(active_ssl, client_fd, std::string("DCCP_SENT ") + (sent ? "1" : "0") + "\n");
+                            } catch (...) { stream_send(active_ssl, client_fd, "DCCP_SENT 0\n"); }
+                        } else { stream_send(active_ssl, client_fd, "ERR\n"); }
+                    }
+                    else if (command == "DCCP_I") {
+                        bool icmp_sent = send_ipv4_icmp_error(peer_endpoint, rx_node.pub_ep, IPPROTO_DCCP, rx_node.iface_name);
+                        std::string res = std::string("DCCP_I=") + (icmp_sent ? "1" : "0");
+                        log_stream("DCCP_I (ICMP DCCP Inject)", res); stream_send(active_ssl, client_fd, res + "\n");
                     } else {
                         log_stream("UNKNOWN_CMD", command); stream_send(active_ssl, client_fd, "ERR\n");
                     }
@@ -1395,6 +1598,8 @@ void run_server_engine(std::shared_ptr<StunContext> ctx_ptr, int probe_timeout_m
     if (stun_ctx.nodes[0].bind_ep.family == AF_INET) {
         stun_ctx.icmp_ctx.primary_socket = create_icmp_raw_listener(stun_ctx.nodes[0].bind_ep, stun_ctx.nodes[0].iface_name);
         stun_ctx.icmp_ctx.secondary_socket = create_icmp_raw_listener(stun_ctx.nodes[2].bind_ep, stun_ctx.nodes[2].iface_name);
+        stun_ctx.dccp_ctx.primary_socket = create_dccp_raw_listener(stun_ctx.nodes[0].bind_ep, stun_ctx.nodes[0].iface_name);
+        stun_ctx.dccp_ctx.secondary_socket = create_dccp_raw_listener(stun_ctx.nodes[2].bind_ep, stun_ctx.nodes[2].iface_name);
     }
 
     LOG_INFO(">>> [" << prefix_name << "] Server fully ready! Logs will appear below...\n");
@@ -1407,6 +1612,8 @@ void run_server_engine(std::shared_ptr<StunContext> ctx_ptr, int probe_timeout_m
     for (int i = 0; i < 4; i++) descriptors.push_back({dtls_fds[i], POLLIN, 0});
     if (stun_ctx.icmp_ctx.primary_socket >= 0) descriptors.push_back({stun_ctx.icmp_ctx.primary_socket, POLLIN, 0});
     if (stun_ctx.icmp_ctx.secondary_socket >= 0) descriptors.push_back({stun_ctx.icmp_ctx.secondary_socket, POLLIN, 0});
+    if (stun_ctx.dccp_ctx.primary_socket >= 0) descriptors.push_back({stun_ctx.dccp_ctx.primary_socket, POLLIN, 0});
+    if (stun_ctx.dccp_ctx.secondary_socket >= 0) descriptors.push_back({stun_ctx.dccp_ctx.secondary_socket, POLLIN, 0});
 
     while (true) {
         for (auto& d : descriptors) d.revents = 0;
@@ -1449,6 +1656,14 @@ void run_server_engine(std::shared_ptr<StunContext> ctx_ptr, int probe_timeout_m
         }
         if (stun_ctx.icmp_ctx.secondary_socket >= 0) {
             if (descriptors[idx].revents & POLLIN) handle_icmp_packet(stun_ctx.icmp_ctx.secondary_socket, stun_ctx.icmp_ctx);
+            idx++;
+        }
+        if (stun_ctx.dccp_ctx.primary_socket >= 0) {
+            if (descriptors[idx].revents & POLLIN) handle_dccp_packet(stun_ctx.dccp_ctx.primary_socket, stun_ctx.dccp_ctx);
+            idx++;
+        }
+        if (stun_ctx.dccp_ctx.secondary_socket >= 0) {
+            if (descriptors[idx].revents & POLLIN) handle_dccp_packet(stun_ctx.dccp_ctx.secondary_socket, stun_ctx.dccp_ctx);
             idx++;
         }
     }
