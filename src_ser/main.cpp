@@ -13,6 +13,16 @@
 #include <netinet/ip6.h>
 #include <ifaddrs.h>
 
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
+#include <openssl/rsa.h>
+#include <openssl/pem.h>
+#include <openssl/rand.h>
+#include <openssl/bio.h>
+#include <openssl/evp.h>
+
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -73,6 +83,7 @@ struct IcmpRawContext {
 
 struct StunContext {
     StunNode nodes[4];
+    StunNode tls_nodes[4];
     IcmpRawContext icmp_ctx;
 };
 
@@ -81,6 +92,11 @@ enum class IcmpErrorVariant : std::uint8_t {
     BadInnerIpChecksum = 2,
     BadUdpChecksum = 3,
 };
+
+SSL_CTX* tls_ctx = nullptr;
+SSL_CTX* dtls_ctx = nullptr;
+X509* generated_cert = nullptr;
+EVP_PKEY* generated_key = nullptr;
 
 [[noreturn]] void fail(const std::string& message) {
     throw std::runtime_error(message);
@@ -140,54 +156,26 @@ void ensure_icmp_conntrack_bypass() {
     else std::cerr << "Warning: Failed to configure ICMP notrack rules via iptables/nft.\n";
 }
 
-// ================= Fragment Conntrack Bypass =================
-// Required for RFC 4787 OutOfOrderFragmentation test.
-// IP fragments sent via raw socket (IP_HDRINCL) are classified as INVALID
-// by conntrack because non-first fragments lack L4 headers, causing them
-// to be dropped by the default "ct state invalid drop" firewall rule.
-// We bypass conntrack for all IP fragments so they reach the kernel's
-// IP fragment reassembly layer intact.
-//
-// For iptables: we prefer the "u32" match that covers ALL fragments.
-// Plain "-f" only matches non-initial fragments and is a fallback.
-// For nftables: a dedicated table is used for trivial cleanup on exit.
-
 static bool s_fragment_rules_added = false;
 
 bool ensure_iptables_fragment_notrack() {
     if (!command_exists("iptables")) return false;
     bool ok = true;
+    constexpr const char* kOutputMatch = "-m u32 --u32 \"" "6 & 0x3FFF != 0" "\" -j CT --notrack";
+    constexpr const char* kPreroutingMatch = "-m u32 --u32 \"" "6 & 0x3FFF != 0" "\" -j CT --notrack";
 
-    // CAUTION: iptables "-f" only matches non-initial fragments (offset > 0).
-    // The first fragment (MF=1, offset=0) would still go through conntrack
-    // and get dropped as INVALID.  We use the u32 match to cover
-    // *all* fragments: offset (bits 0-12) != 0 OR MF flag (bit 13) is set.
-    // If the u32 module is not available we fall back to plain -f with a
-    // warning, knowing the first fragment will still be vulnerable.
-    constexpr const char* kOutputMatch =
-        "-m u32 --u32 \"" "6 & 0x3FFF != 0" "\" -j CT --notrack";
-    constexpr const char* kPreroutingMatch =
-        "-m u32 --u32 \"" "6 & 0x3FFF != 0" "\" -j CT --notrack";
-
-    // Quick probe: can we use the u32 module?
-    bool has_u32 = run_shell_command(
-        "iptables -m u32 -h >/dev/null 2>&1");
-
+    bool has_u32 = run_shell_command("iptables -m u32 -h >/dev/null 2>&1");
     auto try_add_rule = [&](const char* chain, const char* match) -> bool {
-        std::string check = std::string("iptables -t raw -C ") + chain + " " + match + " >/dev/null 2>&1";
-        std::string insert = std::string("iptables -t raw -I ") + chain + " " + match + " >/dev/null 2>&1";
-        if (!run_shell_command(check)) {
-            if (!run_shell_command(insert)) return false;
+        if (!run_shell_command(std::string("iptables -t raw -C ") + chain + " " + match + " >/dev/null 2>&1")) {
+            if (!run_shell_command(std::string("iptables -t raw -I ") + chain + " " + match + " >/dev/null 2>&1")) return false;
         }
         return true;
     };
 
     if (has_u32) {
-        // Best-effort: match ALL fragments including the first
         if (!try_add_rule("OUTPUT", kOutputMatch)) ok = false;
         if (!try_add_rule("PREROUTING", kPreroutingMatch)) ok = false;
     } else {
-        // Fallback: plain -f (only non-initial fragments)
         if (!run_shell_command("iptables -t raw -C OUTPUT -f -j CT --notrack >/dev/null 2>&1")) {
             if (!run_shell_command("iptables -t raw -I OUTPUT -f -j CT --notrack >/dev/null 2>&1")) ok = false;
         }
@@ -201,15 +189,12 @@ bool ensure_iptables_fragment_notrack() {
 bool ensure_nftables_fragment_notrack() {
     if (!command_exists("nft")) return false;
     bool ok = true;
-    // Use a dedicated table so cleanup is a single "nft delete table" call
     if (!run_shell_command("nft list table ip nat_type_tester_frag >/dev/null 2>&1") &&
         !run_shell_command("nft add table ip nat_type_tester_frag >/dev/null 2>&1")) ok = false;
     if (!run_shell_command("nft list chain ip nat_type_tester_frag prerouting >/dev/null 2>&1") &&
         !run_shell_command("nft add chain ip nat_type_tester_frag prerouting '{ type filter hook prerouting priority raw; }' >/dev/null 2>&1")) ok = false;
     if (!run_shell_command("nft list chain ip nat_type_tester_frag output >/dev/null 2>&1") &&
         !run_shell_command("nft add chain ip nat_type_tester_frag output '{ type filter hook output priority raw; }' >/dev/null 2>&1")) ok = false;
-    
-    // ip frag-off & 0x3fff != 0 matches any IP fragment (MF=1 or offset != 0)
     if (!run_shell_command("nft list chain ip nat_type_tester_frag output 2>/dev/null | grep -Eq 'ip frag-off .* notrack'")) {
         if (!run_shell_command("nft add rule ip nat_type_tester_frag output ip frag-off '&' 0x3fff != 0 notrack >/dev/null 2>&1")) ok = false;
     }
@@ -222,24 +207,16 @@ bool ensure_nftables_fragment_notrack() {
 void cleanup_fragment_conntrack_bypass() {
     if (!s_fragment_rules_added) return;
     s_fragment_rules_added = false;
-    
     if (command_exists("iptables")) {
-        // Try both the u32-based rules (all fragments) and plain -f rules
         run_shell_command("iptables -t raw -D OUTPUT -m u32 --u32 \"6 & 0x3FFF != 0\" -j CT --notrack >/dev/null 2>&1");
         run_shell_command("iptables -t raw -D PREROUTING -m u32 --u32 \"6 & 0x3FFF != 0\" -j CT --notrack >/dev/null 2>&1");
         run_shell_command("iptables -t raw -D OUTPUT -f -j CT --notrack >/dev/null 2>&1");
         run_shell_command("iptables -t raw -D PREROUTING -f -j CT --notrack >/dev/null 2>&1");
     }
-    if (command_exists("nft")) {
-        // Delete the dedicated fragment bypass table in one shot
-        run_shell_command("nft delete table ip nat_type_tester_frag >/dev/null 2>&1");
-    }
+    if (command_exists("nft")) run_shell_command("nft delete table ip nat_type_tester_frag >/dev/null 2>&1");
 }
 
 void ensure_fragment_conntrack_bypass() {
-    // Prefer nftables: "ip frag-off & 0x3fff != 0" covers ALL fragments natively.
-    // iptables requires the u32 match module for the same effect; plain -f
-    // only matches non-initial fragments and is used as a degraded fallback.
     bool configured = ensure_nftables_fragment_notrack();
     if (!configured) configured = ensure_iptables_fragment_notrack();
     s_fragment_rules_added = configured;
@@ -248,10 +225,8 @@ void ensure_fragment_conntrack_bypass() {
         std::atexit(cleanup_fragment_conntrack_bypass);
         return;
     }
-    if (geteuid() != 0)
-        std::cerr << "Warning: Fragment notrack rules not configured (run as root). OutOfOrderTest may fail.\n";
-    else
-        std::cerr << "Warning: Failed to configure fragment notrack rules via iptables/nft.\n";
+    if (geteuid() != 0) std::cerr << "Warning: Fragment notrack rules not configured (run as root). OutOfOrderTest may fail.\n";
+    else std::cerr << "Warning: Failed to configure fragment notrack rules via iptables/nft.\n";
 }
 
 void try_disable_kernel_icmp_echo_auto_reply() {
@@ -428,32 +403,31 @@ std::string endpoint_line(const IpEndpoint& endpoint) {
     return endpoint_host(endpoint) + " " + std::to_string(endpoint.port) + "\n";
 }
 
-void send_all(int socket_fd, std::string_view payload) {
-    std::size_t offset = 0;
-    while (offset < payload.size()) {
-        ssize_t written = send(socket_fd, payload.data() + offset, payload.size() - offset, 0);
-        if (written <= 0) throw system_error("send failed");
-        offset += static_cast<std::size_t>(written);
+ssize_t stream_read(SSL* ssl, int fd, void* buf, size_t count) {
+    if (ssl) {
+        int ret = SSL_read(ssl, buf, count);
+        if (ret <= 0) return -1;
+        return ret;
+    } else {
+        return recv(fd, buf, count, 0);
     }
 }
 
-std::string recv_line(int socket_fd, int timeout_ms) {
-    std::string line;
-    std::array<char, 256> buffer{};
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-    while (line.find('\n') == std::string::npos) {
-        const auto now = std::chrono::steady_clock::now();
-        if (now >= deadline) throw std::runtime_error("recv timed out");
-        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
-        pollfd descriptor{socket_fd, POLLIN, 0};
-        const int rc = poll(&descriptor, 1, static_cast<int>(remaining.count()));
-        if (rc <= 0 || (descriptor.revents & POLLIN) == 0) throw std::runtime_error("recv timed out");
-        ssize_t received = recv(socket_fd, buffer.data(), buffer.size(), 0);
-        if (received <= 0) break;
-        line.append(buffer.data(), static_cast<std::size_t>(received));
-        if (line.size() > 4096) fail("Protocol line too long");
+bool stream_send(SSL* ssl, int fd, std::string_view payload) {
+    std::size_t offset = 0;
+    while (offset < payload.size()) {
+        ssize_t written;
+        if (ssl) {
+            int to_write = static_cast<int>(std::min<std::size_t>(payload.size() - offset, 2147483647));
+            written = SSL_write(ssl, payload.data() + offset, to_write);
+            if (written <= 0) return false;
+        } else {
+            written = send(fd, payload.data() + offset, payload.size() - offset, 0);
+            if (written <= 0) return false;
+        }
+        offset += static_cast<std::size_t>(written);
     }
-    return line.empty() ? "" : line.substr(0, line.find('\n'));
+    return true;
 }
 
 std::uint16_t calculate_checksum(const void* data, std::size_t len) {
@@ -466,7 +440,7 @@ std::uint16_t calculate_checksum(const void* data, std::size_t len) {
     if (len == 1) sum += static_cast<std::uint16_t>(static_cast<std::uint16_t>(bytes[0]) << 8);
     sum = (sum >> 16) + (sum & 0xFFFF);
     sum += (sum >> 16);
-    return htons(static_cast<std::uint16_t>(~sum)); // 修复：必须转为网络字节序
+    return htons(static_cast<std::uint16_t>(~sum)); 
 }
 
 std::uint16_t calculate_icmp_checksum(const void* data, std::size_t len) {
@@ -490,10 +464,8 @@ std::uint16_t calculate_udp_checksum_ipv4(const iphdr& ip_header, const udphdr& 
     add_buffer(&protocol_word, 2); add_buffer(&udp_header.len, 2);
     add_buffer(&udp_header, sizeof(udphdr)); add_buffer(payload, payload_len);
     while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
-    return htons(static_cast<std::uint16_t>(~sum)); // 修复：必须转为网络字节序
+    return htons(static_cast<std::uint16_t>(~sum));
 }
-
-// ================= Custom TCP Helper Functions =================
 
 bool try_connect_from_source(const IpEndpoint& source_bind, const std::string& iface, const IpEndpoint& target, int timeout_ms) {
     int socket_fd = socket(target.family, SOCK_STREAM, IPPROTO_TCP);
@@ -594,8 +566,6 @@ std::optional<std::uint16_t> observe_udp_ipv4_id(const IpEndpoint& peer, const I
     return std::nullopt;
 }
 
-// ================= Custom ICMP / RAW Helper Functions =================
-
 bool send_icmp_echo(int raw_fd, const IpEndpoint& target, std::uint8_t type, std::uint16_t identifier, std::uint16_t sequence, std::string_view payload) {
     std::vector<std::uint8_t> packet(sizeof(icmphdr) + payload.size(), 0);
     auto* icmp = reinterpret_cast<icmphdr*>(packet.data());
@@ -608,7 +578,6 @@ bool send_icmp_echo(int raw_fd, const IpEndpoint& target, std::uint8_t type, std
     return sent == static_cast<ssize_t>(packet.size());
 }
 
-// 修复 #2: 内层 IP 负荷必须使用 NAT public 端地址，以免连接跟踪失败
 bool send_ipv4_icmp_error(const IpEndpoint& peer, const IpEndpoint& local_pub, int protocol, const std::string& iface) {
     if (peer.family == AF_INET) {
         int raw_fd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
@@ -623,11 +592,11 @@ bool send_ipv4_icmp_error(const IpEndpoint& peer, const IpEndpoint& local_pub, i
         inner_ip->ihl = 5; inner_ip->version = 4; inner_ip->tot_len = htons(sizeof(iphdr) + 8);
         inner_ip->id = htons(0x1234); inner_ip->ttl = 64; inner_ip->protocol = protocol; 
         std::memcpy(&inner_ip->saddr, peer.address.data(), 4);
-        std::memcpy(&inner_ip->daddr, local_pub.address.data(), 4); // <--- 使用 pub_ep
+        std::memcpy(&inner_ip->daddr, local_pub.address.data(), 4); 
         inner_ip->check = calculate_checksum(inner_ip, sizeof(iphdr));
 
         std::uint8_t* inner_l4 = packet.data() + sizeof(icmphdr) + sizeof(iphdr);
-        std::uint16_t sport = htons(peer.port), dport = htons(local_pub.port); // <--- 使用 pub_ep 端口
+        std::uint16_t sport = htons(peer.port), dport = htons(local_pub.port); 
         std::memcpy(inner_l4, &sport, 2); std::memcpy(inner_l4 + 2, &dport, 2);
         icmp->checksum = calculate_checksum(packet.data(), packet.size());
 
@@ -640,7 +609,6 @@ bool send_ipv4_icmp_error(const IpEndpoint& peer, const IpEndpoint& local_pub, i
     return false;
 }
 
-// 修复：IP_HDRINCL 下，外层源IP强制使用网卡实际绑定的私网IP (outer_source_bind) 应对云主机防欺骗
 bool send_ipv4_icmp_error_variant(const IpEndpoint& peer, const IpEndpoint& outer_source_bind,
                                   const IpEndpoint& inner_source, const IpEndpoint& inner_destination_pub,
                                   std::uint16_t inner_source_port, std::uint16_t inner_destination_port,
@@ -655,7 +623,7 @@ bool send_ipv4_icmp_error_variant(const IpEndpoint& peer, const IpEndpoint& oute
     auto* outer_ip = reinterpret_cast<iphdr*>(packet.data());
     outer_ip->ihl = 5; outer_ip->version = 4; outer_ip->tot_len = htons(packet.size());
     outer_ip->ttl = 64; outer_ip->protocol = IPPROTO_ICMP;
-    std::memcpy(&outer_ip->saddr, outer_source_bind.address.data(), 4); // <--- 这里改用 bind_ep (私网)
+    std::memcpy(&outer_ip->saddr, outer_source_bind.address.data(), 4); 
     std::memcpy(&outer_ip->daddr, peer.address.data(), 4);
     outer_ip->check = calculate_checksum(outer_ip, sizeof(iphdr));
 
@@ -666,7 +634,7 @@ bool send_ipv4_icmp_error_variant(const IpEndpoint& peer, const IpEndpoint& oute
     inner_ip->ihl = 5; inner_ip->version = 4; inner_ip->tot_len = htons(sizeof(iphdr) + sizeof(udphdr));
     inner_ip->id = htons(marker); inner_ip->ttl = 64; inner_ip->protocol = IPPROTO_UDP;
     std::memcpy(&inner_ip->saddr, inner_source.address.data(), 4);
-    std::memcpy(&inner_ip->daddr, inner_destination_pub.address.data(), 4); // 内层保留使用公网目标
+    std::memcpy(&inner_ip->daddr, inner_destination_pub.address.data(), 4); 
     inner_ip->check = calculate_checksum(inner_ip, sizeof(iphdr));
 
     auto* inner_udp = reinterpret_cast<udphdr*>(packet.data() + sizeof(iphdr) + sizeof(icmphdr) + sizeof(iphdr));
@@ -688,7 +656,6 @@ bool send_ipv4_icmp_error_variant(const IpEndpoint& peer, const IpEndpoint& oute
     return sent == static_cast<ssize_t>(packet.size());
 }
 
-// 修复：IP_HDRINCL 下发乱序分片，外层IP强制使用本地绑定的私网IP通过云VPC网关，NAT将接管后续转换
 bool send_out_of_order_fragmented_udp(const IpEndpoint& peer, const IpEndpoint& local_bind, const std::string& iface) {
     if (peer.family != AF_INET || local_bind.family != AF_INET) return false;
     int raw_fd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
@@ -701,7 +668,7 @@ bool send_out_of_order_fragmented_udp(const IpEndpoint& peer, const IpEndpoint& 
     
     iphdr ip_base{};
     ip_base.ihl = 5; ip_base.version = 4; ip_base.id = htons(0x4A87); ip_base.ttl = 64; ip_base.protocol = IPPROTO_UDP;
-    std::memcpy(&ip_base.saddr, local_bind.address.data(), 4); // <--- 改回使用网卡的私有 IP
+    std::memcpy(&ip_base.saddr, local_bind.address.data(), 4); 
     std::memcpy(&ip_base.daddr, peer.address.data(), 4);
 
     udphdr udp{};
@@ -733,8 +700,6 @@ bool send_out_of_order_fragmented_udp(const IpEndpoint& peer, const IpEndpoint& 
     close(raw_fd);
     return first_sent == static_cast<ssize_t>(first_fragment.size()) && second_sent == static_cast<ssize_t>(second_fragment.size());
 }
-
-// ================= STUN 协议支持 =================
 
 void append_stun_address(std::vector<uint8_t>& out, uint16_t attr_type, const IpEndpoint& ep, const uint8_t* tx_id, bool xor_mapped) {
     out.push_back(attr_type >> 8); 
@@ -785,8 +750,6 @@ std::vector<uint8_t> generate_stun_binding_response(const uint8_t* tx_id, const 
     stun_resp[3] = total_attr_len & 0xFF;
     return stun_resp;
 }
-
-// ================= Handler Functions =================
 
 std::optional<std::string> parse_rfc5508_mapping_token(std::string_view payload) {
     constexpr std::string_view prefix = "RFC5508-M:";
@@ -843,8 +806,12 @@ void handle_icmp_packet(int raw_fd, IcmpRawContext& icmp_ctx) {
     send_icmp_echo(raw_fd, peer_endpoint, ICMP_ECHOREPLY, ntohs(icmp->un.echo.id), ntohs(icmp->un.echo.sequence), std::string(payload));
 }
 
-void handle_tcp_client(int client_fd, const StunNode& primary, const StunNode& secondary, IcmpRawContext& icmp_ctx, int timeout_ms, int syn_delay_ms) {
+void handle_stream_client(int client_fd, int rx_idx, const StunContext& ctx, bool is_tls, IcmpRawContext& icmp_ctx, int timeout_ms, int syn_delay_ms) {
     try {
+        const StunNode* current_nodes = is_tls ? ctx.tls_nodes : ctx.nodes;
+        const StunNode& rx_node = current_nodes[rx_idx];
+        const StunNode& other_node = current_nodes[rx_idx ^ 3];
+
         sockaddr_storage peer{}; socklen_t peer_length = sizeof(peer);
         if (getpeername(client_fd, reinterpret_cast<sockaddr*>(&peer), &peer_length) != 0) return;
         IpEndpoint peer_endpoint = from_sockaddr(reinterpret_cast<sockaddr*>(&peer), peer_length);
@@ -853,36 +820,44 @@ void handle_tcp_client(int client_fd, const StunNode& primary, const StunNode& s
         getsockname(client_fd, reinterpret_cast<sockaddr*>(&local), &local_length);
         IpEndpoint local_endpoint = from_sockaddr(reinterpret_cast<sockaddr*>(&local), local_length);
 
-        std::string current_iface = primary.iface_name;
-        IpEndpoint current_pub_ep = primary.pub_ep;
-        if (local_endpoint.port == secondary.bind_ep.port && std::memcmp(local_endpoint.address.data(), secondary.bind_ep.address.data(), local_endpoint.address_length) == 0) {
-            current_iface = secondary.iface_name;
-            current_pub_ep = secondary.pub_ep;
-        }
-
-        auto log_tcp = [&](const std::string& cmd, const std::string& extra = "") {
+        auto log_stream = [&](const std::string& cmd, const std::string& extra = "") {
             std::ostringstream oss;
-            oss << "[TCP-CUST] Req from " << endpoint_host(peer_endpoint) << ":" << peer_endpoint.port << " | Cmd: " << cmd;
+            oss << "[" << (is_tls ? "TLS-CUST" : "TCP-CUST") << "] Req from " << endpoint_host(peer_endpoint) << ":" << peer_endpoint.port << " | Cmd: " << cmd;
             if (!extra.empty()) oss << " | " << extra;
             oss << "\n";
             std::cout << oss.str();
         };
 
-        log_tcp("NEW_CONNECTION", "Interface: " + (current_iface.empty() ? "default" : current_iface));
+        log_stream("NEW_CONNECTION", "Interface: " + (rx_node.iface_name.empty() ? "default" : rx_node.iface_name));
+
+        struct timeval tv;
+        tv.tv_sec = 30;
+        tv.tv_usec = 0;
+        setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+        std::unique_ptr<SSL, decltype(&SSL_free)> ssl_ptr(nullptr, SSL_free);
+        if (is_tls) {
+            SSL* ssl = SSL_new(tls_ctx);
+            SSL_set_fd(ssl, client_fd);
+            if (SSL_accept(ssl) <= 0) {
+                log_stream("HANDSHAKE_FAILED");
+                return;
+            }
+            ssl_ptr.reset(ssl);
+        }
+        SSL* active_ssl = ssl_ptr.get();
 
         std::vector<uint8_t> tcp_buffer;
         while (true) {
             std::array<uint8_t, 2048> buf{};
-            pollfd descriptor{client_fd, POLLIN, 0};
-            if (poll(&descriptor, 1, 30000) <= 0) { log_tcp("DISCONNECT", "Timeout"); return; }
-            
-            ssize_t received = recv(client_fd, buf.data(), buf.size(), 0);
-            if (received <= 0) { log_tcp("DISCONNECT", "Closed"); return; }
+            ssize_t received = stream_read(active_ssl, client_fd, buf.data(), buf.size());
+            if (received <= 0) { log_stream("DISCONNECT", "Closed/Timeout"); return; }
             
             tcp_buffer.insert(tcp_buffer.end(), buf.begin(), buf.begin() + received);
 
             while (!tcp_buffer.empty()) {
-                if (tcp_buffer[0] == 0x00 || tcp_buffer[0] == 0x01) { // STUN Multplexing
+                if (tcp_buffer[0] == 0x00 || tcp_buffer[0] == 0x01) { 
                     if (tcp_buffer.size() < 20) break;
                     uint16_t msg_length = static_cast<uint16_t>((tcp_buffer[2] << 8) | tcp_buffer[3]);
                     if (tcp_buffer.size() < 20U + msg_length) break;
@@ -891,9 +866,10 @@ void handle_tcp_client(int client_fd, const StunNode& primary, const StunNode& s
                     if (msg_type == 0x0001) { 
                         const uint8_t* tx_id = tcp_buffer.data() + 4;
                         bool is_rfc5389 = (tx_id[0] == 0x21 && tx_id[1] == 0x12 && tx_id[2] == 0xA4 && tx_id[3] == 0x42);
-                        auto stun_resp = generate_stun_binding_response(tx_id, peer_endpoint, primary.pub_ep, secondary.pub_ep, is_rfc5389);
-                        send_all(client_fd, std::string_view(reinterpret_cast<const char*>(stun_resp.data()), stun_resp.size()));
-                        log_tcp("STUN Binding Req (TCP)", "Sent mapped address");
+                        
+                        auto stun_resp = generate_stun_binding_response(tx_id, peer_endpoint, rx_node.pub_ep, other_node.pub_ep, is_rfc5389);
+                        stream_send(active_ssl, client_fd, std::string_view(reinterpret_cast<const char*>(stun_resp.data()), stun_resp.size()));
+                        log_stream("STUN Binding Req", "Sent mapped address");
                     }
                     tcp_buffer.erase(tcp_buffer.begin(), tcp_buffer.begin() + 20 + msg_length);
                 } else {
@@ -906,8 +882,12 @@ void handle_tcp_client(int client_fd, const StunNode& primary, const StunNode& s
                     tcp_buffer.erase(tcp_buffer.begin(), newline_pos + 1);
                     if (!command.empty() && command.back() == '\r') command.pop_back();
 
+                    // Commands testing out-of-band features ALWAYS rely on plain UDP context (Node 0 & 2) 
+                    const StunNode& primary = ctx.nodes[0];
+                    const StunNode& secondary = ctx.nodes[2];
+
                     if (command == "M") {
-                        log_tcp("M (Mapping Test)"); send_all(client_fd, endpoint_line(peer_endpoint));
+                        log_stream("M (Mapping Test)"); stream_send(active_ssl, client_fd, endpoint_line(peer_endpoint));
                     }
                     else if (command == "F") {
                         IpEndpoint p_src = primary.bind_ep; p_src.port = 0;
@@ -915,7 +895,7 @@ void handle_tcp_client(int client_fd, const StunNode& primary, const StunNode& s
                         bool p_ok = try_connect_from_source(p_src, primary.iface_name, peer_endpoint, timeout_ms);
                         bool s_ok = try_connect_from_source(s_src, secondary.iface_name, peer_endpoint, timeout_ms);
                         std::string res = std::string("P=") + (p_ok ? "1" : "0") + " S=" + (s_ok ? "1" : "0");
-                        log_tcp("F (Filter Probe)", res); send_all(client_fd, res + "\n");
+                        log_stream("F (Filter Probe)", res); stream_send(active_ssl, client_fd, res + "\n");
                     }
                     else if (command == "S") {
                         IpEndpoint imm_src = secondary.bind_ep; imm_src.port = 0;
@@ -924,13 +904,13 @@ void handle_tcp_client(int client_fd, const StunNode& primary, const StunNode& s
                         std::this_thread::sleep_for(std::chrono::milliseconds(syn_delay_ms));
                         bool del_ok = try_connect_from_source(del_src, primary.iface_name, peer_endpoint, timeout_ms);
                         std::string res = std::string("I=") + (imm_ok ? "1" : "0") + " D=" + (del_ok ? "1" : "0");
-                        log_tcp("S (SYN Delay Test)", res); send_all(client_fd, res + "\n");
+                        log_stream("S (SYN Delay Test)", res); stream_send(active_ssl, client_fd, res + "\n");
                     }
                     else if (command == "U") {
                         IpEndpoint udp_src = primary.bind_ep; udp_src.port = 0;
                         bool sent = try_send_udp_from_source(udp_src, primary.iface_name, peer_endpoint, kRfc7857UdpProbePayload);
                         std::string res = std::string("R=") + (sent ? "1" : "0");
-                        log_tcp("U (UDP Probe)", res); send_all(client_fd, res + "\n");
+                        log_stream("U (UDP Probe)", res); stream_send(active_ssl, client_fd, res + "\n");
                     }
                     else if (command.rfind("C ", 0) == 0) {
                         const std::string ep_str = command.substr(2);
@@ -939,49 +919,48 @@ void handle_tcp_client(int client_fd, const StunNode& primary, const StunNode& s
                         IpEndpoint src = primary.bind_ep; src.port = 0;
                         bool connected = try_connect_from_source(src, primary.iface_name, target, timeout_ms);
                         std::string res = std::string("R=") + (connected ? "1" : "0");
-                        log_tcp("C (Connect Target)", target_host + ":" + std::to_string(target_port) + " -> " + res);
-                        send_all(client_fd, res + "\n");
+                        log_stream("C (Connect Target)", target_host + ":" + std::to_string(target_port) + " -> " + res);
+                        stream_send(active_ssl, client_fd, res + "\n");
                     }
                     else if (command == "I") {
-                        bool icmp_sent = send_ipv4_icmp_error(peer_endpoint, current_pub_ep, IPPROTO_TCP, current_iface);
+                        bool icmp_sent = send_ipv4_icmp_error(peer_endpoint, rx_node.pub_ep, IPPROTO_TCP, rx_node.iface_name);
                         std::string res = std::string("I=") + (icmp_sent ? "1" : "0");
-                        log_tcp("I (ICMP TCP Inject)", res); send_all(client_fd, res + "\n");
+                        log_stream("I (ICMP TCP Inject)", res); stream_send(active_ssl, client_fd, res + "\n");
                     }
                     else if (command.rfind("V ", 0) == 0) {
                         std::string token = command.substr(2);
-                        // Here local_endpoint must be the private IP because the kernel receives it pre-NAT
-                        std::optional<std::uint16_t> obs_id = observe_udp_ipv4_id(peer_endpoint, local_endpoint, token, current_iface, timeout_ms);
+                        std::optional<std::uint16_t> obs_id = observe_udp_ipv4_id(peer_endpoint, local_endpoint, token, rx_node.iface_name, timeout_ms);
                         std::string res = obs_id.has_value() ? ("V=" + std::to_string(*obs_id)) : "V=-1";
-                        log_tcp("V (Verify ID)", "Token=" + token + " -> " + res); send_all(client_fd, res + "\n");
+                        log_stream("V (Verify ID)", "Token=" + token + " -> " + res); stream_send(active_ssl, client_fd, res + "\n");
                     }
                     else if (command.rfind("IE ", 0) == 0) {
                         std::istringstream stream(command); std::string op, target_literal;
                         std::uint16_t m_out = 0, m_in = 0, m_udp = 0;
                         if (!(stream >> op >> target_literal >> m_out >> m_in >> m_udp)) {
-                            log_tcp("IE (ICMP Error Variants)", "Invalid Params"); send_all(client_fd, "E=0\n"); continue;
+                            log_stream("IE (ICMP Error Variants)", "Invalid Params"); stream_send(active_ssl, client_fd, "E=0\n"); continue;
                         }
                         auto [target_host, target_port] = split_host_port(target_literal, 0);
                         IpEndpoint target = resolve_endpoint(target_host, target_port);
                         if (target.family != AF_INET || peer_endpoint.family != AF_INET) { 
-                            log_tcp("IE (ICMP Error Variants)", "Family mismatch"); send_all(client_fd, "E=0\n"); continue; 
+                            log_stream("IE (ICMP Error Variants)", "Family mismatch"); stream_send(active_ssl, client_fd, "E=0\n"); continue; 
                         }
                         bool s_out = send_ipv4_icmp_error_variant(target, primary.bind_ep, peer_endpoint, primary.pub_ep, target.port, primary.pub_ep.port, m_out, IcmpErrorVariant::BadOuterChecksum, primary.iface_name);
                         bool s_in  = send_ipv4_icmp_error_variant(target, primary.bind_ep, peer_endpoint, primary.pub_ep, target.port, primary.pub_ep.port, m_in,  IcmpErrorVariant::BadInnerIpChecksum, primary.iface_name);
                         bool s_udp = send_ipv4_icmp_error_variant(target, primary.bind_ep, peer_endpoint, primary.pub_ep, target.port, primary.pub_ep.port, m_udp, IcmpErrorVariant::BadUdpChecksum, primary.iface_name);
                         std::string res = std::string("E=") + ((s_out && s_in && s_udp) ? "1" : "0");
-                        log_tcp("IE (ICMP Error Variants)", res); send_all(client_fd, res + "\n");
+                        log_stream("IE (ICMP Error Variants)", res); stream_send(active_ssl, client_fd, res + "\n");
                     }
                     else if (command == "IRR") {
                         { std::lock_guard<std::mutex> lock(icmp_ctx.observed_error_markers_mutex); icmp_ctx.observed_error_markers.clear(); }
-                        log_tcp("IRR (ICMP Reset Markers)"); send_all(client_fd, "R=1\n");
+                        log_stream("IRR (ICMP Reset Markers)"); stream_send(active_ssl, client_fd, "R=1\n");
                     }
                     else if (command.rfind("IR ", 0) == 0) {
                         std::istringstream stream(command); std::string op; std::uint16_t marker = 0;
-                        if (!(stream >> op >> marker)) { log_tcp("IR (ICMP Check Marker)", "Invalid"); send_all(client_fd, "R=0\n"); continue; }
+                        if (!(stream >> op >> marker)) { log_stream("IR (ICMP Check Marker)", "Invalid"); stream_send(active_ssl, client_fd, "R=0\n"); continue; }
                         bool seen = false;
                         { std::lock_guard<std::mutex> lock(icmp_ctx.observed_error_markers_mutex); seen = icmp_ctx.observed_error_markers.contains(marker); }
                         std::string res = std::string("R=") + (seen ? "1" : "0");
-                        log_tcp("IR (ICMP Check Marker)", "Marker=" + std::to_string(marker) + " -> " + res); send_all(client_fd, res + "\n");
+                        log_stream("IR (ICMP Check Marker)", "Marker=" + std::to_string(marker) + " -> " + res); stream_send(active_ssl, client_fd, res + "\n");
                     }
                     else if (command.rfind("IM ", 0) == 0) {
                         const std::string token = command.substr(3);
@@ -991,37 +970,124 @@ void handle_tcp_client(int client_fd, const StunNode& primary, const StunNode& s
                             auto it = icmp_ctx.mappings.find(token);
                             if (it != icmp_ctx.mappings.end()) record = it->second;
                         }
-                        if (!record.has_value()) { log_tcp("IM", token + " -> Not Found"); send_all(client_fd, "ERR\n"); continue; }
-                        log_tcp("IM (ICMP Get Mapping)", token + " -> Found");
-                        send_all(client_fd, "M " + record->peer_host + " " + std::to_string(record->mapped_query) + "\n");
+                        if (!record.has_value()) { log_stream("IM", token + " -> Not Found"); stream_send(active_ssl, client_fd, "ERR\n"); continue; }
+                        log_stream("IM (ICMP Get Mapping)", token + " -> Found");
+                        stream_send(active_ssl, client_fd, "M " + record->peer_host + " " + std::to_string(record->mapped_query) + "\n");
                     }
                     else if (command.rfind("IF ", 0) == 0) {
                         std::istringstream stream(command); std::string op, role, token; std::uint16_t probe_query = 0;
-                        if (!(stream >> op >> role >> token >> probe_query) || role.size() != 1) { log_tcp("IF", "Invalid Params"); send_all(client_fd, "F=0\n"); continue; }
+                        if (!(stream >> op >> role >> token >> probe_query) || role.size() != 1) { log_stream("IF", "Invalid Params"); stream_send(active_ssl, client_fd, "F=0\n"); continue; }
                         std::optional<IcmpMappingRecord> record;
                         {
                             std::lock_guard<std::mutex> lock(icmp_ctx.mappings_mutex);
                             auto it = icmp_ctx.mappings.find(token);
                             if (it != icmp_ctx.mappings.end()) record = it->second;
                         }
-                        if (!record.has_value()) { log_tcp("IF", token + " -> No Mapping"); send_all(client_fd, "F=0\n"); continue; }
+                        if (!record.has_value()) { log_stream("IF", token + " -> No Mapping"); stream_send(active_ssl, client_fd, "F=0\n"); continue; }
 
                         int raw_fd = (role[0] == 'P') ? icmp_ctx.primary_socket : ((role[0] == 'S') ? icmp_ctx.secondary_socket : -1);
-                        if (raw_fd < 0) { log_tcp("IF", "Invalid Socket"); send_all(client_fd, "F=0\n"); continue; }
+                        if (raw_fd < 0) { log_stream("IF", "Invalid Socket"); stream_send(active_ssl, client_fd, "F=0\n"); continue; }
                         IpEndpoint target = resolve_endpoint(record->peer_host, 0); target.port = 0;
                         const std::string payload = "RFC5508-F:" + token + ":" + std::to_string(probe_query);
                         bool sent = send_icmp_echo(raw_fd, target, ICMP_ECHO, record->mapped_query, probe_query, payload);
                         std::string res = std::string("F=") + (sent ? "1" : "0");
-                        log_tcp("IF (ICMP Fragment/Echo)", "Token=" + token + " Role=" + role + " -> " + res); send_all(client_fd, res + "\n");
+                        log_stream("IF (ICMP Fragment/Echo)", "Token=" + token + " Role=" + role + " -> " + res); stream_send(active_ssl, client_fd, res + "\n");
                     } else {
-                        log_tcp("UNKNOWN_CMD", command); send_all(client_fd, "ERR\n");
+                        log_stream("UNKNOWN_CMD", command); stream_send(active_ssl, client_fd, "ERR\n");
                     }
                 }
             }
         }
     } catch (const std::exception& e) {
-        std::cerr << "[TCP-CUST] Error handling client: " << e.what() << "\n";
+        std::cerr << "[" << (is_tls ? "TLS-CUST" : "TCP-CUST") << "] Error handling client: " << e.what() << "\n";
     }
+}
+
+void handle_dtls_client(SSL* ssl, int dtls_fd, int rx_idx, const StunContext& ctx) {
+    const StunNode& rx_node = ctx.tls_nodes[rx_idx];
+    const StunNode& other_node = ctx.tls_nodes[rx_idx ^ 3];
+    
+    sockaddr_storage peer{}; socklen_t peer_len = sizeof(peer);
+    getpeername(dtls_fd, reinterpret_cast<sockaddr*>(&peer), &peer_len);
+    IpEndpoint peer_endpoint = from_sockaddr(reinterpret_cast<sockaddr*>(&peer), peer_len);
+
+    auto log_dtls = [&](const std::string& msg) {
+        std::cout << "[DTLS] Req from " << endpoint_host(peer_endpoint) << ":" << peer_endpoint.port << " | " << msg << "\n";
+    };
+
+    struct timeval tv;
+    tv.tv_sec = 30;
+    tv.tv_usec = 0;
+    setsockopt(dtls_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(dtls_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    while (true) {
+        std::array<char, 4096> buffer{};
+        int received = SSL_read(ssl, buffer.data(), buffer.size());
+        if (received <= 0) { log_dtls("Closed/Timeout"); break; }
+        
+        if (received >= 20 && (buffer[0] & 0xC0) == 0) {
+            uint16_t msg_type = static_cast<uint16_t>((static_cast<uint8_t>(buffer[0]) << 8) | static_cast<uint8_t>(buffer[1]));
+            
+            if (msg_type == 0x0001) { 
+                const uint8_t* tx_id = reinterpret_cast<const uint8_t*>(buffer.data() + 4); 
+                bool is_rfc5389 = (tx_id[0] == 0x21 && tx_id[1] == 0x12 && tx_id[2] == 0xA4 && tx_id[3] == 0x42);
+                
+                auto stun_resp = generate_stun_binding_response(tx_id, peer_endpoint, rx_node.pub_ep, other_node.pub_ep, is_rfc5389);
+                SSL_write(ssl, stun_resp.data(), stun_resp.size());
+                log_dtls("STUN Binding Req -> Sent mapped address");
+            }
+        }
+    }
+}
+
+void handle_dtls_listen(int listen_fd, int rx_idx, const StunContext& ctx) {
+    BIO_ADDR *client_addr = BIO_ADDR_new();
+    if (!client_addr) return;
+
+    SSL *ssl = SSL_new(dtls_ctx);
+    BIO *bio = BIO_new_dgram(listen_fd, BIO_NOCLOSE);
+    SSL_set_bio(ssl, bio, bio);
+
+    int ret = DTLSv1_listen(ssl, client_addr);
+    if (ret <= 0) {
+        BIO_ADDR_free(client_addr);
+        SSL_free(ssl);
+        return;
+    }
+
+    const sockaddr* sa = BIO_ADDR_sockaddr(client_addr);
+    socklen_t sa_len = BIO_ADDR_sockaddr_size(client_addr);
+    IpEndpoint peer_endpoint = from_sockaddr(sa, sa_len);
+    BIO_ADDR_free(client_addr);
+
+    int new_fd = socket(peer_endpoint.family, SOCK_DGRAM, IPPROTO_UDP);
+    if (new_fd < 0) { SSL_free(ssl); return; }
+    set_reuse_options(new_fd);
+
+    const StunNode& rx_node = ctx.tls_nodes[rx_idx];
+    bind_socket_to_device(new_fd, rx_node.iface_name);
+
+    SocketAddress local_addr = to_sockaddr(rx_node.bind_ep);
+    if (bind(new_fd, reinterpret_cast<sockaddr*>(&local_addr.storage), local_addr.length) < 0) {
+        close(new_fd); SSL_free(ssl); return;
+    }
+
+    SocketAddress peer_addr = to_sockaddr(peer_endpoint);
+    if (connect(new_fd, reinterpret_cast<sockaddr*>(&peer_addr.storage), peer_addr.length) < 0) {
+        close(new_fd); SSL_free(ssl); return;
+    }
+
+    BIO *new_bio = BIO_new_dgram(new_fd, BIO_NOCLOSE);
+    SSL_set_bio(ssl, new_bio, new_bio);
+
+    std::thread([ssl, new_fd, rx_idx, &ctx]() {
+        if (SSL_accept(ssl) > 0) {
+            handle_dtls_client(ssl, new_fd, rx_idx, ctx);
+        }
+        SSL_free(ssl);
+        close(new_fd);
+    }).detach();
 }
 
 void handle_udp_packet(int rx_idx, const StunContext& ctx) {
@@ -1116,10 +1182,65 @@ void handle_udp_packet(int rx_idx, const StunContext& ctx) {
         return;
     }
 
-    // 修复 #1: 兜底机制 (Generic UDP Echo Fallback)
-    // 如果走到这里，说明这既不是合法的 STUN (或并非 Binding Req)，也不是已知的明文指令。
-    // 这恰恰是 RFC 4787 分片测试要求的 —— 客户端发送带填充数据的 UDP 包，服务端必须原封不动回显。
     sendto(udp_fd, buffer.data(), received, 0, reinterpret_cast<sockaddr*>(&peer), peer_length);
+}
+
+void generate_self_signed_cert() {
+    EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, nullptr);
+    EVP_PKEY_keygen_init(pctx);
+    EVP_PKEY_CTX_set_rsa_keygen_bits(pctx, 2048);
+    EVP_PKEY_keygen(pctx, &generated_key);
+    EVP_PKEY_CTX_free(pctx);
+
+    generated_cert = X509_new();
+    ASN1_INTEGER_set(X509_get_serialNumber(generated_cert), 1);
+    X509_gmtime_adj(X509_get_notBefore(generated_cert), 0);
+    X509_gmtime_adj(X509_get_notAfter(generated_cert), 31536000L); // 1 year
+    X509_set_pubkey(generated_cert, generated_key);
+    X509_NAME *name = X509_get_subject_name(generated_cert);
+    X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, reinterpret_cast<const unsigned char*>("NatTypeTester"), -1, -1, 0);
+    X509_set_issuer_name(generated_cert, name);
+    X509_sign(generated_cert, generated_key, EVP_sha256());
+}
+
+int dtls_verify_cookie(SSL*, const unsigned char*, unsigned int) {
+    return 1;
+}
+
+int dtls_generate_cookie(SSL*, unsigned char* cookie, unsigned int* cookie_len) {
+    *cookie_len = 16;
+    std::memset(cookie, 0, 16);
+    return 1;
+}
+
+void init_openssl(const std::string& cert_file, const std::string& key_file) {
+    SSL_library_init();
+    OpenSSL_add_all_algorithms();
+    SSL_load_error_strings();
+
+    if (cert_file.empty() || key_file.empty()) {
+        std::cout << "Generating self-signed certificate for TLS/DTLS...\n";
+        generate_self_signed_cert();
+    }
+
+    tls_ctx = SSL_CTX_new(TLS_server_method());
+    dtls_ctx = SSL_CTX_new(DTLS_server_method());
+    if (!tls_ctx || !dtls_ctx) fail("Failed to create OpenSSL contexts");
+
+    SSL_CTX_set_cookie_generate_cb(dtls_ctx, dtls_generate_cookie);
+    SSL_CTX_set_cookie_verify_cb(dtls_ctx, dtls_verify_cookie);
+
+    auto configure_ctx = [&](SSL_CTX* ctx) {
+        if (!cert_file.empty() && !key_file.empty()) {
+            if (SSL_CTX_use_certificate_file(ctx, cert_file.c_str(), SSL_FILETYPE_PEM) <= 0) fail("Failed to load cert");
+            if (SSL_CTX_use_PrivateKey_file(ctx, key_file.c_str(), SSL_FILETYPE_PEM) <= 0) fail("Failed to load key");
+        } else {
+            SSL_CTX_use_certificate(ctx, generated_cert);
+            SSL_CTX_use_PrivateKey(ctx, generated_key);
+        }
+    };
+    configure_ctx(tls_ctx);
+    configure_ctx(dtls_ctx);
 }
 
 } // namespace
@@ -1128,7 +1249,9 @@ int main(int argc, char** argv) {
     try {
         std::string bind_ip1 = "0.0.0.0", pub_ip1 = "";
         std::string bind_ip2 = "0.0.0.0", pub_ip2 = "";
+        std::string cert_file, key_file;
         uint16_t port1 = 3478, port2 = 3479;
+        uint16_t tls_port1 = 5349, tls_port2 = 5350;
         int probe_timeout_ms = 1200;
         int syn_delay_ms = 350;
 
@@ -1138,37 +1261,59 @@ int main(int argc, char** argv) {
             else if (token == "--pub-ip1") pub_ip1 = argv[++index];
             else if (token == "--bind-ip2") bind_ip2 = argv[++index];
             else if (token == "--pub-ip2") pub_ip2 = argv[++index];
-            else if (token == "--port1") port1 = std::stoi(argv[++index]);
-            else if (token == "--port2") port2 = std::stoi(argv[++index]);
+            else if (token == "--port1") port1 = static_cast<uint16_t>(std::stoi(argv[++index]));
+            else if (token == "--port2") port2 = static_cast<uint16_t>(std::stoi(argv[++index]));
+            else if (token == "--tls-port1") tls_port1 = static_cast<uint16_t>(std::stoi(argv[++index]));
+            else if (token == "--tls-port2") tls_port2 = static_cast<uint16_t>(std::stoi(argv[++index]));
+            else if (token == "--cert") cert_file = argv[++index];
+            else if (token == "--key") key_file = argv[++index];
             else if (token == "--probe-timeout-ms") probe_timeout_ms = std::stoi(argv[++index]);
             else if (token == "--syn-delay-ms") syn_delay_ms = std::stoi(argv[++index]);
         }
 
         if (pub_ip1.empty() || pub_ip2.empty()) fail("Both --pub-ip1 and --pub-ip2 are required.");
 
+        ensure_icmp_conntrack_bypass();
+        try_disable_kernel_icmp_echo_auto_reply();
+        ensure_fragment_conntrack_bypass();
+        init_openssl(cert_file, key_file);
+
         StunContext stun_ctx;
         stun_ctx.nodes[0].bind_ep = resolve_endpoint(bind_ip1, port1); stun_ctx.nodes[0].pub_ep = resolve_endpoint(pub_ip1, port1);
         stun_ctx.nodes[1].bind_ep = resolve_endpoint(bind_ip1, port2); stun_ctx.nodes[1].pub_ep = resolve_endpoint(pub_ip1, port2);
         stun_ctx.nodes[2].bind_ep = resolve_endpoint(bind_ip2, port1); stun_ctx.nodes[2].pub_ep = resolve_endpoint(pub_ip2, port1);
         stun_ctx.nodes[3].bind_ep = resolve_endpoint(bind_ip2, port2); stun_ctx.nodes[3].pub_ep = resolve_endpoint(pub_ip2, port2);
+        
+        stun_ctx.tls_nodes[0].bind_ep = resolve_endpoint(bind_ip1, tls_port1); stun_ctx.tls_nodes[0].pub_ep = resolve_endpoint(pub_ip1, tls_port1);
+        stun_ctx.tls_nodes[1].bind_ep = resolve_endpoint(bind_ip1, tls_port2); stun_ctx.tls_nodes[1].pub_ep = resolve_endpoint(pub_ip1, tls_port2);
+        stun_ctx.tls_nodes[2].bind_ep = resolve_endpoint(bind_ip2, tls_port1); stun_ctx.tls_nodes[2].pub_ep = resolve_endpoint(pub_ip2, tls_port1);
+        stun_ctx.tls_nodes[3].bind_ep = resolve_endpoint(bind_ip2, tls_port2); stun_ctx.tls_nodes[3].pub_ep = resolve_endpoint(pub_ip2, tls_port2);
 
-        ensure_icmp_conntrack_bypass();
-        try_disable_kernel_icmp_echo_auto_reply();
-        ensure_fragment_conntrack_bypass();
-
-        std::cout << "Starting Server Engine with TCP Multiplexing & Interface Binding Penetration...\n";
+        int tcp_fds[4], tls_fds[4], dtls_fds[4];
+        std::cout << "Starting Server Engine with TCP/UDP Multiplexing & Interface Binding Penetration...\n";
         for (int i = 0; i < 4; ++i) {
             stun_ctx.nodes[i].iface_name = get_interface_name(stun_ctx.nodes[i].bind_ep);
             stun_ctx.nodes[i].fd = create_udp_listener(stun_ctx.nodes[i].bind_ep, stun_ctx.nodes[i].iface_name);
+            tcp_fds[i] = create_tcp_listener(stun_ctx.nodes[i].bind_ep, stun_ctx.nodes[i].iface_name);
+            
+            int flags = fcntl(tcp_fds[i], F_GETFL, 0); fcntl(tcp_fds[i], F_SETFL, flags | O_NONBLOCK);
             
             std::cout << "  Node " << i << ": Bind=" << endpoint_host(stun_ctx.nodes[i].bind_ep) << ":" << stun_ctx.nodes[i].bind_ep.port 
-                      << "  Public=" << endpoint_host(stun_ctx.nodes[i].pub_ep) << ":" << stun_ctx.nodes[i].pub_ep.port;
-            if (!stun_ctx.nodes[i].iface_name.empty()) std::cout << "  (Device: " << stun_ctx.nodes[i].iface_name << ")\n";
-            else std::cout << "  (Device: Default Routing)\n";
+                      << "  Public=" << endpoint_host(stun_ctx.nodes[i].pub_ep) << ":" << stun_ctx.nodes[i].pub_ep.port << "\n";
         }
-
-        int primary_tcp_fd = create_tcp_listener(stun_ctx.nodes[0].bind_ep, stun_ctx.nodes[0].iface_name);
-        int secondary_tcp_fd = create_tcp_listener(stun_ctx.nodes[2].bind_ep, stun_ctx.nodes[2].iface_name);
+        
+        std::cout << "Starting TLS/DTLS Endpoints...\n";
+        for (int i = 0; i < 4; ++i) {
+            stun_ctx.tls_nodes[i].iface_name = get_interface_name(stun_ctx.tls_nodes[i].bind_ep);
+            tls_fds[i] = create_tcp_listener(stun_ctx.tls_nodes[i].bind_ep, stun_ctx.tls_nodes[i].iface_name);
+            dtls_fds[i] = create_udp_listener(stun_ctx.tls_nodes[i].bind_ep, stun_ctx.tls_nodes[i].iface_name);
+            
+            int tcp_f = fcntl(tls_fds[i], F_GETFL, 0); fcntl(tls_fds[i], F_SETFL, tcp_f | O_NONBLOCK);
+            int udp_f = fcntl(dtls_fds[i], F_GETFL, 0); fcntl(dtls_fds[i], F_SETFL, udp_f | O_NONBLOCK);
+            
+            std::cout << "  TLS Node " << i << ": Bind=" << endpoint_host(stun_ctx.tls_nodes[i].bind_ep) << ":" << stun_ctx.tls_nodes[i].bind_ep.port 
+                      << "  Public=" << endpoint_host(stun_ctx.tls_nodes[i].pub_ep) << ":" << stun_ctx.tls_nodes[i].pub_ep.port << "\n";
+        }
 
         if (stun_ctx.nodes[0].bind_ep.family == AF_INET) {
             stun_ctx.icmp_ctx.primary_socket = create_icmp_raw_listener(stun_ctx.nodes[0].bind_ep, stun_ctx.nodes[0].iface_name);
@@ -1178,50 +1323,56 @@ int main(int argc, char** argv) {
         std::cout << "\n>>> Server fully ready! Logs will appear below...\n";
         std::cout << "========================================================\n";
 
+        std::vector<pollfd> descriptors;
+        for (int i = 0; i < 4; i++) descriptors.push_back({tcp_fds[i], POLLIN, 0});
+        for (int i = 0; i < 4; i++) descriptors.push_back({stun_ctx.nodes[i].fd, POLLIN, 0});
+        for (int i = 0; i < 4; i++) descriptors.push_back({tls_fds[i], POLLIN, 0});
+        for (int i = 0; i < 4; i++) descriptors.push_back({dtls_fds[i], POLLIN, 0});
+        if (stun_ctx.icmp_ctx.primary_socket >= 0) descriptors.push_back({stun_ctx.icmp_ctx.primary_socket, POLLIN, 0});
+        if (stun_ctx.icmp_ctx.secondary_socket >= 0) descriptors.push_back({stun_ctx.icmp_ctx.secondary_socket, POLLIN, 0});
+
         while (true) {
-            std::array<pollfd, 8> descriptors{{
-                {primary_tcp_fd, POLLIN, 0},
-                {secondary_tcp_fd, POLLIN, 0},
-                {stun_ctx.nodes[0].fd, POLLIN, 0},
-                {stun_ctx.nodes[1].fd, POLLIN, 0},
-                {stun_ctx.nodes[2].fd, POLLIN, 0},
-                {stun_ctx.nodes[3].fd, POLLIN, 0},
-                {stun_ctx.icmp_ctx.primary_socket, POLLIN, 0},
-                {stun_ctx.icmp_ctx.secondary_socket, POLLIN, 0}
-            }};
-            
+            for (auto& d : descriptors) d.revents = 0;
             if (poll(descriptors.data(), descriptors.size(), -1) < 0) throw system_error("poll failed");
-
-            if (descriptors[0].revents & POLLIN) {
-                sockaddr_storage client{}; socklen_t len = sizeof(client);
-                int client_fd = accept(primary_tcp_fd, reinterpret_cast<sockaddr*>(&client), &len);
-                if (client_fd >= 0) {
-                    std::thread([client_fd, primary = stun_ctx.nodes[0], secondary = stun_ctx.nodes[2], &icmp_ctx = stun_ctx.icmp_ctx, probe_timeout_ms, syn_delay_ms]() {
-                        handle_tcp_client(client_fd, primary, secondary, const_cast<IcmpRawContext&>(icmp_ctx), probe_timeout_ms, syn_delay_ms);
-                        close(client_fd);
-                    }).detach();
+            
+            int idx = 0;
+            for (int i = 0; i < 4; i++, idx++) {
+                if (descriptors[idx].revents & POLLIN) {
+                    sockaddr_storage client{}; socklen_t len = sizeof(client);
+                    int client_fd = accept(tcp_fds[i], reinterpret_cast<sockaddr*>(&client), &len);
+                    if (client_fd >= 0) {
+                        std::thread([client_fd, i, &stun_ctx, probe_timeout_ms, syn_delay_ms]() {
+                            handle_stream_client(client_fd, i, stun_ctx, false, const_cast<IcmpRawContext&>(stun_ctx.icmp_ctx), probe_timeout_ms, syn_delay_ms);
+                            close(client_fd);
+                        }).detach();
+                    }
                 }
             }
-            if (descriptors[1].revents & POLLIN) {
-                sockaddr_storage client{}; socklen_t len = sizeof(client);
-                int client_fd = accept(secondary_tcp_fd, reinterpret_cast<sockaddr*>(&client), &len);
-                if (client_fd >= 0) {
-                    std::thread([client_fd, primary = stun_ctx.nodes[0], secondary = stun_ctx.nodes[2], &icmp_ctx = stun_ctx.icmp_ctx, probe_timeout_ms, syn_delay_ms]() {
-                        handle_tcp_client(client_fd, primary, secondary, const_cast<IcmpRawContext&>(icmp_ctx), probe_timeout_ms, syn_delay_ms);
-                        close(client_fd);
-                    }).detach();
+            for (int i = 0; i < 4; i++, idx++) {
+                if (descriptors[idx].revents & POLLIN) handle_udp_packet(i, stun_ctx);
+            }
+            for (int i = 0; i < 4; i++, idx++) {
+                if (descriptors[idx].revents & POLLIN) {
+                    sockaddr_storage client{}; socklen_t len = sizeof(client);
+                    int client_fd = accept(tls_fds[i], reinterpret_cast<sockaddr*>(&client), &len);
+                    if (client_fd >= 0) {
+                        std::thread([client_fd, i, &stun_ctx, probe_timeout_ms, syn_delay_ms]() {
+                            handle_stream_client(client_fd, i, stun_ctx, true, const_cast<IcmpRawContext&>(stun_ctx.icmp_ctx), probe_timeout_ms, syn_delay_ms);
+                            close(client_fd);
+                        }).detach();
+                    }
                 }
             }
-
-            for (int i = 0; i < 4; ++i) {
-                if (descriptors[2 + i].revents & POLLIN) handle_udp_packet(i, stun_ctx);
+            for (int i = 0; i < 4; i++, idx++) {
+                if (descriptors[idx].revents & POLLIN) handle_dtls_listen(dtls_fds[i], i, stun_ctx);
             }
-
-            if (stun_ctx.icmp_ctx.primary_socket >= 0 && (descriptors[6].revents & POLLIN)) {
-                handle_icmp_packet(stun_ctx.icmp_ctx.primary_socket, stun_ctx.icmp_ctx);
+            if (stun_ctx.icmp_ctx.primary_socket >= 0) {
+                if (descriptors[idx].revents & POLLIN) handle_icmp_packet(stun_ctx.icmp_ctx.primary_socket, stun_ctx.icmp_ctx);
+                idx++;
             }
-            if (stun_ctx.icmp_ctx.secondary_socket >= 0 && (descriptors[7].revents & POLLIN)) {
-                handle_icmp_packet(stun_ctx.icmp_ctx.secondary_socket, stun_ctx.icmp_ctx);
+            if (stun_ctx.icmp_ctx.secondary_socket >= 0) {
+                if (descriptors[idx].revents & POLLIN) handle_icmp_packet(stun_ctx.icmp_ctx.secondary_socket, stun_ctx.icmp_ctx);
+                idx++;
             }
         }
     } catch (const std::exception& e) {
