@@ -1056,9 +1056,12 @@ void handle_dtls_listen(int listen_fd, int rx_idx, const StunContext& ctx) {
         return;
     }
 
-    const sockaddr* sa = BIO_ADDR_sockaddr(client_addr);
-    socklen_t sa_len = BIO_ADDR_sockaddr_size(client_addr);
-    IpEndpoint peer_endpoint = from_sockaddr(sa, sa_len);
+    IpEndpoint peer_endpoint{};
+    peer_endpoint.family = BIO_ADDR_family(client_addr);
+    peer_endpoint.port = ntohs(BIO_ADDR_rawport(client_addr));
+    size_t addr_len = 0;
+    BIO_ADDR_rawaddress(client_addr, peer_endpoint.address.data(), &addr_len);
+    peer_endpoint.address_length = addr_len;
     BIO_ADDR_free(client_addr);
 
     int new_fd = socket(peer_endpoint.family, SOCK_DGRAM, IPPROTO_UDP);
