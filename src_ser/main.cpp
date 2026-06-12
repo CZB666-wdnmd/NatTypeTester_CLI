@@ -1278,7 +1278,22 @@ void handle_stream_client(int client_fd, int rx_idx, std::shared_ptr<StunContext
                         } else { stream_send(active_ssl, client_fd, "ERR\n"); }
                     }
                     else if (command == "DCCP_I") {
-                        bool icmp_sent = send_ipv4_icmp_error(peer_endpoint, rx_node.pub_ep, IPPROTO_DCCP, rx_node.iface_name);
+                        // Find client's DCCP test port from recorded DCCP packets,
+                        // because peer_endpoint.port is the TCP control port, not the DCCP port.
+                        std::uint16_t dccp_port = peer_endpoint.port; // fallback
+                        {
+                            std::lock_guard<std::mutex> lock(ctx.dccp_ctx.mutex);
+                            std::string client_ip = endpoint_host(peer_endpoint);
+                            for (const auto& [key, rec] : ctx.dccp_ctx.packets_by_ep) {
+                                if (key.rfind(client_ip + ":", 0) == 0) {
+                                    dccp_port = rec.peer_endpoint.port;
+                                    break;
+                                }
+                            }
+                        }
+                        IpEndpoint dccp_peer = peer_endpoint;
+                        dccp_peer.port = dccp_port;
+                        bool icmp_sent = send_ipv4_icmp_error(dccp_peer, rx_node.pub_ep, IPPROTO_DCCP, rx_node.iface_name);
                         std::string res = std::string("DCCP_I=") + (icmp_sent ? "1" : "0");
                         log_stream("DCCP_I (ICMP DCCP Inject)", res); stream_send(active_ssl, client_fd, res + "\n");
                     } else {

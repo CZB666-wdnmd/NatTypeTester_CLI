@@ -959,22 +959,30 @@ DccpIcmpResult run_dccp_icmp_test(const RequestOptions& options,
         result.icmp_forwarded = ProbeStatus::Fail;
     }
 
-    // Step 3: Verify mapping survived — ask server to send a normal DCCP-Request
+    // Step 3: Verify mapping survived — open DCCP listener BEFORE asking server to send
+    int dccp_fd = -1;
     try {
-        std::string cmd = "DCCP_SEND P " + to_string(mapped_endpoint) +
-                          " 0 " + std::to_string(sc_icmp) + " 0\n";
-        send_server_command(primary_server, cmd, timeout);
+        dccp_fd = open_dccp_listener(local_port, kDccpRecvTimeout);
     } catch (const std::exception&) {
         close(icmp_fd);
         result.mapping_survives = ProbeStatus::Inconclusive;
         return result;
     }
 
-    // Try to receive on DCCP listener
-    int dccp_fd = -1;
     try {
-        dccp_fd = open_dccp_listener(local_port, kDccpRecvTimeout);
-        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        std::string cmd = "DCCP_SEND P " + to_string(mapped_endpoint) +
+                          " 0 " + std::to_string(sc_icmp) + " 0\n";
+        send_server_command(primary_server, cmd, timeout);
+    } catch (const std::exception&) {
+        close(dccp_fd);
+        close(icmp_fd);
+        result.mapping_survives = ProbeStatus::Inconclusive;
+        return result;
+    }
+
+    // Try to receive on DCCP listener
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    {
         auto recv = recv_dccp_packet(dccp_fd, kDccpRecvTimeout);
         close(dccp_fd);
         close(icmp_fd);
@@ -984,10 +992,6 @@ DccpIcmpResult run_dccp_icmp_test(const RequestOptions& options,
         } else {
             result.mapping_survives = ProbeStatus::Fail;
         }
-    } catch (...) {
-        if (dccp_fd >= 0) close(dccp_fd);
-        close(icmp_fd);
-        result.mapping_survives = ProbeStatus::Inconclusive;
     }
 
     return result;
