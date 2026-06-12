@@ -39,6 +39,9 @@ TransportType parse_transport(const std::map<std::string, std::string>& options)
     if (value == "tls") {
         return TransportType::Tls;
     }
+    if (value == "dtls") {
+        return TransportType::Dtls;
+    }
     throw std::runtime_error("Unsupported transport: " + value);
 }
 
@@ -320,6 +323,14 @@ StunResult5389 run_rfc5780_test(const RequestOptions& options,
         while (action.has_value()) {
             action = discovery.got_response(session.request(*action));
         }
+    } else if (options.transport == TransportType::Dtls) {
+        DtlsSession session(options.server_name, local_bind, options.timeout, options.skip_certificate_validation);
+        while (action.has_value()) {
+            action = discovery.got_response(session.request(*action));
+        }
+        if (test_type == StunTestType::Combining) {
+            discovery.result.filtering_behavior = FilteringBehavior::None;
+        }
     } else {
         TcpSession session(options.server_name, local_bind, options.timeout, options.transport == TransportType::Tls,
                            options.skip_certificate_validation);
@@ -339,23 +350,29 @@ StunResult5389 run_rfc5780_test(const RequestOptions& options,
 // ====================================================================
 
 void Rfc5780Test::parseArgs(const std::map<std::string, std::string>& options) {
-    constexpr std::uint16_t default_port = 3478;
+    constexpr std::uint16_t default_udp_tcp_port = 3478;
+    constexpr std::uint16_t default_tls_dtls_port = 5349;
     json_mode_ = options.contains("--json");
+
+    options_.transport = parse_transport(options);
+    options_.skip_certificate_validation = parse_bool_option(options, "--skip-cert", false);
+
+    std::uint16_t default_port = (options_.transport == TransportType::Tls || options_.transport == TransportType::Dtls) 
+                                 ? default_tls_dtls_port : default_udp_tcp_port;
 
     auto [host, port] = split_host_port(require_option(options, "--stun_server"), default_port);
     stun_host_ = host;
-    stun_server_ = resolve_endpoint(host, port, SOCK_DGRAM);
+    
+    int socket_type = (options_.transport == TransportType::Udp || options_.transport == TransportType::Dtls) ? SOCK_DGRAM : SOCK_STREAM;
+    stun_server_ = resolve_endpoint(host, port, socket_type);
     options_.server_name = stun_host_;
-    options_.transport = parse_transport(options);
-    options_.skip_certificate_validation = parse_bool_option(options, "--skip-cert", false);
 
     if (std::optional<std::string> timeout = find_option(options, "--timeout-ms"); timeout.has_value()) {
         options_.timeout = std::chrono::milliseconds(std::stoi(*timeout));
     }
 
     test_type_ = parse_stun_test_type(options);
-    local_bind_ = parse_local_bind(options, stun_server_.family,
-                                   options_.transport == TransportType::Udp ? SOCK_DGRAM : SOCK_STREAM);
+    local_bind_ = parse_local_bind(options, stun_server_.family, socket_type);
 }
 
 int Rfc5780Test::runTest() {
@@ -401,7 +418,7 @@ int Rfc5780Test::runTest() {
 }
 
 void Rfc5780Test::printHelp() const {
-    std::cout << "  nat_type_tester_cli rfc5780 --stun_server host[:port] [--local host[:port]] [--transport udp|tcp|tls]\n"
+    std::cout << "  nat_type_tester_cli rfc5780 --stun_server host[:port] [--local host[:port]] [--transport udp|tcp|tls|dtls]\n"
               << "                               [--test-type combining|binding|mapping|filtering] [--skip-cert 0|1] [--timeout-ms 3000]\n";
 }
 

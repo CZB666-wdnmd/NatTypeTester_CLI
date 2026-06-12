@@ -59,6 +59,7 @@ enum class TransportType {
     Udp,
     Tcp,
     Tls,
+    Dtls,
 };
 
 enum class StunTestType {
@@ -172,6 +173,21 @@ private:
     std::chrono::milliseconds timeout_{};
     std::string server_name_;
     bool use_tls_{false};
+    bool skip_certificate_validation_{false};
+};
+
+class DtlsSession {
+public:
+    DtlsSession(const std::string& server_name,
+                const std::optional<IpEndpoint>& local_bind,
+                std::chrono::milliseconds timeout,
+                bool skip_certificate_validation);
+    std::optional<StunResponse> request(const StunDiscoveryAction& action);
+
+private:
+    std::optional<IpEndpoint> local_bind_;
+    std::chrono::milliseconds timeout_{};
+    std::string server_name_;
     bool skip_certificate_validation_{false};
 };
 

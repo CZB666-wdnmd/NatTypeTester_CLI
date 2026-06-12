@@ -1,5 +1,6 @@
 #include "stun_utils.h"
 
+#include <openssl/bio.h>
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
@@ -24,6 +25,16 @@ constexpr std::uint16_t kChangedAddress = 0x0005;
 constexpr std::uint16_t kXorMappedAddress = 0x0020;
 constexpr std::uint16_t kOtherAddress = 0x802C;
 constexpr std::uint32_t kMagicCookie = 0x2112A442u;
+
+std::string get_openssl_error_string() {
+    unsigned long err = ERR_get_error();
+    if (err == 0) {
+        return "Unknown OpenSSL error";
+    }
+    char buf[256];
+    ERR_error_string_n(err, buf, sizeof(buf));
+    return std::string(buf);
+}
 
 bool is_ip_literal(const std::string& value) {
     in_addr address4{};
@@ -71,16 +82,17 @@ std::optional<IpEndpoint> parse_address_attribute(const StunMessage& message, st
     return std::nullopt;
 }
 
-SSL_CTX* create_ssl_ctx(bool verify_peer) {
-    SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
+SSL_CTX* create_ssl_ctx(bool verify_peer, bool is_dtls = false) {
+    const SSL_METHOD* method = is_dtls ? DTLS_client_method() : TLS_client_method();
+    SSL_CTX* ctx = SSL_CTX_new(method);
     if (ctx == nullptr) {
-        throw std::runtime_error("SSL_CTX_new failed");
+        throw std::runtime_error("SSL_CTX_new failed: " + get_openssl_error_string());
     }
     if (verify_peer) {
         SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, nullptr);
         if (SSL_CTX_set_default_verify_paths(ctx) != 1) {
             SSL_CTX_free(ctx);
-            throw std::runtime_error("SSL_CTX_set_default_verify_paths failed");
+            throw std::runtime_error("SSL_CTX_set_default_verify_paths failed: " + get_openssl_error_string());
         }
     } else {
         SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, nullptr);
@@ -175,6 +187,7 @@ std::string to_string(TransportType value) {
     case TransportType::Udp: return "udp";
     case TransportType::Tcp: return "tcp";
     case TransportType::Tls: return "tls";
+    case TransportType::Dtls: return "dtls";
     }
     return "udp";
 }
@@ -517,10 +530,10 @@ std::optional<StunResponse> TcpSession::request(const StunDiscoveryAction& actio
                 }
             }
         } else {
-            std::unique_ptr<SSL_CTX, decltype(&SSL_CTX_free)> ctx(create_ssl_ctx(!skip_certificate_validation_), SSL_CTX_free);
+            std::unique_ptr<SSL_CTX, decltype(&SSL_CTX_free)> ctx(create_ssl_ctx(!skip_certificate_validation_, false), SSL_CTX_free);
             std::unique_ptr<SSL, decltype(&SSL_free)> ssl(SSL_new(ctx.get()), SSL_free);
             if (!ssl) {
-                throw std::runtime_error("SSL_new failed");
+                throw std::runtime_error("SSL_new failed: " + get_openssl_error_string());
             }
 
             if (!skip_certificate_validation_) {
@@ -540,14 +553,14 @@ std::optional<StunResponse> TcpSession::request(const StunDiscoveryAction& actio
 
             SSL_set_fd(ssl.get(), socket_fd);
             if (SSL_connect(ssl.get()) != 1) {
-                throw std::runtime_error("SSL_connect failed");
+                throw std::runtime_error("SSL_connect failed: " + get_openssl_error_string());
             }
 
             std::size_t offset = 0;
             while (offset < payload.size()) {
                 int written = SSL_write(ssl.get(), payload.data() + offset, static_cast<int>(payload.size() - offset));
                 if (written <= 0) {
-                    throw std::runtime_error("SSL_write failed");
+                    throw std::runtime_error("SSL_write failed: " + get_openssl_error_string());
                 }
                 offset += static_cast<std::size_t>(written);
             }
@@ -570,6 +583,128 @@ std::optional<StunResponse> TcpSession::request(const StunDiscoveryAction& actio
                         local_bind_ = local;
                     }
                     return StunResponse{response_message, action.send_to, local};
+                }
+            }
+        }
+
+        close(socket_fd);
+    } catch (...) {
+        close(socket_fd);
+        throw;
+    }
+
+    return std::nullopt;
+}
+
+DtlsSession::DtlsSession(const std::string& server_name,
+                         const std::optional<IpEndpoint>& local_bind,
+                         std::chrono::milliseconds timeout,
+                         bool skip_certificate_validation)
+    : local_bind_(local_bind),
+      timeout_(timeout),
+      server_name_(server_name),
+      skip_certificate_validation_(skip_certificate_validation) {}
+
+std::optional<StunResponse> DtlsSession::request(const StunDiscoveryAction& action) {
+    int socket_fd = socket(action.send_to.family, SOCK_DGRAM, IPPROTO_UDP);
+    if (socket_fd < 0) {
+        throw system_error("socket failed");
+    }
+
+    try {
+        set_reuse_options(socket_fd);
+        bind_socket(socket_fd, local_bind_.value_or(wildcard_endpoint(action.send_to.family)));
+        connect_with_timeout(socket_fd, action.send_to, timeout_);
+        
+        struct timeval tv;
+        tv.tv_sec = 0;
+        tv.tv_usec = 500000;
+        setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(socket_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+        std::unique_ptr<SSL_CTX, decltype(&SSL_CTX_free)> ctx(create_ssl_ctx(!skip_certificate_validation_, true), SSL_CTX_free);
+        std::unique_ptr<SSL, decltype(&SSL_free)> ssl(SSL_new(ctx.get()), SSL_free);
+        if (!ssl) {
+            throw std::runtime_error("SSL_new failed: " + get_openssl_error_string());
+        }
+
+        if (!skip_certificate_validation_) {
+            if (is_ip_literal(server_name_)) {
+                X509_VERIFY_PARAM* param = SSL_get0_param(ssl.get());
+                if (X509_VERIFY_PARAM_set1_ip_asc(param, server_name_.c_str()) != 1) {
+                    throw std::runtime_error("failed to configure TLS IP verification");
+                }
+            } else {
+                SSL_set_tlsext_host_name(ssl.get(), server_name_.c_str());
+                X509_VERIFY_PARAM* param = SSL_get0_param(ssl.get());
+                if (X509_VERIFY_PARAM_set1_host(param, server_name_.c_str(), 0) != 1) {
+                    throw std::runtime_error("failed to configure TLS hostname verification");
+                }
+            }
+        }
+
+        BIO* bio = BIO_new_dgram(socket_fd, BIO_NOCLOSE);
+        if (!bio) {
+            throw std::runtime_error("BIO_new_dgram failed");
+        }
+        
+        SocketAddress sa = to_sockaddr(action.send_to);
+        BIO_ctrl(bio, BIO_CTRL_DGRAM_SET_CONNECTED, 0, &sa.storage);
+        SSL_set_bio(ssl.get(), bio, bio);
+
+        SSL_set_options(ssl.get(), SSL_OP_NO_QUERY_MTU);
+        SSL_set_mtu(ssl.get(), 1200);
+
+        auto deadline = std::chrono::steady_clock::now() + timeout_;
+        while (true) {
+            if (std::chrono::steady_clock::now() > deadline) {
+                throw std::runtime_error("DTLS SSL_connect timeout");
+            }
+            int ret = SSL_connect(ssl.get());
+            if (ret == 1) break;
+            
+            int err = SSL_get_error(ssl.get(), ret);
+            if (err == SSL_ERROR_SYSCALL || err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+                DTLSv1_handle_timeout(ssl.get());
+                continue;
+            }
+            throw std::runtime_error("DTLS SSL_connect failed: " + get_openssl_error_string());
+        }
+
+        set_socket_timeouts(socket_fd, timeout_);
+
+        std::vector<std::uint8_t> payload = serialize(action.message);
+        int written = SSL_write(ssl.get(), payload.data(), static_cast<int>(payload.size()));
+        if (written <= 0) {
+            throw std::runtime_error("SSL_write failed: " + get_openssl_error_string());
+        }
+
+        IpEndpoint local = socket_local_endpoint(socket_fd);
+        if (!local_bind_.has_value() || local_bind_->port == 0) {
+            local_bind_ = local;
+        }
+
+        std::vector<std::uint8_t> buffer(65536);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (wait_for_readable(socket_fd, std::chrono::milliseconds(500))) {
+                int received = SSL_read(ssl.get(), buffer.data(), static_cast<int>(buffer.size()));
+                if (received > 0) {
+                    StunMessage response_message;
+                    if (parse_message(buffer.data(), static_cast<std::size_t>(received), response_message) &&
+                        response_message.magic_cookie == action.message.magic_cookie &&
+                        response_message.transaction_id == action.message.transaction_id) {
+                        SSL_shutdown(ssl.get());
+                        close(socket_fd);
+                        if (!local_bind_.has_value()) {
+                            local_bind_ = local;
+                        }
+                        return StunResponse{response_message, action.send_to, local};
+                    }
+                } else {
+                    int err = SSL_get_error(ssl.get(), received);
+                    if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE && err != SSL_ERROR_SYSCALL) {
+                        break;
+                    }
                 }
             }
         }
