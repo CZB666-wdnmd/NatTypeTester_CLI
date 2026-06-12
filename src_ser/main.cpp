@@ -50,8 +50,8 @@
 namespace {
 
 std::mutex g_console_mutex;
-#define LOG_INFO(...) { std::lock_guard<std::mutex> lock(g_console_mutex); std::cout << __VA_ARGS__; std::cout.flush(); }
-#define LOG_ERR(...) { std::lock_guard<std::mutex> lock(g_console_mutex); std::cerr << __VA_ARGS__; std::cerr.flush(); }
+#define LOG_INFO(...) do { std::lock_guard<std::mutex> lock(g_console_mutex); std::cout << __VA_ARGS__; std::cout.flush(); } while(0)
+#define LOG_ERR(...) do { std::lock_guard<std::mutex> lock(g_console_mutex); std::cerr << __VA_ARGS__; std::cerr.flush(); } while(0)
 
 constexpr std::string_view kRfc7857UdpProbePayload = "RFC7857-UDP-PROBE\n";
 constexpr std::string_view kRfc4787OutOfOrderFragmentPayload = "RFC4787-OOO-FRAGMENT\n";
