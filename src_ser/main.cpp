@@ -105,7 +105,7 @@ struct DccpContext {
     int secondary_socket{-1};
     std::unordered_map<std::uint32_t, DccpRecord> requests_by_sc;
     std::unordered_map<std::string, DccpRecord> packets_by_ep;
-    std::mutex mutex;
+    mutable std::mutex mutex;
 };
 
 struct StunContext {
