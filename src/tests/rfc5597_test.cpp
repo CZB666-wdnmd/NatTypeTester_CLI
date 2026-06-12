@@ -40,10 +40,10 @@ constexpr std::chrono::milliseconds kDccpRecvTimeout{2000};
 constexpr std::chrono::milliseconds kShortTimeout{1500};
 constexpr std::uint32_t kServiceCodeA = 123456u;
 constexpr std::uint32_t kServiceCodeB = 654321u;
-constexpr std::uint32_t kServiceCodeSimOpen = 888888u;
-constexpr std::uint32_t kServiceCodeFilterProbe = 999999u;
-constexpr std::uint32_t kServiceCodeIcmpProbe = 777777u;
-constexpr std::uint32_t kServiceCodeHairpin = 111111u;
+constexpr std::uint32_t sc_sim = " + std::to_string(sc_sim) + "u;
+constexpr std::uint32_t sc_filter = " + std::to_string(sc_filter) + "u;
+constexpr std::uint32_t sc_icmp = " + std::to_string(sc_icmp) + "u;
+constexpr std::uint32_t sc_hairpin = 111111u;
 
 // ---- Test wrapper helpers ----
 
@@ -193,6 +193,11 @@ IpEndpoint send_dccp_request(const IpEndpoint& src_bind,
             actual_src.address_length = resolved.address_length;
             actual_src.family = resolved.family;
         }
+        if (actual_src.port == 0) {
+            static std::mt19937 rng(static_cast<unsigned>(std::chrono::steady_clock::now().time_since_epoch().count()));
+            static std::uniform_int_distribution<std::uint16_t> dist(49152, 65535);
+            actual_src.port = dist(rng);
+        }
         std::memcpy(&ip->saddr, actual_src.address.data(), 4);
         std::memcpy(&ip->daddr, dst.address.data(), 4);
         ip->check = calculate_checksum(ip, sizeof(iphdr));
@@ -295,7 +300,7 @@ struct DccpRecvResult {
     bool valid_csum{false};
 };
 
-DccpRecvResult recv_dccp_packet(int raw_fd, std::chrono::milliseconds timeout) {
+DccpRecvResult recv_dccp_packet(int raw_fd, std::chrono::milliseconds timeout, std::uint16_t expected_local_port = 0) {
     DccpRecvResult result;
 
     pollfd pfd{raw_fd, POLLIN, 0};
@@ -328,6 +333,20 @@ DccpRecvResult recv_dccp_packet(int raw_fd, std::chrono::milliseconds timeout) {
     std::size_t dccp_len = static_cast<std::size_t>(received) - ip_hdr_len;
 
     std::uint16_t sport = (static_cast<std::uint16_t>(dccp[0]) << 8) | dccp[1];
+    std::uint16_t dport = (static_cast<std::uint16_t>(dccp[2]) << 8) | dccp[3];
+
+    if (expected_local_port != 0 && dport != expected_local_port) {
+        return result;
+    }
+
+    // Data Offset stored as full byte — consistent with server impl
+    std::uint8_t data_offset_val = dccp[4];
+    if (data_offset_val == 0) data_offset_val = static_cast<std::uint8_t>(dccp_len / 4);
+
+    if (dccp_len < static_cast<std::size_t>(data_offset_val) * 4) {
+        return result;
+    }
+
     std::uint8_t type_val = (dccp[8] >> 1) & 0x0F;
     std::uint8_t cscov_val = dccp[5] & 0x0F;
 
@@ -358,9 +377,7 @@ DccpRecvResult recv_dccp_packet(int raw_fd, std::chrono::milliseconds timeout) {
     ph.length = htons(static_cast<std::uint16_t>(dccp_len));
     add_buf(&ph, sizeof(ph));
 
-    // Data Offset stored as full byte — consistent with server impl
-    std::uint8_t data_offset_val = dccp[4];
-    if (data_offset_val == 0) data_offset_val = static_cast<std::uint8_t>(dccp_len / 4);
+    // Data Offset already extracted above
 
     std::size_t cov_len = dccp_len;
     if (cscov_val > 0) {
@@ -378,19 +395,20 @@ DccpRecvResult recv_dccp_packet(int raw_fd, std::chrono::milliseconds timeout) {
     result.cscov = cscov_val;
 
     // Extract service code if type 0 (Request) with X=1 and enough data
-    bool x_flag = (dccp[8] & 0x01) != 0;
-    if (type_val == 0 && x_flag && dccp_len >= 20) {
-        std::uint32_t sc;
-        std::memcpy(&sc, dccp + 16, 4);
-        result.service_code = ntohl(sc);
-    }
+        bool x_flag = (dccp[8] & 0x01) != 0;
+        if (type_val == 0 && x_flag && dccp_len >= 20) {
+            std::uint32_t sc;
+            std::memcpy(&sc, dccp + 16, 4);
+            result.service_code = ntohl(sc);
+        }
 
-    return result;
+        return result;
+    }
 }
 
 /// Try to receive an ICMP Port Unreachable message with embedded DCCP header.
 /// Returns true if such an ICMP error was received on the socket.
-bool recv_icmp_dccp_error(int raw_fd, std::chrono::milliseconds timeout) {
+bool recv_icmp_dccp_error(int raw_fd, std::chrono::milliseconds timeout, std::uint16_t expected_local_port = 0) {
     pollfd pfd{raw_fd, POLLIN, 0};
     int rc = poll(&pfd, 1, static_cast<int>(timeout.count()));
     if (rc <= 0) {
@@ -403,7 +421,7 @@ bool recv_icmp_dccp_error(int raw_fd, std::chrono::milliseconds timeout) {
 
     ssize_t received = recvfrom(raw_fd, buffer.data(), buffer.size(), 0,
                                 reinterpret_cast<sockaddr*>(&peer), &peer_len);
-    if (received < static_cast<ssize_t>(sizeof(iphdr) + sizeof(icmphdr))) {
+    if (received < static_cast<ssize_t>(sizeof(iphdr) + 8 + sizeof(iphdr) + 8)) {
         return false;
     }
 
@@ -413,13 +431,24 @@ bool recv_icmp_dccp_error(int raw_fd, std::chrono::milliseconds timeout) {
     }
 
     std::size_t ip_hdr_len = static_cast<std::size_t>(ip_hdr->ihl) * 4;
+    if (received < static_cast<ssize_t>(ip_hdr_len + 8 + sizeof(iphdr) + 8)) {
+        return false;
+    }
     const auto* icmp_hdr = reinterpret_cast<const icmphdr*>(buffer.data() + ip_hdr_len);
 
     if (icmp_hdr->type == ICMP_DEST_UNREACH && icmp_hdr->code == ICMP_PORT_UNREACH) {
         // Check if the embedded packet is DCCP
-        const auto* inner_ip = reinterpret_cast<const iphdr*>(buffer.data() + ip_hdr_len + sizeof(icmphdr));
+        const auto* inner_ip = reinterpret_cast<const iphdr*>(buffer.data() + ip_hdr_len + 8);
         if (inner_ip->version == 4 && inner_ip->protocol == IPPROTO_DCCP) {
-            return true;
+            std::size_t inner_ip_hdr_len = static_cast<std::size_t>(inner_ip->ihl) * 4;
+            if (received >= static_cast<ssize_t>(ip_hdr_len + 8 + inner_ip_hdr_len + 4)) {
+                const std::uint8_t* inner_dccp = buffer.data() + ip_hdr_len + 8 + inner_ip_hdr_len;
+                std::uint16_t inner_sport = (static_cast<std::uint16_t>(inner_dccp[0]) << 8) | inner_dccp[1];
+                if (expected_local_port != 0 && inner_sport != expected_local_port) {
+                    return false;
+                }
+                return true;
+            }
         }
     }
 
@@ -508,7 +537,8 @@ DccpIntegrityResult run_dccp_integrity_test(const RequestOptions& options,
         IpEndpoint bind_ep = local_bind.value_or(wildcard_endpoint(AF_INET, 0));
 
         // Send DCCP-Request with Service Code = 123456, CsCov = 5
-        send_dccp_request(bind_ep, primary_server, kServiceCodeA, 5);
+        std::uint32_t sc_test = random_service_code();
+        send_dccp_request(bind_ep, primary_server, sc_test, 5);
     } catch (const std::exception& e) {
         result.reachable = ProbeStatus::Fail;
         return result;
@@ -521,7 +551,7 @@ DccpIntegrityResult run_dccp_integrity_test(const RequestOptions& options,
     try {
         std::string response = send_server_command(
             primary_server,
-            "DCCP_GET_REQ 123456\n",
+            "DCCP_GET_REQ " + std::to_string(sc_test) + "\n",
             timeout);
 
         auto parsed = parse_dccp_req_response(response);
@@ -563,7 +593,8 @@ DccpMappingFilteringResult run_dccp_mapping_filtering_test(const RequestOptions&
 
     // Step 1: Send to Primary with SC_A
     try {
-        send_dccp_request(bind_ep, primary_server, kServiceCodeA, 0);
+        std::uint32_t sc_a = random_service_code();
+        send_dccp_request(bind_ep, primary_server, sc_a, 0);
     } catch (const std::exception&) {
         result.mapping_behavior = MappingBehavior::Fail;
         return result;
@@ -573,7 +604,7 @@ DccpMappingFilteringResult run_dccp_mapping_filtering_test(const RequestOptions&
 
     // Query Primary mapping
     try {
-        std::string r1 = send_server_command(primary_server, "DCCP_GET_REQ 123456\n", timeout);
+        std::string r1 = send_server_command(primary_server, "DCCP_GET_REQ " + std::to_string(sc_test) + "\n", timeout);
         auto p1 = parse_dccp_req_response(r1);
         if (!p1.found) {
             result.mapping_behavior = MappingBehavior::Fail;
@@ -587,7 +618,8 @@ DccpMappingFilteringResult run_dccp_mapping_filtering_test(const RequestOptions&
 
     // Step 2: Send from SAME local port to Secondary with SC_B
     try {
-        send_dccp_request(bind_ep, secondary_server, kServiceCodeB, 0);
+        std::uint32_t sc_b = random_service_code();
+        send_dccp_request(bind_ep, secondary_server, sc_b, 0);
     } catch (const std::exception&) {
         result.mapping_behavior = MappingBehavior::AddressAndPortDependent;
         return result;
@@ -597,7 +629,7 @@ DccpMappingFilteringResult run_dccp_mapping_filtering_test(const RequestOptions&
 
     // Query Secondary mapping
     try {
-        std::string r2 = send_server_command(secondary_server, "DCCP_GET_REQ 654321\n", timeout);
+        std::string r2 = send_server_command(secondary_server, "DCCP_GET_REQ " + std::to_string(sc_b) + "\n", timeout);
         auto p2 = parse_dccp_req_response(r2);
         if (!p2.found) {
             result.mapping_behavior = MappingBehavior::AddressAndPortDependent;
@@ -629,6 +661,7 @@ ProbeStatus run_dccp_filtering_test_inner(const RequestOptions& /* options */,
                                           const IpEndpoint& mapped_endpoint,
                                           std::uint16_t local_port,
                                           std::chrono::milliseconds timeout) {
+    std::uint32_t sc_filter = random_service_code();
     // Open a DCCP listener on the local port
     int listen_fd = -1;
     try {
@@ -640,17 +673,17 @@ ProbeStatus run_dccp_filtering_test_inner(const RequestOptions& /* options */,
     try {
         // Ask server to send DCCP-Request from Secondary to our mapped address
         std::string cmd = "DCCP_SEND S " + to_string(mapped_endpoint) +
-                          " 0 999999 0\n";
+                          " 0 " + std::to_string(sc_filter) + " 0\n";
         send_server_command(secondary_server, cmd, timeout);
 
         // Wait a bit for the packet to arrive
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
         // Try to receive
-        auto recv = recv_dccp_packet(listen_fd, kDccpRecvTimeout);
+        auto recv = recv_dccp_packet(listen_fd, kDccpRecvTimeout, local_port);
         close(listen_fd);
 
-        if (recv.received && recv.service_code == kServiceCodeFilterProbe) {
+        if (recv.received && recv.service_code == sc_filter) {
             return ProbeStatus::Pass; // EIF: packet from any remote reaches us
         }
         return ProbeStatus::Fail; // ADF: only packets from known destination
@@ -666,6 +699,7 @@ DccpSimOpenResult run_dccp_simultaneous_open_test(const RequestOptions& options,
                                                   const IpEndpoint& primary_server,
                                                   const IpEndpoint& mapped_endpoint,
                                                   const std::optional<IpEndpoint>& local_bind) {
+    std::uint32_t sc_sim = random_service_code();
     DccpSimOpenResult result;
     auto timeout = options.timeout;
 
@@ -683,19 +717,20 @@ DccpSimOpenResult run_dccp_simultaneous_open_test(const RequestOptions& options,
 
     try {
         // First send our DCCP-Request to Primary
-        send_dccp_request(bind_ep, primary_server, kServiceCodeA, 0);
+        std::uint32_t sc_a = random_service_code();
+        send_dccp_request(bind_ep, primary_server, sc_a, 0);
 
         // Immediately (near-simultaneously) ask server to send DCCP-Request back
         std::string cmd = "DCCP_SEND P " + to_string(mapped_endpoint) +
-                          " 0 888888 0\n";
+                          " 0 " + std::to_string(sc_sim) + " 0\n";
         send_server_command(primary_server, cmd, timeout);
 
         // Try to receive
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        auto recv = recv_dccp_packet(listen_fd, kDccpRecvTimeout);
+        auto recv = recv_dccp_packet(listen_fd, kDccpRecvTimeout, local_port);
         close(listen_fd);
 
-        if (recv.received && recv.service_code == kServiceCodeSimOpen) {
+        if (recv.received && recv.service_code == sc_sim) {
             result.received = ProbeStatus::Pass;
         } else {
             result.received = ProbeStatus::Fail;
@@ -737,7 +772,7 @@ DccpUnexpectedSyncResult run_dccp_unexpected_sync_test(const RequestOptions& opt
 
         // Try to receive DCCP-Sync
         std::this_thread::sleep_for(std::chrono::milliseconds(300));
-        auto recv = recv_dccp_packet(listen_fd, kDccpRecvTimeout);
+        auto recv = recv_dccp_packet(listen_fd, kDccpRecvTimeout, local_port);
 
         if (recv.received && recv.type == 8) {
             // NAT forwarded the unexpected Sync packet — potentially dangerous
@@ -823,6 +858,7 @@ DccpHairpinningResult run_dccp_hairpinning_test(const RequestOptions& options,
                                                 const IpEndpoint& primary_server,
                                                 const IpEndpoint& mapped_endpoint,
                                                 const std::optional<IpEndpoint>& local_bind) {
+    std::uint32_t sc_hairpin = random_service_code();
     DccpHairpinningResult result;
     auto timeout = options.timeout;
 
@@ -840,7 +876,8 @@ DccpHairpinningResult run_dccp_hairpinning_test(const RequestOptions& options,
 
     try {
         // Send DCCP-Request from port A to create mapping
-        send_dccp_request(bind_a, primary_server, kServiceCodeA, 0);
+        std::uint32_t sc_a = random_service_code();
+        send_dccp_request(bind_a, primary_server, sc_a, 0);
     } catch (const std::exception&) {
         close(listen_a);
         result.hairpinning = ProbeStatus::Inconclusive;
@@ -852,7 +889,7 @@ DccpHairpinningResult run_dccp_hairpinning_test(const RequestOptions& options,
     // Process B: from a DIFFERENT local port, send DCCP-Request to our own mapped address
     IpEndpoint bind_b = wildcard_endpoint(AF_INET, 0);
     try {
-        send_dccp_request(bind_b, mapped_endpoint, kServiceCodeHairpin, 0);
+        send_dccp_request(bind_b, mapped_endpoint, sc_hairpin, 0);
     } catch (const std::exception&) {
         close(listen_a);
         result.hairpinning = ProbeStatus::Inconclusive;
@@ -861,7 +898,7 @@ DccpHairpinningResult run_dccp_hairpinning_test(const RequestOptions& options,
 
     // Check if Process A received the hairpin packet
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    auto recv = recv_dccp_packet(listen_a, kDccpRecvTimeout);
+    auto recv = recv_dccp_packet(listen_a, kDccpRecvTimeout, bind_a.port);
     close(listen_a);
 
     if (recv.received) {
@@ -879,6 +916,7 @@ DccpIcmpResult run_dccp_icmp_test(const RequestOptions& options,
                                   const IpEndpoint& primary_server,
                                   const IpEndpoint& mapped_endpoint,
                                   const std::optional<IpEndpoint>& local_bind) {
+    std::uint32_t sc_icmp = random_service_code();
     DccpIcmpResult result;
     auto timeout = options.timeout;
 
@@ -911,7 +949,7 @@ DccpIcmpResult run_dccp_icmp_test(const RequestOptions& options,
 
     // Step 2: Check if we received the ICMP Port Unreachable
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    bool icmp_received = recv_icmp_dccp_error(icmp_fd, kShortTimeout);
+    bool icmp_received = recv_icmp_dccp_error(icmp_fd, kShortTimeout, local_port);
 
     if (icmp_received) {
         result.icmp_forwarded = ProbeStatus::Pass;
@@ -922,7 +960,7 @@ DccpIcmpResult run_dccp_icmp_test(const RequestOptions& options,
     // Step 3: Verify mapping survived — ask server to send a normal DCCP-Request
     try {
         std::string cmd = "DCCP_SEND P " + to_string(mapped_endpoint) +
-                          " 0 777777 0\n";
+                          " 0 " + std::to_string(sc_icmp) + " 0\n";
         send_server_command(primary_server, cmd, timeout);
     } catch (const std::exception&) {
         close(icmp_fd);
@@ -939,7 +977,7 @@ DccpIcmpResult run_dccp_icmp_test(const RequestOptions& options,
         close(dccp_fd);
         close(icmp_fd);
 
-        if (recv.received && recv.service_code == kServiceCodeIcmpProbe) {
+        if (recv.received && recv.service_code == sc_icmp) {
             result.mapping_survives = ProbeStatus::Pass;
         } else {
             result.mapping_survives = ProbeStatus::Fail;
@@ -986,6 +1024,14 @@ int Rfc5597Test::runTest() {
         auto cfg = discover_custom_servers(stun_server_, stun_server_.family);
         primary_server_ = cfg.primary;
         secondary_server_ = cfg.secondary;
+    }
+
+    if (!local_bind_.has_value() || local_bind_->port == 0) {
+        IpEndpoint ep = local_bind_.value_or(wildcard_endpoint(AF_INET, 0));
+        static std::mt19937 rng(static_cast<unsigned>(std::chrono::steady_clock::now().time_since_epoch().count()));
+        static std::uniform_int_distribution<std::uint16_t> dist(49152, 65535);
+        ep.port = dist(rng);
+        local_bind_ = ep;
     }
 
     Rfc5597Result result;
