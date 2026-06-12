@@ -44,7 +44,7 @@
 #include <unordered_set>
 #include <vector>
 #include <fstream>
-#include <regex>
+#include <cctype>
 
 namespace {
 
@@ -1396,21 +1396,43 @@ int main(int argc, char** argv) {
             }
         }
 
-        // 如果指定了配置文件，通过轻量级正则状态机读取 JSON 键值对
+// 如果指定了配置文件，通过纯字符串查找解析扁平 JSON（完全不依赖正则）
         if (!config_file.empty()) {
             std::ifstream ifs(config_file);
             if (!ifs) fail("Failed to open config file: " + config_file);
             std::string content((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
             
-            // 匹配字符串: "key": "value"
-            std::regex str_re(R"("([^"]+)"\s*:\s*"([^"]*)")");
-            for (std::sregex_iterator i(content.begin(), content.end(), str_re), end; i != end; ++i) {
-                cfg[(*i)[1].str()] = (*i)[2].str();
-            }
-            // 匹配数字: "key": 1234
-            std::regex int_re(R"("([^"]+)"\s*:\s*(-?\d+))");
-            for (std::sregex_iterator i(content.begin(), content.end(), int_re), end; i != end; ++i) {
-                cfg[(*i)[1].str()] = (*i)[2].str();
+            size_t pos = 0;
+            while ((pos = content.find('"', pos)) != std::string::npos) {
+                // 提取 Key
+                size_t key_end = content.find('"', pos + 1);
+                if (key_end == std::string::npos) break;
+                std::string key = content.substr(pos + 1, key_end - pos - 1);
+                
+                // 寻找冒号
+                size_t colon_pos = content.find(':', key_end + 1);
+                if (colon_pos == std::string::npos) break;
+                
+                // 寻找 Value 的起始位置
+                size_t val_start = content.find_first_not_of(" \t\r\n", colon_pos + 1);
+                if (val_start == std::string::npos) break;
+                
+                if (content[val_start] == '"') { 
+                    // 匹配字符串: "key": "value"
+                    size_t val_end = content.find('"', val_start + 1);
+                    if (val_end == std::string::npos) break;
+                    cfg[key] = content.substr(val_start + 1, val_end - val_start - 1);
+                    pos = val_end + 1;
+                } else if (content[val_start] == '-' || std::isdigit(static_cast<unsigned char>(content[val_start]))) { 
+                    // 匹配数字: "key": 1234
+                    size_t val_end = content.find_first_not_of("-0123456789", val_start);
+                    size_t len = (val_end == std::string::npos) ? std::string::npos : (val_end - val_start);
+                    cfg[key] = content.substr(val_start, len);
+                    pos = (val_end == std::string::npos) ? content.length() : val_end;
+                } else {
+                    // 跳过未知的格式(例如 {}, [])
+                    pos = val_start + 1;
+                }
             }
             std::cout << "Loaded configuration from " << config_file << "\n";
         }
