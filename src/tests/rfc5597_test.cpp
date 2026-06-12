@@ -38,12 +38,6 @@ namespace {
 constexpr std::chrono::milliseconds kDefaultTimeout{3000};
 constexpr std::chrono::milliseconds kDccpRecvTimeout{2000};
 constexpr std::chrono::milliseconds kShortTimeout{1500};
-constexpr std::uint32_t kServiceCodeA = 123456u;
-constexpr std::uint32_t kServiceCodeB = 654321u;
-constexpr std::uint32_t sc_sim = " + std::to_string(sc_sim) + "u;
-constexpr std::uint32_t sc_filter = " + std::to_string(sc_filter) + "u;
-constexpr std::uint32_t sc_icmp = " + std::to_string(sc_icmp) + "u;
-constexpr std::uint32_t sc_hairpin = 111111u;
 
 // ---- Test wrapper helpers ----
 
@@ -300,101 +294,103 @@ struct DccpRecvResult {
     bool valid_csum{false};
 };
 
-DccpRecvResult recv_dccp_packet(int raw_fd, std::chrono::milliseconds timeout, std::uint16_t expected_local_port = 0) {
+DccpRecvResult recv_dccp_packet(int raw_fd, std::chrono::milliseconds timeout, std::optional<std::uint16_t> expected_dport = std::nullopt) {
     DccpRecvResult result;
+    auto start = std::chrono::steady_clock::now();
 
-    pollfd pfd{raw_fd, POLLIN, 0};
-    int rc = poll(&pfd, 1, static_cast<int>(timeout.count()));
-    if (rc <= 0) {
-        return result; // timeout or error
-    }
+    while (true) {
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start);
+        if (elapsed >= timeout) return result;
 
-    std::array<std::uint8_t, 4096> buffer{};
-    sockaddr_storage peer{};
-    socklen_t peer_len = sizeof(peer);
-
-    ssize_t received = recvfrom(raw_fd, buffer.data(), buffer.size(), 0,
-                                reinterpret_cast<sockaddr*>(&peer), &peer_len);
-    if (received < static_cast<ssize_t>(sizeof(iphdr) + 12)) {
-        return result;
-    }
-
-    const auto* ip_hdr = reinterpret_cast<const iphdr*>(buffer.data());
-    if (ip_hdr->version != 4 || ip_hdr->protocol != IPPROTO_DCCP) {
-        return result;
-    }
-
-    std::size_t ip_hdr_len = static_cast<std::size_t>(ip_hdr->ihl) * 4;
-    if (received < static_cast<ssize_t>(ip_hdr_len + 12)) {
-        return result;
-    }
-
-    const std::uint8_t* dccp = buffer.data() + ip_hdr_len;
-    std::size_t dccp_len = static_cast<std::size_t>(received) - ip_hdr_len;
-
-    std::uint16_t sport = (static_cast<std::uint16_t>(dccp[0]) << 8) | dccp[1];
-    std::uint16_t dport = (static_cast<std::uint16_t>(dccp[2]) << 8) | dccp[3];
-
-    if (expected_local_port != 0 && dport != expected_local_port) {
-        return result;
-    }
-
-    // Data Offset stored as full byte — consistent with server impl
-    std::uint8_t data_offset_val = dccp[4];
-    if (data_offset_val == 0) data_offset_val = static_cast<std::uint8_t>(dccp_len / 4);
-
-    if (dccp_len < static_cast<std::size_t>(data_offset_val) * 4) {
-        return result;
-    }
-
-    std::uint8_t type_val = (dccp[8] >> 1) & 0x0F;
-    std::uint8_t cscov_val = dccp[5] & 0x0F;
-
-    // Validate checksum
-    std::uint32_t sum = 0;
-    auto add_buf = [&](const void* buf, std::size_t len) {
-        const std::uint8_t* ptr = static_cast<const std::uint8_t*>(buf);
-        while (len >= 2) {
-            sum += (static_cast<std::uint32_t>(ptr[0]) << 8) | ptr[1];
-            ptr += 2;
-            len -= 2;
+        pollfd pfd{raw_fd, POLLIN, 0};
+        int rc = poll(&pfd, 1, static_cast<int>(timeout.count() - elapsed.count()));
+        if (rc <= 0) {
+            return result; // timeout or error
         }
-        if (len == 1) {
-            sum += static_cast<std::uint32_t>(ptr[0]) << 8;
+
+        std::array<std::uint8_t, 4096> buffer{};
+        sockaddr_storage peer{};
+        socklen_t peer_len = sizeof(peer);
+
+        ssize_t received = recvfrom(raw_fd, buffer.data(), buffer.size(), 0,
+                                    reinterpret_cast<sockaddr*>(&peer), &peer_len);
+        if (received < static_cast<ssize_t>(sizeof(iphdr) + 12)) {
+            continue;
         }
-    };
 
-    // Pseudo-header
-    struct PseudoHdr {
-        std::uint32_t saddr, daddr;
-        std::uint8_t zero, protocol;
-        std::uint16_t length;
-    } __attribute__((packed)) ph;
-    std::memcpy(&ph.saddr, &ip_hdr->saddr, 4);
-    std::memcpy(&ph.daddr, &ip_hdr->daddr, 4);
-    ph.zero = 0;
-    ph.protocol = IPPROTO_DCCP;
-    ph.length = htons(static_cast<std::uint16_t>(dccp_len));
-    add_buf(&ph, sizeof(ph));
+        const auto* ip_hdr = reinterpret_cast<const iphdr*>(buffer.data());
+        if (ip_hdr->version != 4 || ip_hdr->protocol != IPPROTO_DCCP) {
+            continue;
+        }
 
-    // Data Offset already extracted above
+        std::size_t ip_hdr_len = static_cast<std::size_t>(ip_hdr->ihl) * 4;
+        if (received < static_cast<ssize_t>(ip_hdr_len + 12)) {
+            continue;
+        }
 
-    std::size_t cov_len = dccp_len;
-    if (cscov_val > 0) {
-        std::size_t req_cov = static_cast<std::size_t>(data_offset_val) * 4 + static_cast<std::size_t>(cscov_val - 1) * 4;
-        if (req_cov < dccp_len) cov_len = req_cov;
-    }
-    add_buf(dccp, cov_len);
-    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+        const std::uint8_t* dccp = buffer.data() + ip_hdr_len;
+        std::size_t dccp_len = static_cast<std::size_t>(received) - ip_hdr_len;
 
-    result.valid_csum = (static_cast<std::uint16_t>(~sum) == 0);
-    result.received = true;
-    result.peer = from_sockaddr(reinterpret_cast<const sockaddr*>(&peer), peer_len);
-    result.peer.port = sport;
-    result.type = type_val;
-    result.cscov = cscov_val;
+        std::uint16_t sport = (static_cast<std::uint16_t>(dccp[0]) << 8) | dccp[1];
+        std::uint16_t dport = (static_cast<std::uint16_t>(dccp[2]) << 8) | dccp[3];
 
-    // Extract service code if type 0 (Request) with X=1 and enough data
+        if (expected_dport.has_value() && dport != *expected_dport) {
+            continue;
+        }
+
+        std::uint8_t data_offset_val = dccp[4];
+        if (data_offset_val == 0) data_offset_val = static_cast<std::uint8_t>(dccp_len / 4);
+        if (dccp_len < static_cast<std::size_t>(data_offset_val) * 4) {
+            continue;
+        }
+
+        std::uint8_t type_val = (dccp[8] >> 1) & 0x0F;
+        std::uint8_t cscov_val = dccp[5] & 0x0F;
+
+        // Validate checksum
+        std::uint32_t sum = 0;
+        auto add_buf = [&](const void* buf, std::size_t len) {
+            const std::uint8_t* ptr = static_cast<const std::uint8_t*>(buf);
+            while (len >= 2) {
+                sum += (static_cast<std::uint32_t>(ptr[0]) << 8) | ptr[1];
+                ptr += 2;
+                len -= 2;
+            }
+            if (len == 1) {
+                sum += static_cast<std::uint32_t>(ptr[0]) << 8;
+            }
+        };
+
+        // Pseudo-header
+        struct PseudoHdr {
+            std::uint32_t saddr, daddr;
+            std::uint8_t zero, protocol;
+            std::uint16_t length;
+        } __attribute__((packed)) ph;
+        std::memcpy(&ph.saddr, &ip_hdr->saddr, 4);
+        std::memcpy(&ph.daddr, &ip_hdr->daddr, 4);
+        ph.zero = 0;
+        ph.protocol = IPPROTO_DCCP;
+        ph.length = htons(static_cast<std::uint16_t>(dccp_len));
+        add_buf(&ph, sizeof(ph));
+
+        std::size_t cov_len = dccp_len;
+        if (cscov_val > 0) {
+            std::size_t req_cov = static_cast<std::size_t>(data_offset_val) * 4 + static_cast<std::size_t>(cscov_val - 1) * 4;
+            if (req_cov < dccp_len) cov_len = req_cov;
+        }
+        add_buf(dccp, cov_len);
+        while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+
+        result.valid_csum = (static_cast<std::uint16_t>(~sum) == 0);
+        result.received = true;
+        result.peer = from_sockaddr(reinterpret_cast<const sockaddr*>(&peer), peer_len);
+        result.peer.port = sport;
+        result.type = type_val;
+        result.cscov = cscov_val;
+
+        // Extract service code if type 0 (Request) with X=1 and enough data
         bool x_flag = (dccp[8] & 0x01) != 0;
         if (type_val == 0 && x_flag && dccp_len >= 20) {
             std::uint32_t sc;
@@ -408,51 +404,56 @@ DccpRecvResult recv_dccp_packet(int raw_fd, std::chrono::milliseconds timeout, s
 
 /// Try to receive an ICMP Port Unreachable message with embedded DCCP header.
 /// Returns true if such an ICMP error was received on the socket.
-bool recv_icmp_dccp_error(int raw_fd, std::chrono::milliseconds timeout, std::uint16_t expected_local_port = 0) {
-    pollfd pfd{raw_fd, POLLIN, 0};
-    int rc = poll(&pfd, 1, static_cast<int>(timeout.count()));
-    if (rc <= 0) {
-        return false;
-    }
+bool recv_icmp_dccp_error(int raw_fd, std::chrono::milliseconds timeout, std::uint16_t expected_local_port) {
+    auto start = std::chrono::steady_clock::now();
 
-    std::array<std::uint8_t, 4096> buffer{};
-    sockaddr_storage peer{};
-    socklen_t peer_len = sizeof(peer);
+    while (true) {
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start);
+        if (elapsed >= timeout) return false;
 
-    ssize_t received = recvfrom(raw_fd, buffer.data(), buffer.size(), 0,
-                                reinterpret_cast<sockaddr*>(&peer), &peer_len);
-    if (received < static_cast<ssize_t>(sizeof(iphdr) + 8 + sizeof(iphdr) + 8)) {
-        return false;
-    }
+        pollfd pfd{raw_fd, POLLIN, 0};
+        int rc = poll(&pfd, 1, static_cast<int>(timeout.count() - elapsed.count()));
+        if (rc <= 0) {
+            return false;
+        }
 
-    const auto* ip_hdr = reinterpret_cast<const iphdr*>(buffer.data());
-    if (ip_hdr->version != 4 || ip_hdr->protocol != IPPROTO_ICMP) {
-        return false;
-    }
+        std::array<std::uint8_t, 4096> buffer{};
+        sockaddr_storage peer{};
+        socklen_t peer_len = sizeof(peer);
 
-    std::size_t ip_hdr_len = static_cast<std::size_t>(ip_hdr->ihl) * 4;
-    if (received < static_cast<ssize_t>(ip_hdr_len + 8 + sizeof(iphdr) + 8)) {
-        return false;
-    }
-    const auto* icmp_hdr = reinterpret_cast<const icmphdr*>(buffer.data() + ip_hdr_len);
+        ssize_t received = recvfrom(raw_fd, buffer.data(), buffer.size(), 0,
+                                    reinterpret_cast<sockaddr*>(&peer), &peer_len);
+        if (received < static_cast<ssize_t>(sizeof(iphdr) + sizeof(icmphdr))) {
+            continue;
+        }
 
-    if (icmp_hdr->type == ICMP_DEST_UNREACH && icmp_hdr->code == ICMP_PORT_UNREACH) {
-        // Check if the embedded packet is DCCP
-        const auto* inner_ip = reinterpret_cast<const iphdr*>(buffer.data() + ip_hdr_len + 8);
-        if (inner_ip->version == 4 && inner_ip->protocol == IPPROTO_DCCP) {
-            std::size_t inner_ip_hdr_len = static_cast<std::size_t>(inner_ip->ihl) * 4;
-            if (received >= static_cast<ssize_t>(ip_hdr_len + 8 + inner_ip_hdr_len + 4)) {
-                const std::uint8_t* inner_dccp = buffer.data() + ip_hdr_len + 8 + inner_ip_hdr_len;
-                std::uint16_t inner_sport = (static_cast<std::uint16_t>(inner_dccp[0]) << 8) | inner_dccp[1];
-                if (expected_local_port != 0 && inner_sport != expected_local_port) {
-                    return false;
+        const auto* ip_hdr = reinterpret_cast<const iphdr*>(buffer.data());
+        if (ip_hdr->version != 4 || ip_hdr->protocol != IPPROTO_ICMP) {
+            continue;
+        }
+
+        std::size_t ip_hdr_len = static_cast<std::size_t>(ip_hdr->ihl) * 4;
+        if (received < static_cast<ssize_t>(ip_hdr_len + sizeof(icmphdr) + sizeof(iphdr) + 8)) {
+            continue;
+        }
+        const auto* icmp_hdr = reinterpret_cast<const icmphdr*>(buffer.data() + ip_hdr_len);
+
+        if (icmp_hdr->type == ICMP_DEST_UNREACH && icmp_hdr->code == ICMP_PORT_UNREACH) {
+            // Check if the embedded packet is DCCP
+            const auto* inner_ip = reinterpret_cast<const iphdr*>(buffer.data() + ip_hdr_len + sizeof(icmphdr));
+            if (inner_ip->version == 4 && inner_ip->protocol == IPPROTO_DCCP) {
+                std::size_t inner_ip_hdr_len = static_cast<std::size_t>(inner_ip->ihl) * 4;
+                if (received >= static_cast<ssize_t>(ip_hdr_len + sizeof(icmphdr) + inner_ip_hdr_len + 8)) {
+                    const std::uint8_t* inner_dccp = buffer.data() + ip_hdr_len + sizeof(icmphdr) + inner_ip_hdr_len;
+                    std::uint16_t inner_sport = (static_cast<std::uint16_t>(inner_dccp[0]) << 8) | inner_dccp[1];
+                    if (inner_sport == expected_local_port) {
+                        return true;
+                    }
                 }
-                return true;
             }
         }
     }
-
-    return false;
 }
 
 // ---- TCP control channel helpers ----
@@ -533,11 +534,11 @@ DccpIntegrityResult run_dccp_integrity_test(const RequestOptions& options,
     DccpIntegrityResult result;
     auto timeout = options.timeout;
 
+    std::uint32_t sc_test = random_service_code();
     try {
         IpEndpoint bind_ep = local_bind.value_or(wildcard_endpoint(AF_INET, 0));
 
         // Send DCCP-Request with Service Code = 123456, CsCov = 5
-        std::uint32_t sc_test = random_service_code();
         send_dccp_request(bind_ep, primary_server, sc_test, 5);
     } catch (const std::exception& e) {
         result.reachable = ProbeStatus::Fail;
@@ -592,8 +593,8 @@ DccpMappingFilteringResult run_dccp_mapping_filtering_test(const RequestOptions&
     IpEndpoint bind_ep = local_bind.value_or(wildcard_endpoint(AF_INET, 0));
 
     // Step 1: Send to Primary with SC_A
+    std::uint32_t sc_a = random_service_code();
     try {
-        std::uint32_t sc_a = random_service_code();
         send_dccp_request(bind_ep, primary_server, sc_a, 0);
     } catch (const std::exception&) {
         result.mapping_behavior = MappingBehavior::Fail;
@@ -604,7 +605,7 @@ DccpMappingFilteringResult run_dccp_mapping_filtering_test(const RequestOptions&
 
     // Query Primary mapping
     try {
-        std::string r1 = send_server_command(primary_server, "DCCP_GET_REQ " + std::to_string(sc_test) + "\n", timeout);
+        std::string r1 = send_server_command(primary_server, "DCCP_GET_REQ " + std::to_string(sc_a) + "\n", timeout);
         auto p1 = parse_dccp_req_response(r1);
         if (!p1.found) {
             result.mapping_behavior = MappingBehavior::Fail;
@@ -617,8 +618,8 @@ DccpMappingFilteringResult run_dccp_mapping_filtering_test(const RequestOptions&
     }
 
     // Step 2: Send from SAME local port to Secondary with SC_B
+    std::uint32_t sc_b = random_service_code();
     try {
-        std::uint32_t sc_b = random_service_code();
         send_dccp_request(bind_ep, secondary_server, sc_b, 0);
     } catch (const std::exception&) {
         result.mapping_behavior = MappingBehavior::AddressAndPortDependent;
@@ -715,9 +716,10 @@ DccpSimOpenResult run_dccp_simultaneous_open_test(const RequestOptions& options,
         return result;
     }
 
+    std::uint32_t sc_a = random_service_code();
+
     try {
         // First send our DCCP-Request to Primary
-        std::uint32_t sc_a = random_service_code();
         send_dccp_request(bind_ep, primary_server, sc_a, 0);
 
         // Immediately (near-simultaneously) ask server to send DCCP-Request back
@@ -875,8 +877,8 @@ DccpHairpinningResult run_dccp_hairpinning_test(const RequestOptions& options,
     }
 
     try {
-        // Send DCCP-Request from port A to create mapping
         std::uint32_t sc_a = random_service_code();
+        // Send DCCP-Request from port A to create mapping
         send_dccp_request(bind_a, primary_server, sc_a, 0);
     } catch (const std::exception&) {
         close(listen_a);
