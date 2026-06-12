@@ -22,6 +22,7 @@
 #include <openssl/rand.h>
 #include <openssl/bio.h>
 #include <openssl/evp.h>
+#include <openssl/obj_mac.h>
 
 #include <algorithm>
 #include <array>
@@ -1228,9 +1229,9 @@ void handle_udp_packet(int rx_idx, const StunContext& ctx) {
 }
 
 void generate_self_signed_cert() {
-    EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, nullptr);
+    EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, nullptr);
     EVP_PKEY_keygen_init(pctx);
-    EVP_PKEY_CTX_set_rsa_keygen_bits(pctx, 2048);
+    EVP_PKEY_CTX_set_ec_paramgen_curve_nid(pctx, NID_X9_62_prime256v1); // 使用高兼容性的 prime256v1 (secp256r1)
     EVP_PKEY_keygen(pctx, &generated_key);
     EVP_PKEY_CTX_free(pctx);
 
@@ -1261,7 +1262,7 @@ void init_openssl(const std::string& cert_file, const std::string& key_file) {
     SSL_load_error_strings();
 
     if (cert_file.empty() || key_file.empty()) {
-        std::cout << "Generating self-signed certificate for TLS/DTLS...\n";
+        std::cout << "Generating self-signed certificate (ECDSA prime256v1) for TLS/DTLS...\n";
         generate_self_signed_cert();
     }
 
@@ -1271,6 +1272,14 @@ void init_openssl(const std::string& cert_file, const std::string& key_file) {
 
     SSL_CTX_set_cookie_generate_cb(dtls_ctx, dtls_generate_cookie);
     SSL_CTX_set_cookie_verify_cb(dtls_ctx, dtls_verify_cookie);
+
+    // 启用最高兼容性的 Cipher 列表并放宽安全级别以兼容所有版本的测试客户端
+    SSL_CTX_set_cipher_list(tls_ctx, "ALL:!aNULL:!eNULL");
+    SSL_CTX_set_cipher_list(dtls_ctx, "ALL:!aNULL:!eNULL");
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L
+    SSL_CTX_set_security_level(tls_ctx, 0);
+    SSL_CTX_set_security_level(dtls_ctx, 0);
+#endif
 
     auto configure_ctx = [&](SSL_CTX* ctx) {
         if (!cert_file.empty() && !key_file.empty()) {
