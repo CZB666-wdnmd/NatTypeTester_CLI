@@ -1113,7 +1113,7 @@ void handle_dtls_listen(int listen_fd, int rx_idx, const StunContext& ctx) {
         // 修复3：握手阶段（SSL_accept）极其容易发生丢包
         // 必须在握手前就设定好系统级的 Socket I/O 超时，防止被挂起
         struct timeval tv;
-        tv.tv_sec = 10;
+        tv.tv_sec = 3;
         tv.tv_usec = 0;
         setsockopt(new_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         setsockopt(new_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
