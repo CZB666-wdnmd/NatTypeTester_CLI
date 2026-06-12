@@ -77,46 +77,6 @@ struct Rfc5597Result {
     DccpIcmpResult icmp;
 };
 
-/// Run individual RFC 5597 test sections.
-DccpIntegrityResult run_dccp_integrity_test(const RequestOptions& options,
-                                            const IpEndpoint& primary_server,
-                                            const std::optional<IpEndpoint>& local_bind);
-
-DccpMappingFilteringResult run_dccp_mapping_filtering_test(const RequestOptions& options,
-                                                           const IpEndpoint& primary_server,
-                                                           const IpEndpoint& secondary_server,
-                                                           const std::optional<IpEndpoint>& local_bind);
-
-DccpSimOpenResult run_dccp_simultaneous_open_test(const RequestOptions& options,
-                                                  const IpEndpoint& primary_server,
-                                                  const IpEndpoint& mapped_endpoint,
-                                                  const std::optional<IpEndpoint>& local_bind);
-
-DccpUnexpectedSyncResult run_dccp_unexpected_sync_test(const RequestOptions& options,
-                                                       const IpEndpoint& primary_server,
-                                                       const IpEndpoint& mapped_endpoint,
-                                                       const std::optional<IpEndpoint>& local_bind);
-
-DccpPortOverloadingResult run_dccp_port_overloading_test(const RequestOptions& options,
-                                                         const IpEndpoint& primary_server,
-                                                         const std::optional<IpEndpoint>& local_bind);
-
-DccpHairpinningResult run_dccp_hairpinning_test(const RequestOptions& options,
-                                                const IpEndpoint& primary_server,
-                                                const IpEndpoint& mapped_endpoint,
-                                                const std::optional<IpEndpoint>& local_bind);
-
-DccpIcmpResult run_dccp_icmp_test(const RequestOptions& options,
-                                  const IpEndpoint& primary_server,
-                                  const IpEndpoint& mapped_endpoint,
-                                  const std::optional<IpEndpoint>& local_bind);
-
-/// Run all RFC 5597 tests in sequence (used when TestType::All).
-Rfc5597Result run_rfc5597_tests(const RequestOptions& options,
-                                const IpEndpoint& primary_server,
-                                const IpEndpoint& secondary_server,
-                                const std::optional<IpEndpoint>& local_bind);
-
 class Rfc5597Test : public INatTest {
 public:
     std::string_view commandName() const override { return "rfc5597"; }

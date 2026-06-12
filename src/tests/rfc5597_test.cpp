@@ -88,10 +88,6 @@ void print_row(const std::string& key, const std::string& value) {
     std::cout << key << ": " << value << '\n';
 }
 
-std::string endpoint_or_dash(const std::optional<IpEndpoint>& endpoint) {
-    return endpoint.has_value() ? to_string(*endpoint) : "-";
-}
-
 // ---- DCCP raw socket helpers ----
 
 /// Compute IPv4 pseudo-header checksum for DCCP.
@@ -153,7 +149,7 @@ IpEndpoint send_dccp_request(const IpEndpoint& src_bind,
                               const IpEndpoint& dst,
                               std::uint32_t service_code,
                               std::uint8_t cscov,
-                              const std::string& iface_name = "") {
+                              const std::string& /* iface_name */ = "") {
     if (dst.family != AF_INET) {
         throw std::runtime_error("DCCP only supported for IPv4");
     }
@@ -628,7 +624,7 @@ DccpMappingFilteringResult run_dccp_mapping_filtering_test(const RequestOptions&
 // ---- Test 3: Filtering Behavior (EIF / ADF) ----
 // NOTE: This function also embeds filtering testing, see run_dccp_filtering_test
 
-ProbeStatus run_dccp_filtering_test_inner(const RequestOptions& options,
+ProbeStatus run_dccp_filtering_test_inner(const RequestOptions& /* options */,
                                           const IpEndpoint& secondary_server,
                                           const IpEndpoint& mapped_endpoint,
                                           std::uint16_t local_port,
@@ -957,68 +953,6 @@ DccpIcmpResult run_dccp_icmp_test(const RequestOptions& options,
     return result;
 }
 
-// ---- Full test runner ----
-
-Rfc5597Result run_rfc5597_tests(const RequestOptions& options,
-                                const IpEndpoint& primary_server,
-                                const IpEndpoint& secondary_server,
-                                const std::optional<IpEndpoint>& local_bind) {
-    Rfc5597Result full_result;
-
-    // 1. Integrity test (REQ-11/12/13)
-    full_result.integrity = run_dccp_integrity_test(options, primary_server, local_bind);
-
-    if (full_result.integrity.reachable != ProbeStatus::Pass ||
-        !full_result.integrity.mapped_endpoint.has_value()) {
-        // Cannot proceed with remaining tests
-        return full_result;
-    }
-
-    IpEndpoint mapped_ep = *full_result.integrity.mapped_endpoint;
-
-    // 2. Mapping + Filtering test
-    full_result.map_filter = run_dccp_mapping_filtering_test(
-        options, primary_server, secondary_server, local_bind);
-
-    // 3. Filtering test
-    if (full_result.integrity.mapped_endpoint.has_value()) {
-        IpEndpoint bind_ep = local_bind.value_or(wildcard_endpoint(AF_INET, 0));
-        ProbeStatus fs = run_dccp_filtering_test_inner(
-            options, secondary_server, mapped_ep, bind_ep.port, options.timeout);
-        if (fs == ProbeStatus::Pass) {
-            full_result.map_filter.filtering_behavior = FilteringBehavior::EndpointIndependent;
-        } else if (fs == ProbeStatus::Fail) {
-            full_result.map_filter.filtering_behavior = FilteringBehavior::AddressAndPortDependent;
-        }
-    }
-
-    // 4. Simultaneous Open
-    full_result.sim_open = run_dccp_simultaneous_open_test(
-        options, primary_server, mapped_ep, local_bind);
-
-    // 5. Unexpected Sync
-    full_result.unexpected_sync = run_dccp_unexpected_sync_test(
-        options, primary_server, mapped_ep, local_bind);
-
-    // 6. Port Overloading
-    full_result.port_overloading = run_dccp_port_overloading_test(
-        options, primary_server, local_bind);
-
-    // 7. Hairpinning
-    full_result.hairpinning = run_dccp_hairpinning_test(
-        options, primary_server, mapped_ep, local_bind);
-
-    // 8. ICMP
-    full_result.icmp = run_dccp_icmp_test(
-        options, primary_server, mapped_ep, local_bind);
-
-    return full_result;
-}
-
-// ====================================================================
-// Test filtering — run only selected test types
-// ====================================================================
-
 } // namespace
 
 // ---- Rfc5597Test class methods ----
@@ -1047,8 +981,6 @@ void Rfc5597Test::parseArgs(const std::map<std::string, std::string>& options) {
 }
 
 int Rfc5597Test::runTest() {
-    const std::string& tt = (test_type_ == Rfc5597TestType::All) ? std::string("all") : std::string("");
-
     // Resolve servers if not manually specified
     if (primary_server_.port == 0) {
         auto cfg = discover_custom_servers(stun_server_, stun_server_.family);
