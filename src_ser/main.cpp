@@ -43,6 +43,8 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <fstream>
+#include <regex>
 
 namespace {
 
@@ -1371,50 +1373,90 @@ void run_server_engine(std::shared_ptr<StunContext> ctx_ptr, int probe_timeout_m
 
 int main(int argc, char** argv) {
     try {
-        std::string bind_ip1 = "", pub_ip1 = "";
-        std::string bind_ip2 = "", pub_ip2 = "";
-        std::string v6_ip1 = "", v6_ip2 = "";
-        
-        std::string cert_file, key_file;
-        uint16_t port1 = 3478, port2 = 3479;
-        uint16_t tls_port1 = 5349, tls_port2 = 5350;
-        uint16_t v6_port1 = 3478, v6_port2 = 3479;
-        uint16_t v6_tls_port1 = 5349, v6_tls_port2 = 5350;
+        std::unordered_map<std::string, std::string> cfg;
+        // 预设默认值
+        cfg["port1"] = "3478";
+        cfg["port2"] = "3479";
+        cfg["tls-port1"] = "5349";
+        cfg["tls-port2"] = "5350";
+        cfg["v6-port1"] = "3478";
+        cfg["v6-port2"] = "3479";
+        cfg["v6-tls-port1"] = "5349";
+        cfg["v6-tls-port2"] = "5350";
+        cfg["probe-timeout-ms"] = "1200";
+        cfg["syn-delay-ms"] = "350";
 
-        int probe_timeout_ms = 1200;
-        int syn_delay_ms = 350;
-
-        for (int index = 1; index < argc; ++index) {
-            std::string token = argv[index];
-            if (token == "--bind-ip1") bind_ip1 = argv[++index];
-            else if (token == "--pub-ip1") pub_ip1 = argv[++index];
-            else if (token == "--bind-ip2") bind_ip2 = argv[++index];
-            else if (token == "--pub-ip2") pub_ip2 = argv[++index];
-            
-            else if (token == "--v6-ip1") v6_ip1 = argv[++index];
-            else if (token == "--v6-ip2") v6_ip2 = argv[++index];
-            
-            else if (token == "--port1") port1 = static_cast<uint16_t>(std::stoi(argv[++index]));
-            else if (token == "--port2") port2 = static_cast<uint16_t>(std::stoi(argv[++index]));
-            else if (token == "--tls-port1") tls_port1 = static_cast<uint16_t>(std::stoi(argv[++index]));
-            else if (token == "--tls-port2") tls_port2 = static_cast<uint16_t>(std::stoi(argv[++index]));
-
-            else if (token == "--v6-port1") v6_port1 = static_cast<uint16_t>(std::stoi(argv[++index]));
-            else if (token == "--v6-port2") v6_port2 = static_cast<uint16_t>(std::stoi(argv[++index]));
-            else if (token == "--v6-tls-port1") v6_tls_port1 = static_cast<uint16_t>(std::stoi(argv[++index]));
-            else if (token == "--v6-tls-port2") v6_tls_port2 = static_cast<uint16_t>(std::stoi(argv[++index]));
-
-            else if (token == "--cert") cert_file = argv[++index];
-            else if (token == "--key") key_file = argv[++index];
-            else if (token == "--probe-timeout-ms") probe_timeout_ms = std::stoi(argv[++index]);
-            else if (token == "--syn-delay-ms") syn_delay_ms = std::stoi(argv[++index]);
+        // 第一遍扫描：寻找 -c 或 --config
+        std::string config_file;
+        for (int i = 1; i < argc; ++i) {
+            std::string arg = argv[i];
+            if ((arg == "-c" || arg == "--config") && i + 1 < argc) {
+                config_file = argv[i + 1];
+                break;
+            }
         }
+
+        // 如果指定了配置文件，通过轻量级正则状态机读取 JSON 键值对
+        if (!config_file.empty()) {
+            std::ifstream ifs(config_file);
+            if (!ifs) fail("Failed to open config file: " + config_file);
+            std::string content((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+            
+            // 匹配字符串: "key": "value"
+            std::regex str_re(R"("([^"]+)"\s*:\s*"([^"]*)")");
+            for (std::sregex_iterator i(content.begin(), content.end(), str_re), end; i != end; ++i) {
+                cfg[(*i)[1].str()] = (*i)[2].str();
+            }
+            // 匹配数字: "key": 1234
+            std::regex int_re(R"("([^"]+)"\s*:\s*(-?\d+))");
+            for (std::sregex_iterator i(content.begin(), content.end(), int_re), end; i != end; ++i) {
+                cfg[(*i)[1].str()] = (*i)[2].str();
+            }
+            std::cout << "Loaded configuration from " << config_file << "\n";
+        }
+
+        // 第二遍扫描：读取命令行参数，它将覆盖 JSON 中的同名配置
+        for (int i = 1; i < argc; ++i) {
+            std::string arg = argv[i];
+            if (arg == "-c" || arg == "--config") { ++i; continue; }
+            if (arg.starts_with("--") && i + 1 < argc) {
+                std::string key = arg.substr(2);
+                std::string val = argv[i + 1];
+                if (!val.starts_with("--")) {
+                    cfg[key] = val;
+                    ++i;
+                }
+            }
+        }
+
+        // 提取最终参数
+        std::string bind_ip1 = cfg["bind-ip1"];
+        std::string pub_ip1  = cfg["pub-ip1"];
+        std::string bind_ip2 = cfg["bind-ip2"];
+        std::string pub_ip2  = cfg["pub-ip2"];
+        std::string v6_ip1   = cfg["v6-ip1"];
+        std::string v6_ip2   = cfg["v6-ip2"];
+        
+        std::string cert_file = cfg["cert"];
+        std::string key_file  = cfg["key"];
+        
+        uint16_t port1 = static_cast<uint16_t>(std::stoi(cfg["port1"]));
+        uint16_t port2 = static_cast<uint16_t>(std::stoi(cfg["port2"]));
+        uint16_t tls_port1 = static_cast<uint16_t>(std::stoi(cfg["tls-port1"]));
+        uint16_t tls_port2 = static_cast<uint16_t>(std::stoi(cfg["tls-port2"]));
+        uint16_t v6_port1 = static_cast<uint16_t>(std::stoi(cfg["v6-port1"]));
+        uint16_t v6_port2 = static_cast<uint16_t>(std::stoi(cfg["v6-port2"]));
+        uint16_t v6_tls_port1 = static_cast<uint16_t>(std::stoi(cfg["v6-tls-port1"]));
+        uint16_t v6_tls_port2 = static_cast<uint16_t>(std::stoi(cfg["v6-tls-port2"]));
+
+        int probe_timeout_ms = std::stoi(cfg["probe-timeout-ms"]);
+        int syn_delay_ms = std::stoi(cfg["syn-delay-ms"]);
 
         bool has_ipv4 = !pub_ip1.empty() && !pub_ip2.empty();
         bool has_ipv6 = !v6_ip1.empty() && !v6_ip2.empty();
 
         if (!has_ipv4 && !has_ipv6) {
-            fail("Must provide either IPv4 config (--pub-ip1/2) or IPv6 config (--v6-ip1/2).");
+            fail("Must provide either IPv4 config (pub-ip1/2) or IPv6 config (v6-ip1/2).");
         }
 
         if (has_ipv4) {
